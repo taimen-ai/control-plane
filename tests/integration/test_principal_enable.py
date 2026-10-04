@@ -453,3 +453,108 @@ async def test_a_retired_agent_is_not_enabled(client: httpx.AsyncClient) -> None
     assert refused.json()["error"]["details"]["agent"] == "coder"
     assert refused.json()["error"]["details"]["agentStatus"] == "retired"
     assert await status_of(client, admin_key, principal_id) == "disabled"
+
+
+def _take_out_beside_the_registry(sync_engine: Engine, principal_id: str) -> None:
+    """What only SQL does to a live agent: ``:disable`` refuses it (``use_agent_retire``)."""
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE principals SET status = 'disabled' WHERE id = :id"), {"id": principal_id}
+        )
+        conn.execute(
+            text(
+                "UPDATE iam_principal_bindings SET status = 'revoked', revoked_at = now() "
+                "WHERE principal_id = :id"
+            ),
+            {"id": principal_id},
+        )
+
+
+async def _binding_status(client: httpx.AsyncClient, key: str, principal_id: str) -> str:
+    response = await client.get(
+        f"/api/v1/principals/{principal_id}/iam-bindings", headers=auth(key)
+    )
+    assert response.status_code == 200, response.text
+    (binding,) = response.json()["items"]
+    status: str = binding["status"]
+    return status
+
+
+async def test_a_live_agent_comes_back_with_enable_and_its_link(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """The way out of ``principal_not_active`` for a live agent (CP-ADR-0073, I5).
+
+    Publishing does not touch the principal's status and ``PUT …/identity``
+    refuses a non-active one, so ``:enable`` brings the status back; the
+    binding stays revoked until the same identity is linked again.
+    """
+    admin_key, workspace = await _tenant(client)
+    assert (await _publish(client, admin_key, coder_spec(workspace["id"]))).status_code == 201
+    first = {"iamTenantId": str(uuid.uuid4()), "iamPrincipalId": str(uuid.uuid4())}
+    principal_id = (await _link(client, admin_key, **first)).json()["principalId"]
+    _take_out_beside_the_registry(sync_engine, principal_id)
+
+    stuck = await _link(client, admin_key, **first)
+    assert stuck.status_code == 422, stuck.text
+    assert stuck.json()["error"]["code"] == "principal_not_active"
+
+    enabled = await enable(client, admin_key, principal_id, reason="disabled beside the registry")
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["status"] == "active"
+    assert await _binding_status(client, admin_key, principal_id) == "revoked"
+    (event,) = [
+        e
+        for e in await events_of(client, admin_key, "principal", principal_id)
+        if e["type"] == "principal.enabled"
+    ]
+    assert event["payload"]["previousStatus"] == "disabled"
+
+    again = await enable(client, admin_key, principal_id)
+    assert again.status_code == 200, again.text
+
+    relinked = await _link(client, admin_key, **first)
+    assert relinked.status_code == 200, relinked.text
+    assert await _binding_status(client, admin_key, principal_id) == "active"
+
+
+async def test_a_live_service_agent_is_enabled_too(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """A registry service agent is the registry's, not its installer's: ``service`` passes."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    spec = {
+        "displayName": "Notification service",
+        "identity": {"kind": "service", "permissions": ["events.read", "tasks.read"]},
+        "placement": "none",
+    }
+    published = await _publish(client, admin_key, spec, agent="notification-service")
+    assert published.status_code == 201, published.text
+    linked = await _link(client, admin_key, agent="notification-service")
+    principal_id = linked.json()["principalId"]
+    _take_out_beside_the_registry(sync_engine, principal_id)
+
+    enabled = await enable(client, admin_key, principal_id)
+    assert enabled.status_code == 200, enabled.text
+    assert await status_of(client, admin_key, principal_id) == "active"
+
+
+async def test_a_live_agent_principal_is_enabled_only_with_its_live_rights(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """The escalation rule stays: a live binding left by SQL comes back with the status."""
+    admin_key, workspace = await _tenant(client)
+    assert (await _publish(client, admin_key, coder_spec(workspace["id"]))).status_code == 201
+    principal_id = (await _link(client, admin_key)).json()["principalId"]
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE principals SET status = 'paused' WHERE id = :id"), {"id": principal_id}
+        )
+    _, operator_key = await create_agent_with_key(
+        client, admin_key, name="operator", kind="human", permissions=["principals.write"]
+    )
+
+    refused = await enable(client, operator_key, principal_id)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "permission_escalation"
+    assert await status_of(client, admin_key, principal_id) == "paused"

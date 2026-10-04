@@ -19,8 +19,9 @@ thought, raw prompts or terminal history.
 External observations (CP-ADR-0057) additionally name their ``source`` system,
 the time the fact was seen there (``observedAt``), the observed object
 (``externalRef``) and an earlier observation they replace (``supersedes``).
-A ``(source, dedupKey)`` pair is unique per tenant: repeating it returns the
-observation it first produced instead of appending a new event.
+A ``(source, dedupKey)`` pair is unique per tenant and author: repeating it
+returns the observation it first produced instead of appending a new event;
+the same pair from another author is that author's own observation.
 """
 
 import re
@@ -29,20 +30,20 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.commands.relations import resolve_task
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.context.assertions import validate_assertions
 from control_plane.application.events import record_event
+from control_plane.application.queries.events import recorded_observations
+from control_plane.application.visibility import task_visible
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import NotFoundError, ValidationError
 from control_plane.infrastructure.db.models import (
-    Event,
-    EventArchive,
     ObservationDedupKey,
     Run,
     Session,
@@ -81,22 +82,6 @@ class RecordedObservation:
     recorded_at: datetime
     # True when (source, dedupKey) resolved to an earlier observation.
     deduplicated: bool = False
-
-
-async def _observation_exists(
-    session: AsyncSession, tenant_id: uuid.UUID, observation_id: uuid.UUID
-) -> bool:
-    # An observation IS its journal event, which retention may have moved to
-    # the archive (ADR-0038) — both tables are the journal.
-    def recorded(table: type[Event] | type[EventArchive]) -> Any:
-        return exists().where(
-            table.tenant_id == tenant_id,
-            table.entity_type == "observation",
-            table.entity_id == observation_id,
-            table.event_type == "observation.recorded",
-        )
-
-    return bool(await session.scalar(select(or_(recorded(Event), recorded(EventArchive)))))
 
 
 async def record_observation(
@@ -178,12 +163,18 @@ async def record_observation(
         run = await session.scalar(
             select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
         )
-        if run is None:
+        # A run of invisible work answers as a missing one (CP-ADR-0082 V6).
+        if run is None or not await task_visible(session, ctx, run.task_id):
             raise NotFoundError("Run not found", details={"runId": str(run_id)})
         payload["runId"] = str(run.id)
         if task_id is None:
             task_id = run.task_id
             payload["taskId"] = str(run.task_id)
+    if task_id is not None:
+        # Binding a fact to a task speaks about that task: a rule may close
+        # the task on it (CP-ADR-0063 Zh6), so the author must be allowed to
+        # read the task — the decision of the PDP, as for reading it.
+        await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task_id)))
     if workspace_id is not None:
         from control_plane.application.commands.workspaces import get_tenant_workspace
 
@@ -200,8 +191,9 @@ async def record_observation(
         if owned is None:
             raise NotFoundError("Session not found", details={"sessionId": str(session_id)})
     if supersedes is not None:
-        # Same rule as the scope references: unknown or foreign is a 404.
-        if not await _observation_exists(session, ctx.tenant_id, supersedes):
+        # Same rule as the scope references: unknown, foreign or invisible
+        # (the journal would not hand it to the caller) is a 404.
+        if not await recorded_observations(session, ctx, {supersedes}):
             raise NotFoundError(
                 "Superseded observation not found", details={"supersedes": str(supersedes)}
             )
@@ -212,13 +204,16 @@ async def record_observation(
     if source is not None and dedup_key is not None:
         # Claim the key before appending: a concurrent twin blocks on the
         # uncommitted row and then sees the conflict, so exactly one event
-        # is written per (tenant, source, dedupKey).
+        # is written per (tenant, source, dedupKey, author). The author is
+        # part of the key, so nobody can take another author's key in advance
+        # (CP-ADR-0057 amendment 2026-10-01).
         claimed = await session.scalar(
             insert(ObservationDedupKey)
             .values(
                 tenant_id=ctx.tenant_id,
                 source=source,
                 dedup_key=dedup_key,
+                actor_id=ctx.principal_id,
                 observation_id=observation_id,
                 event_id=event_id,
                 kind=kind,
@@ -233,6 +228,7 @@ async def record_observation(
                     ObservationDedupKey.tenant_id == ctx.tenant_id,
                     ObservationDedupKey.source == source,
                     ObservationDedupKey.dedup_key == dedup_key,
+                    ObservationDedupKey.actor_id == ctx.principal_id,
                 )
             )
             assert existing is not None  # the conflicting row is committed

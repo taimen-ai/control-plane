@@ -123,7 +123,9 @@ async def get_rule_evaluation(
             .where(RuleEvaluation.id == evaluation_id, RuleEvaluation.tenant_id == ctx.tenant_id)
         )
     ).first()
-    if row is None:
+    # Of a rule of an invisible workspace: the evaluation's own 404, not the
+    # workspace's (CP-ADR-0082 §3.7).
+    if row is None or (row[1] is not None and not ctx.sees_workspace(row[1])):
         raise NotFoundError(
             "Rule evaluation not found", details={"evaluationId": str(evaluation_id)}
         )

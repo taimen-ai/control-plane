@@ -13,8 +13,9 @@ Working copies are cut by an :class:`ExecutionWorkspacePool` per repository,
 made the first time a task of that repository comes. All pools share one
 root, so a task keeps one container ``<root>/<publicId>/`` whatever its
 repository: the copy of the repository sits in it under the entry's
-directory, and a copy made under the one-repository form of ``workingCopy``
-is found where it was.
+directory — one name or a path of several segments (TAI-ADR-0064), so the
+container is laid out like the superproject — and a copy made under the
+one-repository form of ``workingCopy`` is found where it was.
 
 The key a task ran under is written to the ``execution.workspace``
 checkpoint. A task whose key changed since (a key corrected by a person)
@@ -55,8 +56,11 @@ _UNRESOLVED_RE = re.compile(r"\$\{[^}]*\}")
 # $defs.repositoryAlias: Latin and Cyrillic letters, digits, ``. _ -``.
 _ALIAS_CHARS = "A-Za-z0-9\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u0400-\u04ff"
 _ALIAS_RE = re.compile(rf"^[{_ALIAS_CHARS}][{_ALIAS_CHARS}._-]{{0,62}}\Z")
-# $defs.agentWorkingCopies.catalogEntry.directory.
-_DIRECTORY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}\Z")
+# $defs.workingCopyPath (agentWorkingCopies.catalogEntry.directory): one name
+# or a path of several segments (TAI-ADR-0064), at most 200 characters.
+_DIRECTORY_SEGMENT = r"[a-z0-9][a-z0-9._-]{0,99}"
+_DIRECTORY_RE = re.compile(rf"^{_DIRECTORY_SEGMENT}(?:/{_DIRECTORY_SEGMENT})*\Z")
+_DIRECTORY_MAX_LENGTH = 200
 # ``checks`` is the daemon's switch, read by ``revision.settings_of``.
 _CATALOG_FIELDS = frozenset(
     {"repositoryField", "superproject", "publish", "repositories", "checks"}
@@ -141,7 +145,7 @@ class RepositoryCatalog:
                         "are compared case-insensitively)"
                     )
                 names.add(folded)
-        # The rest of cp_packages check: one entry per address and per directory.
+        # The rest of the package-sdk check: one entry per address and per directory.
         urls: dict[str, str] = {}
         directories: dict[str, str] = {}
         keys = {key.casefold(): key for key in entries}
@@ -162,6 +166,15 @@ class RepositoryCatalog:
                     f"repositories.{entry.key}.directory {entry.directory!r} is the key of "
                     "another entry"
                 )
+        # A directory of several segments may lie inside another entry's
+        # copy: one clone would hold the other (package-sdk check).
+        for entry in entries.values():
+            for outer in entries.values():
+                if entry.directory.casefold().startswith(outer.directory.casefold() + "/"):
+                    raise CatalogError(
+                        f"repositories.{entry.key}.directory {entry.directory!r} lies inside "
+                        f"the directory {outer.directory!r} of {outer.key}"
+                    )
         superproject = spec.get("superproject")
         if superproject is not None and (
             not isinstance(superproject, str) or superproject not in entries
@@ -229,8 +242,15 @@ def _entry(key: Any, value: Any, *, publish: bool) -> CatalogEntry:
     if not isinstance(base_ref, str) or not base_ref.strip():
         raise CatalogError(f"repositories.{key}.baseRef must be a branch name")
     directory = value.get("directory", key)
-    if not isinstance(directory, str) or not _DIRECTORY_RE.match(directory):
-        raise CatalogError(f"repositories.{key}.directory must be a lowercase directory name")
+    if (
+        not isinstance(directory, str)
+        or len(directory) > _DIRECTORY_MAX_LENGTH
+        or not _DIRECTORY_RE.match(directory)
+    ):
+        raise CatalogError(
+            f"repositories.{key}.directory must be a lowercase relative path: a name or "
+            "segments joined by /, without .., an empty segment or a backslash"
+        )
     own_publish = value.get("publish", publish)
     if not isinstance(own_publish, bool):
         raise CatalogError(f"repositories.{key}.publish must be a boolean")
@@ -279,7 +299,7 @@ def _check_url(key: str, url: str) -> None:
 
 
 def _url_identity(url: str) -> str:
-    """An address as cp_packages compares them: no case, trailing ``/`` or ``.git``."""
+    """An address as package-sdk compares them: no case, trailing ``/`` or ``.git``."""
     return url.lower().rstrip("/").removesuffix(".git")
 
 

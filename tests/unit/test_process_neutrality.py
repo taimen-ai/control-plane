@@ -26,6 +26,19 @@ GUARDED = [
     CORE / "application" / "commands" / "package_test.py",
     CORE / "application" / "commands" / "package_trials.py",
     CORE / "sandbox.py",
+    # Screens of packages: the core knows no name of a view, a block or a field
+    # of a package (CP-ADR-0080, TAI-ADR-0066).
+    DOMAIN / "views.py",
+    DOMAIN / "view.schema.json",
+    CORE / "application" / "commands" / "views.py",
+    CORE / "application" / "queries" / "views.py",
+    CORE / "api" / "v1" / "views.py",
+    # Settings of packages: stored, checked by their schema and given out, their
+    # meaning unknown to the core (CP-ADR-0081 §9, FR-017).
+    DOMAIN / "package_settings.py",
+    CORE / "application" / "commands" / "package_settings.py",
+    CORE / "application" / "queries" / "package_settings.py",
+    CORE / "api" / "v1" / "package_settings.py",
 ]
 
 # Words of the domains the platform's own packages cover and of the usual
@@ -78,7 +91,7 @@ PATTERN = re.compile(r"(?<![\w-])(" + "|".join(DOMAIN_WORDS) + r")(?![\w-])", re
 # words its example neutrally.
 CATALOG_EXAMPLES = {
     # $defs/memoryWhere/items/properties/attr (company-knowledge K001, recall.where).
-    "process_spec.schema.json": ("например okpd2 или validUntil",),
+    "process_spec.schema.json": ("e.g. okpd2 or validUntil",),
 }
 
 

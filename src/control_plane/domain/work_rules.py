@@ -8,7 +8,8 @@ observation kinds, event types, skills and task types a rule names is data.
 
 Documents (camelCase, as over the wire)::
 
-    trigger:        {"kind": "observation", "type": "<observation kind>", "source"?: "..."}
+    trigger:        {"kind": "observation", "type": "<observation kind>", "source"?: "...",
+                     "agent"?: "<agent key>", "actorId"?: "<principal id>"}
                     {"kind": "event", "type": "<journal event type>"}
                     {"kind": "schedule", "type": "interval", "everySeconds": N}
     condition:      an expression (below); omitted means "always"
@@ -24,6 +25,7 @@ Documents (camelCase, as over the wire)::
                                               "dependsOn"?: "<template>" | [...]}},
                      "acceptance"?: [<acceptance checks, templates allowed>],
                      "check"?: "<template of the check key>",
+                     "target"?: "dedup" | "task",
                      "forEach"?: "<path to a list>", "where"?: <expression>}
 
 ``request_decision`` files the work like ``ensure_work`` and a *gate*
@@ -47,6 +49,15 @@ to nothing; the rule's identity must be allowed to file work there.
 ``fields.assignee`` names a principal by id, an agent as ``agent:<key>`` or a
 role of the target workspace as ``role:<slug>`` — work any holder of the role
 may take (CP-ADR-0063, amendment process-packages P012).
+
+``target: task`` (``cancel_work`` / ``complete_work`` on an observation)
+closes the task the observation is bound to (``payload.taskId``) instead of
+the work found by the dedup key: ``taskTypes`` is then required and bounds
+the types the rule may close, and the action has no dedup key, ``forEach``
+or ``where`` — the fact names the one work item (CP-ADR-0063, amendment
+integrations-connections, Zh1/Zh2). Such a rule must name the author of
+the facts it trusts: ``trigger.agent`` and/or ``trigger.actorId`` — the
+source an observation names is the author's own claim (amendment Zh6).
 
 ``ensure_work`` may pick the task type per item: ``taskType`` is then a
 template and ``taskTypes`` lists the keys it may render to. Its
@@ -73,6 +84,10 @@ null, and any other pairing is an evaluation error — a rule that compares a
 string with a number is broken, and silently answering ``false`` would hide
 it.
 
+``fields`` is kept only when it names something: an action without fields
+(always so for ``cancel_work`` / ``complete_work``) is stored, returned and
+compared without the member (CP-ADR-0063, amendment TASK-001373, Z1).
+
 Templates are strings with ``{{ path }}`` placeholders. A string that is
 exactly one placeholder takes the raw value (a list stays a list); any other
 string gets each placeholder's text.
@@ -82,6 +97,7 @@ Pure functions, no database and no I/O, like ``domain/approval_outcomes.py``.
 
 import json
 import re
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -89,6 +105,7 @@ from typing import Any
 
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.project import guard_json_document, reject_secret_material
+from control_plane.domain.settings_refs import REF_TYPE, REF_UNKNOWN, SettingsScope
 from control_plane.domain.work_graph import CHECK_KEY_RE, check_spec, normalize_checks
 
 # --- vocabulary -----------------------------------------------------------------
@@ -143,10 +160,22 @@ CREATING_ACTIONS = frozenset({ActionKind.ENSURE_WORK, ActionKind.REQUEST_DECISIO
 # Actions that close the work; under a live claim they wait for it to end.
 CLOSING_ACTIONS = frozenset({ActionKind.CANCEL_WORK, ActionKind.COMPLETE_WORK})
 
+
+class ActionTarget(StrEnum):
+    """Which work a closing action closes (amendment integrations-connections, Zh1)."""
+
+    # The work rules filed under the rendered dedup key (the default).
+    DEDUP = "dedup"
+    # The task the triggering observation is bound to.
+    TASK = "task"
+
+
 RULE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 # Same shape as an observation kind (application/commands/observations.py).
 _OBSERVATION_KIND_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9._:/-]{0,127}$")
+# Same shape as an agent key of the registry (agent_assignees.py).
+_AGENT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
 _TYPE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 # Pinned only: a rule's interpretation must not change under it when a newer
@@ -182,8 +211,10 @@ ROOT_GOAL = "goal"
 ROOT_TASK = "task"
 ROOT_SKILL = "skill"
 ROOT_ITEM = "item"
+# The effective settings of the rule's package (CP-ADR-0081 §6).
+ROOT_SETTINGS = "settings"
 # What the condition and the interpretation inputs may read.
-BASE_ROOTS = frozenset({ROOT_TRIGGER, ROOT_PAYLOAD, ROOT_GOAL, ROOT_TASK})
+BASE_ROOTS = frozenset({ROOT_TRIGGER, ROOT_PAYLOAD, ROOT_GOAL, ROOT_TASK, ROOT_SETTINGS})
 
 _LOGICAL = ("and", "or")
 _COMPARISONS = ("eq", "ne", "lt", "le", "gt", "ge")
@@ -563,7 +594,9 @@ def normalize_trigger(value: Any) -> dict[str, Any]:
     trigger = _document(value, label="trigger", code=code)
     kind = trigger.get("kind")
     if kind == TriggerKind.OBSERVATION:
-        _unknown_keys(trigger, {"kind", "type", "source"}, label="trigger", code=code)
+        _unknown_keys(
+            trigger, {"kind", "type", "source", "agent", "actorId"}, label="trigger", code=code
+        )
         kind_type = trigger.get("type")
         if not isinstance(kind_type, str) or not _OBSERVATION_KIND_RE.match(kind_type):
             raise _invalid(code, "trigger.type must be an observation kind", "trigger.type")
@@ -573,6 +606,21 @@ def normalize_trigger(value: Any) -> dict[str, Any]:
             if not isinstance(source, str) or not _SOURCE_RE.match(source):
                 raise _invalid(code, "trigger.source must be an observation source", "trigger")
             result["source"] = source
+        # The author filter (amendment Zh6): the source is what the author
+        # says about itself, the author is who the journal says wrote it.
+        agent = trigger.get("agent")
+        if agent is not None:
+            if not isinstance(agent, str) or not _AGENT_KEY_RE.match(agent):
+                raise _invalid(code, "trigger.agent must be an agent key", "trigger.agent")
+            result["agent"] = agent
+        actor_id = trigger.get("actorId")
+        if actor_id is not None:
+            try:
+                result["actorId"] = str(uuid.UUID(actor_id))
+            except (ValueError, TypeError, AttributeError):
+                raise _invalid(
+                    code, "trigger.actorId must be a principal id", "trigger.actorId"
+                ) from None
         return result
     if kind == TriggerKind.EVENT:
         _unknown_keys(trigger, {"kind", "type"}, label="trigger", code=code)
@@ -669,6 +717,7 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
             "acceptance",
             "check",
             "taskTypes",
+            "target",
         },
         label="action",
         code=code,
@@ -681,6 +730,33 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
             "action.kind",
         )
     result: dict[str, Any] = {"kind": kind}
+    target = doc.get("target")
+    if target is not None:
+        if kind not in CLOSING_ACTIONS:
+            raise _invalid(
+                code, f"action.target is only used by {sorted(CLOSING_ACTIONS)}", "action.target"
+            )
+        if target not in {t.value for t in ActionTarget}:
+            raise _invalid(
+                code,
+                f"action.target must be one of {sorted(t.value for t in ActionTarget)}",
+                "action.target",
+            )
+        result["target"] = target
+    bound = target == ActionTarget.TASK
+    if bound:
+        # The fact names the work: there is no key to render and no items.
+        for name in ("dedupKeyTemplate", "forEach", "where"):
+            if name in doc:
+                raise _invalid(
+                    code, f"action.{name} is not used with target: task", f"action.{name}"
+                )
+        if doc.get("taskTypes") is None:
+            raise _invalid(
+                code,
+                "action.taskTypes is required with target: task: the types the rule may close",
+                "action.taskTypes",
+            )
 
     for_each = doc.get("forEach")
     outer = action_roots(interpreted=interpreted, for_each=False)
@@ -697,8 +773,12 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
     task_type = doc.get("taskType")
     task_types = doc.get("taskTypes")
     if task_types is not None:
-        if kind != ActionKind.ENSURE_WORK:
-            raise _invalid(code, "action.taskTypes is only used by ensure_work", "action.taskTypes")
+        if kind != ActionKind.ENSURE_WORK and not bound:
+            raise _invalid(
+                code,
+                "action.taskTypes is only used by ensure_work and by target: task",
+                "action.taskTypes",
+            )
         result["taskTypes"] = _normalize_task_types(task_types)
     if kind in CREATING_ACTIONS:
         if isinstance(task_type, str) and _has_placeholder(task_type):
@@ -721,17 +801,18 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
             code, f"action.taskType is only used by {sorted(CREATING_ACTIONS)}", "action.taskType"
         )
 
-    template = doc.get("dedupKeyTemplate")
-    if not isinstance(template, str) or not template.strip():
-        raise _invalid(code, "action.dedupKeyTemplate is required", "action.dedupKeyTemplate")
-    if len(template) > MAX_DEDUP_KEY_LENGTH:
-        raise _invalid(
-            code,
-            f"action.dedupKeyTemplate exceeds {MAX_DEDUP_KEY_LENGTH} characters",
-            "action.dedupKeyTemplate",
-        )
-    template_paths(template, roots=roots, where="action.dedupKeyTemplate", code=code)
-    result["dedupKeyTemplate"] = template
+    if not bound:
+        template = doc.get("dedupKeyTemplate")
+        if not isinstance(template, str) or not template.strip():
+            raise _invalid(code, "action.dedupKeyTemplate is required", "action.dedupKeyTemplate")
+        if len(template) > MAX_DEDUP_KEY_LENGTH:
+            raise _invalid(
+                code,
+                f"action.dedupKeyTemplate exceeds {MAX_DEDUP_KEY_LENGTH} characters",
+                "action.dedupKeyTemplate",
+            )
+        template_paths(template, roots=roots, where="action.dedupKeyTemplate", code=code)
+        result["dedupKeyTemplate"] = template
 
     fields = doc.get("fields", {})
     if not isinstance(fields, dict):
@@ -780,7 +861,10 @@ def normalize_action(value: Any, *, interpreted: bool) -> dict[str, Any]:
         )
     if kind in CLOSING_ACTIONS and fields:
         raise _invalid(code, f"{kind} takes no fields", "action.fields")
-    result["fields"] = fields
+    # No fields is no member: the canonical form is what the author writes, so
+    # a document read back compares equal to its file (amendment Z1).
+    if fields:
+        result["fields"] = fields
 
     if "acceptance" in doc:
         if kind not in CREATING_ACTIONS:
@@ -976,6 +1060,30 @@ def normalize_rule_spec(
             "its skill result is the only fact such work can cite",
             "interpretation",
         )
+    if (
+        normalized_action.get("target") == ActionTarget.TASK
+        and normalized_trigger["kind"] != TriggerKind.OBSERVATION
+    ):
+        # Only an observation is bound to a task; closing the task of a core
+        # event is a different decision (amendment Zh2).
+        raise _invalid(
+            "invalid_rule_action",
+            "target: task closes the task an observation is bound to: "
+            "the trigger must be an observation",
+            "action.target",
+        )
+    if normalized_action.get("target") == ActionTarget.TASK and not has_author_filter(
+        normalized_trigger
+    ):
+        # Anyone who may record an observation may bind it to a task and name
+        # any source: without an author the rule would close work on anybody's
+        # word (amendment Zh6).
+        raise _invalid(
+            "invalid_rule_trigger",
+            "target: task needs the author of the facts it trusts: "
+            "trigger.agent or trigger.actorId",
+            "trigger.agent",
+        )
     return RuleSpec(
         trigger=normalized_trigger,
         condition=normalized_condition,
@@ -984,11 +1092,15 @@ def normalize_rule_spec(
     )
 
 
+_ALL_ROOTS = frozenset({*BASE_ROOTS, ROOT_SKILL, ROOT_ITEM})
+_ORDERS = ("lt", "le", "gt", "ge")
+
+
 def rule_roots(
     *, condition: Any, interpretation: Mapping[str, Any] | None, action: Mapping[str, Any]
 ) -> frozenset[str]:
     """Every root the (normalized) documents of a rule read."""
-    all_roots = frozenset({*BASE_ROOTS, ROOT_SKILL, ROOT_ITEM})
+    all_roots = _ALL_ROOTS
     code = "invalid_rule"
     paths = validate_expression(condition, roots=all_roots)
     if interpretation is not None:
@@ -1024,6 +1136,26 @@ def normalize_dedup_key(value: Any) -> str:
     return text
 
 
+def has_author_filter(trigger: Mapping[str, Any]) -> bool:
+    """Does the (normalized) trigger name who wrote the facts it takes?"""
+    return trigger.get("agent") is not None or trigger.get("actorId") is not None
+
+
+def author_matches(
+    trigger: Mapping[str, Any], actor_id: str | None, agents: Mapping[str, str]
+) -> bool:
+    """Did the author the journal names write a fact this trigger takes?
+
+    ``agents`` maps agent keys to their principals; an agent without one (not
+    linked, retired, unknown) wrote nothing. Both filters, when given, hold.
+    """
+    expected = trigger.get("actorId")
+    if expected is not None and actor_id != expected:
+        return False
+    agent = trigger.get("agent")
+    return agent is None or (actor_id is not None and agents.get(agent) == actor_id)
+
+
 def trigger_matches(
     trigger: Mapping[str, Any], event_type: str, payload: Mapping[str, Any]
 ) -> bool:
@@ -1036,3 +1168,147 @@ def trigger_matches(
     if kind == TriggerKind.EVENT:
         return event_type == trigger.get("type")
     return False
+
+
+# --- settings of the package (CP-ADR-0081 §6) -------------------------------------------------
+
+# What a read of ``settings`` is used as, and the JSON types that fit it.
+_ORDERED_TYPES = frozenset({"number", "integer", "string"})
+_SCALAR_TYPES = frozenset({"number", "integer", "string", "boolean"})
+_FITS: Mapping[str, frozenset[str] | None] = {
+    "order": _ORDERED_TYPES,  # lt, le, gt, ge
+    "equal": _SCALAR_TYPES | {"array"},  # eq, ne
+    "member": _SCALAR_TYPES,  # the left operand of in
+    "list": frozenset({"array"}),  # the right operand of in, forEach
+    "text": _SCALAR_TYPES,  # a placeholder inside text
+    "exists": None,  # anything
+    "whole": None,  # a template that is exactly one placeholder keeps the raw value
+}
+
+
+@dataclass(frozen=True)
+class SettingsRead:
+    """A read of ``settings`` in a rule: where it sits, the path and what it is used as."""
+
+    where: str
+    path: VarPath
+    use: str
+
+
+def _condition_reads(expression: Any, where: str) -> list[SettingsRead]:
+    found: list[SettingsRead] = []
+
+    def operand(value: Any, at: str, use: str) -> None:
+        if isinstance(value, dict) and set(value) == {"var"}:
+            path = parse_path(value["var"], roots=_ALL_ROOTS, where=at, code="invalid_rule")
+            if path.root == ROOT_SETTINGS:
+                found.append(SettingsRead(f"{at}.var", path, use))
+        elif isinstance(value, dict) and set(value) != {"const"}:
+            node(value, at)
+
+    def node(value: Any, at: str) -> None:
+        if not isinstance(value, dict) or len(value) != 1:
+            return
+        ((operator, args),) = value.items()
+        here = f"{at}.{operator}"
+        if operator in _LOGICAL:
+            for index, item in enumerate(args):
+                node(item, f"{here}[{index}]")
+        elif operator == "not":
+            node(args, here)
+        elif operator == "exists":
+            path = parse_path(args, roots=_ALL_ROOTS, where=here, code="invalid_rule")
+            if path.root == ROOT_SETTINGS:
+                found.append(SettingsRead(here, path, "exists"))
+        else:
+            uses = {"in": ("member", "list")}.get(
+                operator, ("order", "order") if operator in _ORDERS else ("equal", "equal")
+            )
+            operand(args[0], f"{here}[0]", uses[0])
+            operand(args[1], f"{here}[1]", uses[1])
+
+    node(expression, where)
+    return found
+
+
+def _template_reads(value: Any, where: str) -> list[SettingsRead]:
+    found: list[SettingsRead] = []
+    if isinstance(value, str):
+        use = "whole" if _PLACEHOLDER_RE.fullmatch(value) is not None else "text"
+        for match in _PLACEHOLDER_RE.finditer(value):
+            path = parse_path(match.group(1), roots=_ALL_ROOTS, where=where, code="invalid_rule")
+            if path.root == ROOT_SETTINGS:
+                found.append(SettingsRead(where, path, use))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found += _template_reads(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found += _template_reads(item, f"{where}[{index}]")
+    return found
+
+
+def settings_reads(spec: RuleSpec) -> list[SettingsRead]:
+    """Every read of ``settings`` of a normalized rule, with the field it sits in."""
+    found = _condition_reads(spec.condition, "condition")
+    if spec.interpretation is not None:
+        found += _template_reads(spec.interpretation.get("inputs", {}), "interpretation.inputs")
+    action = spec.action
+    for_each = action.get("forEach")
+    if for_each is not None:
+        path = parse_path(for_each, roots=_ALL_ROOTS, where="action.forEach", code="invalid_rule")
+        if path.root == ROOT_SETTINGS:
+            found.append(SettingsRead("action.forEach", path, "list"))
+    if "where" in action:
+        found += _condition_reads(action["where"], "action.where")
+    for name in ("taskType", "dedupKeyTemplate", "fields", "acceptance", "check"):
+        if name in action:
+            found += _template_reads(action[name], f"action.{name}")
+    return found
+
+
+def _settings_type(schema: Mapping[str, Any], segments: tuple[str, ...]) -> str | None:
+    """The JSON type of a path of the settings schema; ``None`` when it names no field."""
+    node: Any = schema
+    for segment in segments:
+        if not isinstance(node, Mapping):
+            return None
+        if node.get("type") == "array" and segment.isdigit():
+            node = node.get("items")
+            continue
+        properties = node.get("properties")
+        if not isinstance(properties, Mapping) or segment not in properties:
+            return None
+        node = properties[segment]
+    if not isinstance(node, Mapping):
+        return None
+    kind = node.get("type")
+    return kind if isinstance(kind, str) else "object"
+
+
+def check_settings_refs(spec: RuleSpec, scope: SettingsScope) -> None:
+    """``settings_ref_unknown`` / ``settings_ref_type`` of the first read that does not fit.
+
+    The field of the error is the condition or template the read sits in.
+    """
+    for read in settings_reads(spec):
+        named = read.path.text
+        if scope.package is None:
+            why = "the rule is not from a package: it has no settings"
+        elif scope.schema is None:
+            why = f"package {scope.package} declares no settings"
+        else:
+            kind = _settings_type(scope.schema, read.path.segments)
+            if kind is None:
+                why = f"the settings of package {scope.package} declare no such field"
+            else:
+                fits = _FITS[read.use]
+                if fits is None or kind in fits:
+                    continue
+                raise _invalid(
+                    REF_TYPE,
+                    f"{read.where}: {named} is {kind}, which does not fit the place of the read",
+                    read.where,
+                    settings=named,
+                )
+        raise _invalid(REF_UNKNOWN, f"{read.where}: {named}: {why}", read.where, settings=named)

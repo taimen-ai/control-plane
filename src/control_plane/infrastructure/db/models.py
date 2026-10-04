@@ -19,13 +19,14 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     SmallInteger,
     Text,
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 NAMING_CONVENTION = {
@@ -66,6 +67,8 @@ class Principal(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('human', 'agent', 'service')", name="kind"),
         CheckConstraint("status IN ('active', 'paused', 'disabled')", name="status"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint("jsonb_typeof(profile) = 'object'", name="profile_object"),
         Index("ix_principals_tenant_created", "tenant_id", "created_at", "id"),
     )
 
@@ -75,6 +78,12 @@ class Principal(Base):
     display_name: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, default="active")
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", default=dict)
+    # Display details in the organization, edited by ``PATCH /principals/{id}``
+    # (CP-ADR-0082 §1); ``version`` grows on every change of the name or profile.
+    profile: Mapped[dict[str, Any]] = mapped_column(
+        default=dict, server_default=text("'{}'::jsonb")
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
 
@@ -112,6 +121,7 @@ class IamPrincipalBinding(Base):
     __tablename__ = "iam_principal_bindings"
     __table_args__ = (
         CheckConstraint("status IN ('active', 'disabled', 'revoked')", name="status"),
+        CheckConstraint("visibility IN ('tenant', 'members')", name="visibility"),
         Index("uq_iam_bindings_identity", "issuer", "iam_principal_id", unique=True),
         Index("ix_iam_bindings_tenant_principal", "tenant_id", "principal_id"),
     )
@@ -124,6 +134,9 @@ class IamPrincipalBinding(Base):
     iam_principal_id: Mapped[uuid.UUID]
     permissions: Mapped[list[str]] = mapped_column(default=list)
     status: Mapped[str] = mapped_column(Text, default="active")
+    # ``tenant`` — permissions act on the whole tenant; ``members`` — a human
+    # sees only the workspaces of their membership and below (CP-ADR-0082 §2).
+    visibility: Mapped[str] = mapped_column(Text, default="tenant", server_default=text("'tenant'"))
     revoked_at: Mapped[datetime | None]
     last_used_at: Mapped[datetime | None]
     created_at: Mapped[datetime]
@@ -263,6 +276,10 @@ class TaskType(Base):
     # amendment 2026-09-27): [{key, kind, description, spec?, when?}]. Part
     # of the immutable version; empty means "none", the behaviour before.
     acceptance: Mapped[list[Any]] = mapped_column(JSONB, default=list)
+    # Slugs of the tenant's roles a person needs to take work of this version
+    # (CP-ADR-0048, amendment 2026-10-03 A1). Part of the immutable version;
+    # empty means "people are not restricted", the behaviour before.
+    executor_roles: Mapped[list[Any]] = mapped_column(JSONB, default=list)
     status: Mapped[str] = mapped_column(Text, default="active")
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
@@ -548,6 +565,17 @@ class Event(Base):
         # v0.4 replay order (per-tenant) and the adapter's global scan.
         Index("ix_events_tenant_tx_sequence", "tenant_id", "tx_id", "sequence"),
         Index("ix_events_tx_sequence", "tx_id", "sequence"),
+        # Narrowing filters of the journal page (CP-ADR-0068 amendment B, Б4):
+        # an author or one workspace in replay order, a period by time.
+        Index("ix_events_tenant_actor_tx_sequence", "tenant_id", "actor_id", "tx_id", "sequence"),
+        Index(
+            "ix_events_tenant_workspace_tx_sequence",
+            "tenant_id",
+            "workspace_id",
+            "tx_id",
+            "sequence",
+        ),
+        Index("ix_events_tenant_occurred_at", "tenant_id", "occurred_at"),
     )
 
     sequence: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
@@ -596,6 +624,21 @@ class EventArchive(Base):
         UniqueConstraint("id", name="uq_event_archive_id"),
         Index("ix_event_archive_tenant_tx_sequence", "tenant_id", "tx_id", "sequence"),
         Index("ix_event_archive_entity", "tenant_id", "entity_type", "entity_id"),
+        Index(
+            "ix_event_archive_tenant_actor_tx_sequence",
+            "tenant_id",
+            "actor_id",
+            "tx_id",
+            "sequence",
+        ),
+        Index(
+            "ix_event_archive_tenant_workspace_tx_sequence",
+            "tenant_id",
+            "workspace_id",
+            "tx_id",
+            "sequence",
+        ),
+        Index("ix_event_archive_tenant_occurred_at", "tenant_id", "occurred_at"),
     )
 
     sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
@@ -716,9 +759,11 @@ class ObservationDedupKey(Base):
     """Recognises a repeat of an external observation (CP-ADR-0057).
 
     The observation itself stays a journal event (ADR-0027); this row only
-    remembers which observation a ``(source, dedup_key)`` pair produced, so a
-    repeated report answers with the existing id instead of a new event. The
-    primary key IS the tenant-scoped uniqueness guarantee.
+    remembers which observation a ``(source, dedup_key)`` pair of one author
+    produced, so a repeated report answers with the existing id instead of a
+    new event. The primary key IS the tenant-scoped uniqueness guarantee; the
+    author is part of it, so nobody can take another author's key in advance
+    (CP-ADR-0057, amendment 2026-10-01).
     """
 
     __tablename__ = "observation_dedup_keys"
@@ -726,6 +771,7 @@ class ObservationDedupKey(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
     source: Mapped[str] = mapped_column(Text, primary_key=True)
     dedup_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    actor_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     observation_id: Mapped[uuid.UUID]
     event_id: Mapped[uuid.UUID]
     kind: Mapped[str] = mapped_column(Text)
@@ -743,6 +789,9 @@ class Workspace(Base):
         CheckConstraint("status IN ('active', 'archived')", name="status"),
         CheckConstraint("id != parent_id", name="not_own_parent"),
         CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint(
+            "task_types IS NULL OR jsonb_typeof(task_types) = 'array'", name="task_types_array"
+        ),
         # slug is unique among siblings; NULL parent (root level) needs its own
         # partial index because NULLs never collide in a plain UNIQUE.
         Index(
@@ -775,6 +824,10 @@ class Workspace(Base):
     name: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, default="")
     custom_fields: Mapped[dict[str, Any]] = mapped_column(default=dict)
+    # Keys of the task types work here may have (CP-ADR-0008, amendment
+    # 2026-10-03 A1). NULL inherits from the nearest ancestor that sets it
+    # (every type when none does); [] allows none.
+    task_types: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     status: Mapped[str] = mapped_column(Text, default="active")
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime]
@@ -1352,6 +1405,134 @@ class ArtifactType(Base):
     updated_at: Mapped[datetime]
 
 
+class ConnectionType(Base):
+    """One immutable version of a connection type (CP-ADR-0079 §2).
+
+    Versioned like a skill (ADR-0021): ``(tenant_id, key, version)`` is unique,
+    the publisher names the version, and a database trigger rejects every
+    UPDATE but a forward ``status`` move (active -> deprecated -> disabled,
+    active -> disabled) with its ``row_version``; DELETE is rejected.
+    ``spec`` is the catalog object's spec as published, ``spec_hash`` the
+    sha256 of its canonical JSON: a second publication of the same pair
+    compares the hashes. ``display_name`` repeats ``spec.displayName`` for
+    lists.
+    """
+
+    __tablename__ = "connection_types"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'deprecated', 'disabled')", name="status"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint("row_version >= 1", name="row_version_positive"),
+        UniqueConstraint("tenant_id", "key", "version", name="uq_connection_types_key_version"),
+        Index("ix_connection_types_tenant_created", "tenant_id", "created_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(Text, default="active")
+    display_name: Mapped[str] = mapped_column(Text)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    spec_hash: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+    row_version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class Connection(Base):
+    """An account of an external system in the tenant (CP-ADR-0079 §3).
+
+    It belongs to the tenant, not to a person; two accounts of one type are two
+    rows with different keys. ``key`` never changes and is never reused: a
+    connection is not deleted, a revoked one connects again under its key.
+    ``(type_key, type_version)`` is a published version of the tenant's type.
+    ``secret_ref`` is the path of the material in the secret store, never the
+    material; it is set exactly when ``auth`` is. ``oauth_server`` names the
+    OAuth server the creds of an ``oauth2`` connection refresh through (one per
+    authorization attempt, CP-ADR-0079 §6); it is a name, not a secret.
+    ``version`` backs ``If-Match``
+    and moves with what a person or a status transition changes, not with
+    ``last_checked_at`` alone.
+    """
+
+    __tablename__ = "connections"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'active', 'expired', 'revoked')", name="status"),
+        CheckConstraint("auth IS NULL OR auth IN ('oauth2', 'token')", name="auth"),
+        CheckConstraint("(secret_ref IS NULL) = (auth IS NULL)", name="secret_ref_with_auth"),
+        CheckConstraint("oauth_server IS NULL OR auth = 'oauth2'", name="oauth_server_with_oauth2"),
+        CheckConstraint("jsonb_typeof(settings) = 'object'", name="settings_is_object"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        UniqueConstraint("tenant_id", "key", name="uq_connections_tenant_key"),
+        ForeignKeyConstraint(
+            ["tenant_id", "type_key", "type_version"],
+            ["connection_types.tenant_id", "connection_types.key", "connection_types.version"],
+            name="fk_connections_type_version",
+        ),
+        Index("ix_connections_tenant_created", "tenant_id", "created_at", "id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(Text)
+    type_key: Mapped[str] = mapped_column(Text)
+    type_version: Mapped[int] = mapped_column(Integer)
+    display_name: Mapped[str] = mapped_column(Text)
+    account: Mapped[str | None] = mapped_column(Text)
+    auth: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, default="pending")
+    status_reason: Mapped[str | None] = mapped_column(Text)
+    status_message: Mapped[str | None] = mapped_column(Text)
+    settings: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    secret_ref: Mapped[str | None] = mapped_column(Text)
+    oauth_server: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None]
+    connected_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
+    connected_at: Mapped[datetime | None]
+    last_checked_at: Mapped[datetime | None]
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ConnectionOAuthState(Base):
+    """One ``state`` of ``POST /connections/{key}:authorize`` (CP-ADR-0079 §6).
+
+    Only the SHA-256 of the state is kept: the state itself went to the browser
+    and is not stored anywhere. ``authority`` is the snapshot of the calling
+    credential (``authority_snapshot``) the callback acts with. A state is used
+    once: ``consumed_at`` is set by the first callback that names it (``outcome``
+    then says how the attempt ended) or by a later ``:authorize`` of the same
+    connection (``superseded``).
+    """
+
+    __tablename__ = "connection_oauth_states"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('consumed', 'authorized', 'failed', 'superseded')",
+            name="outcome",
+        ),
+        CheckConstraint("(consumed_at IS NULL) = (outcome IS NULL)", name="consumed_with_outcome"),
+        CheckConstraint("octet_length(state_hash) = 32", name="state_hash_sha256"),
+        UniqueConstraint("state_hash", name="uq_connection_oauth_states_state_hash"),
+        Index("ix_connection_oauth_states_connection", "connection_id", "consumed_at"),
+        Index("ix_connection_oauth_states_created", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    connection_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("connections.id"))
+    principal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    authority: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    state_hash: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime]
+    expires_at: Mapped[datetime]
+    consumed_at: Mapped[datetime | None]
+    outcome: Mapped[str | None] = mapped_column(Text)
+
+
 class Agent(Base):
     """A registered agent: its key, desired state and current revision (CP-ADR-0073).
 
@@ -1433,6 +1614,29 @@ class AgentRevision(Base):
     source_package_version: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     created_at: Mapped[datetime]
+
+
+class AgentSecretName(Base):
+    """The name of one of an agent's secrets, who set it and when (CP-ADR-0079 §11).
+
+    Only the name: the value went to the secret store in transit
+    (``kv/data/tenants/<t>/agents/<key>/<name>``) and is in no table. The
+    worker deletes the rows of a retired agent with their documents.
+    """
+
+    __tablename__ = "agent_secret_names"
+    __table_args__ = (
+        CheckConstraint("name ~ '^[a-z0-9][a-z0-9-]{0,62}$'", name="name_format"),
+        Index("ix_agent_secret_names_tenant", "tenant_id"),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"), primary_key=True)
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+    updated_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    updated_at: Mapped[datetime]
 
 
 class AgentObservedStatus(Base):
@@ -1757,6 +1961,9 @@ class TaskVerification(Base):
     started_at: Mapped[datetime]
     finished_at: Mapped[datetime | None]
     updated_at: Mapped[datetime]
+    # The task's evidence tied to a check when the attempt closed: a later
+    # attempt does not count those facts again (CP-ADR-0063 Zh7).
+    spent_evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
 
 
 # --- M1.3 work derivation rules (CP-ADR-0063) -----------------------------------
@@ -2489,6 +2696,20 @@ class ProcessInstance(Base):
         ),
         Index("ix_process_instances_tenant_status", "tenant_id", "status", "definition_key"),
         Index("ix_process_instances_refs", "refs", postgresql_using="gin"),
+        # The data under a view (CP-ADR-0080 amendment A): data @> {...} and a page of a process.
+        Index(
+            "ix_process_instances_data",
+            "data",
+            postgresql_using="gin",
+            postgresql_ops={"data": "jsonb_path_ops"},
+        ),
+        Index(
+            "ix_process_instances_tenant_definition_started",
+            "tenant_id",
+            "definition_key",
+            "started_at",
+            "id",
+        ),
         Index("ix_process_instances_parent", "parent_instance_id"),
         Index(
             "ix_process_instances_sla_due",
@@ -2586,11 +2807,13 @@ class PackageObject(Base):
     __table_args__ = (
         CheckConstraint(
             "kind IN ('ArtifactType', 'TaskType', 'ProjectTemplate', 'WorkspaceType', 'Role', "
-            "'Capability', 'Skill', 'WorkRule', 'Agent', 'Process', 'Calendar')",
+            "'Capability', 'ConnectionType', 'Skill', 'WorkRule', 'Agent', 'Process', 'Calendar', "
+            "'View')",
             name="kind_known",
         ),
         CheckConstraint(
-            "kind NOT IN ('Process', 'Calendar') OR (plan_hash IS NOT NULL AND version IS NOT NULL"
+            "kind NOT IN ('Process', 'Calendar', 'View') OR (plan_hash IS NOT NULL"
+            " AND version IS NOT NULL"
             " AND spec IS NOT NULL AND spec_hash IS NOT NULL)",
             name="planned_spec",
         ),
@@ -2610,6 +2833,177 @@ class PackageObject(Base):
     plan_hash: Mapped[str | None] = mapped_column(Text)
     applied_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
     applied_at: Mapped[datetime]
+
+
+class View(Base):
+    """A screen of a package by description (CP-ADR-0080, TAI-ADR-0066): the key and its state.
+
+    Written only by ``POST /packages:apply`` (under the tenant's apply lock):
+    ``current_revision`` is the latest :class:`ViewRevision`; ``status``
+    ``retired`` — the package that installed the view no longer brings it.
+    Which package that is lives in ``package_objects`` (kind ``View``).
+    """
+
+    __tablename__ = "views"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'retired')", name="status_known"),
+        CheckConstraint("current_revision >= 1", name="revision_positive"),
+        UniqueConstraint("tenant_id", "key", name="uq_views_tenant_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    key: Mapped[str] = mapped_column(Text)
+    current_revision: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(Text)
+    retired_at: Mapped[datetime | None]
+    retired_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+    updated_at: Mapped[datetime]
+
+
+class ViewRevision(Base):
+    """An immutable revision of a view: its checked form and the hash of it.
+
+    ``spec`` is the form (``domain/views.py``): the spec with its components
+    inlined, ``messages`` — the texts of its keys by locale, ``locales`` and
+    ``defaultLocale``. ``source_kind``/``source_key`` and ``audience_roles``
+    repeat what a list filters by.
+    """
+
+    __tablename__ = "view_revisions"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        CheckConstraint("source_kind IN ('process', 'tasks', 'knowledge')", name="source_known"),
+        UniqueConstraint("view_id", "revision", name="uq_view_revisions_view_revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    view_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("views.id"))
+    revision: Mapped[int] = mapped_column(Integer)
+    hash: Mapped[str] = mapped_column(Text)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    source_kind: Mapped[str] = mapped_column(Text)
+    source_key: Mapped[str | None] = mapped_column(Text)
+    audience_roles: Mapped[list[str] | None] = mapped_column(JSONB)
+    package_key: Mapped[str | None] = mapped_column(Text)
+    package_version: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+
+
+class PackageDictionary(Base):
+    """The dictionaries of a package, a revision per change (TAI-ADR-0066 p.1a).
+
+    ``messages`` — ``{locale: {key: text}}`` of ``i18n/<locale>.yaml``;
+    ``hash`` — of ``locales``, ``defaultLocale`` and ``messages``. An apply of
+    the package writes a revision when the hash differs from the latest one.
+    """
+
+    __tablename__ = "package_dictionaries"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        UniqueConstraint(
+            "tenant_id", "package_key", "revision", name="uq_package_dictionaries_package_revision"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    package_key: Mapped[str] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer)
+    package_version: Mapped[str | None] = mapped_column(Text)
+    locales: Mapped[list[str]] = mapped_column(JSONB)
+    default_locale: Mapped[str] = mapped_column(Text)
+    messages: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    hash: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    created_at: Mapped[datetime]
+
+
+class PackageSettingsSchema(Base):
+    """The settings schema of a package by revision (CP-ADR-0081 §3); rows are only inserted.
+
+    ``POST /packages:apply`` writes a revision when the hash of ``{schema,
+    uischema}`` differs from the active one; at most one revision of a package
+    is ``active`` (a partial unique index), none once the package stops
+    declaring settings. ``schema`` and ``uischema`` are as in the manifest —
+    dictionary keys, no strings. Only ``active`` ever changes.
+    """
+
+    __tablename__ = "package_settings_schemas"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        UniqueConstraint(
+            "tenant_id",
+            "package_key",
+            "revision",
+            name="uq_package_settings_schemas_package_revision",
+        ),
+        Index(
+            "uq_package_settings_schemas_active",
+            "tenant_id",
+            "package_key",
+            unique=True,
+            postgresql_where=text("active"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    package_key: Mapped[str] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer)
+    package_version: Mapped[str | None] = mapped_column(Text)
+    schema: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    uischema: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    schema_hash: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean)
+    plan_hash: Mapped[str] = mapped_column(Text)
+    applied_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    applied_at: Mapped[datetime]
+
+
+class PackageSettings(Base):
+    """The saved settings of a package, one row per package from its first ``PUT`` (§3).
+
+    ``values`` — what a person saved, nothing of the defaults; ``version`` —
+    the number of the latest :class:`PackageSettingsVersion`, moved only by
+    ``PUT /packages/{key}/settings``; ``schema_revision`` — the revision the
+    values were checked against.
+    """
+
+    __tablename__ = "package_settings"
+    __table_args__ = (CheckConstraint("version >= 1", name="version_positive"),)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    package_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    values: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    version: Mapped[int] = mapped_column(Integer)
+    schema_revision: Mapped[int] = mapped_column(Integer)
+    updated_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    updated_at: Mapped[datetime]
+
+
+class PackageSettingsVersion(Base):
+    """One saving of the settings of a package (§3); rows are never updated or deleted.
+
+    ``changed_paths`` — JSON Pointers of the members whose saved value differs
+    from the version before. The pair (version, schema revision) names the
+    effective values an object of the package saw (§6).
+    """
+
+    __tablename__ = "package_settings_versions"
+    __table_args__ = (CheckConstraint("version >= 1", name="version_positive"),)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    package_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    values: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    schema_revision: Mapped[int] = mapped_column(Integer)
+    changed_paths: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    updated_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("principals.id"))
+    updated_at: Mapped[datetime]
 
 
 class CatalogRetirement(Base):
@@ -2676,13 +3070,20 @@ class ProcessInstanceEvent(Base):
     where the input came from (``event:<id>``, ``timer:<id>``…) and is unique
     per instance, so the same input delivered twice is taken once. The journal
     alone replays the instance: ``calendars`` names the calendar versions the
-    step was computed on.
+    step was computed on; ``settings_version`` and ``settings_schema_revision``
+    — the settings of the package a step of a process that reads them saw
+    (CP-ADR-0081 §6), ``null`` for every other record.
     """
 
     __tablename__ = "process_instance_events"
     __table_args__ = (
         UniqueConstraint(
             "instance_id", "source_ref", name="uq_process_instance_events_instance_source"
+        ),
+        CheckConstraint(
+            "(settings_version IS NULL) = (settings_schema_revision IS NULL)"
+            " AND (settings_version IS NULL OR settings_version >= 0)",
+            name="settings_pair",
         ),
     )
 
@@ -2700,4 +3101,6 @@ class ProcessInstanceEvent(Base):
     decisions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     intents: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     calendars: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    settings_version: Mapped[int | None] = mapped_column(Integer)
+    settings_schema_revision: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime]

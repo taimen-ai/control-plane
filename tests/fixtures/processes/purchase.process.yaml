@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../../../../package-sdk/schema/v1/object.schema.json
+# yaml-language-server: $schema=../../../../sdk/package-sdk/schema/v1/object.schema.json
 # Пример процесса для контракта схемы (TAI-ADR-0054): не пакет, не устанавливается.
 # Показывает оба уровня языка, согласование с кворумом, таймеры от даты данных,
 # таблицу решений, память (проекция дела, recall, remember, контекст шага),

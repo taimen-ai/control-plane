@@ -1,7 +1,7 @@
 """Link catalog objects to the package that installed them: ``POST /packages:record``.
 
 CP-ADR-0074 §11, amendment TASK-000904 (:mod:`control_plane.domain.package_links`).
-The installer (``cp_packages --install``) applies every kind but the engine's
+The installer (package-sdk) applies every kind but the engine's
 (``Process``, ``Calendar``) — task types, agents and rules until it moves to
 plan and apply — through their own routes and then names, per package, every object it applied — the
 unchanged ones too: an upgrade of the package moves their link to its new
@@ -33,6 +33,7 @@ from control_plane.infrastructure.db.models import (
     ArtifactType,
     Base,
     Capability,
+    ConnectionType,
     PackageObject,
     ProjectTemplate,
     Role,
@@ -59,6 +60,7 @@ _KINDS: dict[str, _Kind] = {
     "WorkspaceType": _Kind(WorkspaceType, WorkspaceType.key, Permission.WORKSPACES_MANAGE),
     "Role": _Kind(Role, Role.slug, Permission.ORG_MANAGE),
     "Capability": _Kind(Capability, Capability.name, Permission.ORG_MANAGE),
+    "ConnectionType": _Kind(ConnectionType, ConnectionType.key, Permission.CONNECTIONS_MANAGE),
     "Skill": _Kind(Skill, Skill.name, Permission.ORG_MANAGE),
     "WorkRule": _Kind(WorkRule, WorkRule.key, Permission.RULES_WRITE),
     "Agent": _Kind(Agent, Agent.key, Permission.AGENTS_MANAGE),

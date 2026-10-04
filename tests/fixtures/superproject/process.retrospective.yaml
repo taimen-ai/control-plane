@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../../../package-sdk/schema/v1/object.schema.json
+# yaml-language-server: $schema=../../../sdk/package-sdk/schema/v1/object.schema.json
 # Сгенерировано skill-sdk из кода — правьте код и перегенерируйте (TAI-ADR-0045).
 apiVersion: taimen.ai/v1
 kind: Skill

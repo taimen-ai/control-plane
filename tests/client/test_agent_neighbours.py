@@ -331,6 +331,134 @@ async def test_a_superproject_task_that_merged_a_moved_pin_publishes_it(
     assert "notes.md" in _git(forge.superproject, "ls-tree", "--name-only", branch).split()
 
 
+async def test_a_superproject_task_that_followed_a_pin_the_base_moved_is_done(
+    client: httpx.AsyncClient, sdk: Make, tmp_path: Path
+) -> None:
+    """TASK-001387: a pin moved in the base during the run is not the executor's change."""
+    s = await _setup(client)
+    forge = Forge(tmp_path)
+    task = await _task(client, s["admin"], "superproject")
+
+    def follow_the_base(workspace: Workspace) -> None:
+        # The submodule-lag rule moves the pin while the task runs; the task
+        # merges its base and updates the submodule checkout to match.
+        _git(forge.superproject, "update-index", "--cacheinfo", f"160000,{forge.tip},control-plane")
+        _git(forge.superproject, "commit", "-qm", "move the pin")
+        _git(workspace.path, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        _git(workspace.path, "merge", "-q", "--no-edit", "origin/main")
+        submodule = workspace.path / "control-plane"
+        _git(submodule, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        _git(submodule, "checkout", "-q", "--detach", forge.tip)
+        (workspace.path / "notes.md").write_text("work\n")
+
+    await _work(sdk, s["agent"], Adapter(follow_the_base), forge)
+
+    [run] = (await _get(client, s["admin"], "/runs", taskId=task["id"]))["items"]
+    assert run["failureReason"] != "neighbour_modified"
+    assert (await _get(client, s["admin"], f"/tasks/{task['id']}"))["status"] == "done"
+    branch = f"task/{task['publicId']}"
+    assert _git(forge.superproject, "ls-tree", branch, "control-plane").split()[2] == forge.tip
+    assert "notes.md" in _git(forge.superproject, "ls-tree", "--name-only", branch).split()
+
+
+async def test_a_superproject_task_that_rolled_a_pin_back_is_told_how_to_fix_it(
+    client: httpx.AsyncClient, sdk: Make, tmp_path: Path
+) -> None:
+    """TASK-001396: a merge of the base, then ``commit -a`` over the old checkout."""
+    s = await _setup(client)
+    forge = Forge(tmp_path)
+    task = await _task(client, s["admin"], "superproject")
+
+    def merge_then_commit_all(workspace: Workspace) -> None:
+        _git(forge.superproject, "update-index", "--cacheinfo", f"160000,{forge.tip},control-plane")
+        _git(forge.superproject, "commit", "-qm", "move the pin")
+        _git(workspace.path, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        _git(workspace.path, "merge", "-q", "--no-edit", "origin/main")
+        (workspace.path / "notes.md").write_text("work\n")
+        _git(workspace.path, "add", "-A")
+        _git(workspace.path, "commit", "-qm", "work")
+
+    await _work(sdk, s["agent"], Adapter(merge_then_commit_all), forge)
+
+    [run] = (await _get(client, s["admin"], "/runs", taskId=task["id"]))["items"]
+    assert (run["status"], run["failureReason"]) == ("failed", "neighbour_pointer_regressed")
+    reason = run["output"]["reason"]
+    assert forge.tip in reason and forge.pin in reason
+    assert "git checkout origin/main -- control-plane" in reason
+    assert str(tmp_path) not in reason
+    # The next attempt reads it in the task's comments; nothing was published.
+    comments = (await _get(client, s["admin"], f"/tasks/{task['id']}/comments"))["items"]
+    assert any("git checkout origin/main -- control-plane" in c["body"] for c in comments)
+    assert _branches(forge.superproject) == []
+
+
+class PackageSdk:
+    """A submodule of the superproject ``neighbours`` does not name, as package-sdk."""
+
+    def __init__(self, forge: Forge) -> None:
+        self.forge = forge
+        self.repo = _repo(forge.superproject.parent / "package-sdk", {})
+        self.pin = _git(self.repo, "rev-parse", "HEAD")
+        self.tip = _commit(self.repo, {"README.md": "later\n"}, "later")
+        self._point(self.pin)
+
+    def _point(self, revision: str) -> None:
+        sp = self.forge.superproject
+        _git(sp, "update-index", "--add", "--cacheinfo", f"160000,{revision},package-sdk")
+        _git(sp, "commit", "-qm", "pin package-sdk")
+
+    def merge_moved_base(self, workspace: Workspace) -> None:
+        """The executor checks the SDK out, the base moves it, the task merges the base."""
+        _git(workspace.path, "clone", "-q", "--no-checkout", str(self.repo), "package-sdk")
+        _git(workspace.path / "package-sdk", "checkout", "-q", "--detach", self.pin)
+        self._point(self.tip)
+        _git(workspace.path, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        _git(workspace.path, "merge", "-q", "--no-edit", "origin/main")
+        assert _git(workspace.path, "status", "--porcelain") == "M package-sdk"
+        (workspace.path / "notes.md").write_text("work\n")
+
+
+async def test_the_daemon_s_commit_keeps_the_base_s_pointer_of_an_undeclared_submodule(
+    client: httpx.AsyncClient, sdk: Make, tmp_path: Path
+) -> None:
+    """9b30f86, 54d149a: the daemon's own commit took the old checkout of package-sdk."""
+    s = await _setup(client)
+    forge = Forge(tmp_path)
+    package = PackageSdk(forge)
+    task = await _task(client, s["admin"], "superproject")
+
+    await _work(sdk, s["agent"], Adapter(package.merge_moved_base), forge)
+
+    assert (await _get(client, s["admin"], f"/tasks/{task['id']}"))["status"] == "done"
+    branch = f"task/{task['publicId']}"
+    assert _git(forge.superproject, "ls-tree", branch, "package-sdk").split()[2] == package.tip
+    assert "notes.md" in _git(forge.superproject, "ls-tree", "--name-only", branch).split()
+
+
+async def test_commit_all_over_an_undeclared_submodule_is_told_how_to_fix_it(
+    client: httpx.AsyncClient, sdk: Make, tmp_path: Path
+) -> None:
+    s = await _setup(client)
+    forge = Forge(tmp_path)
+    package = PackageSdk(forge)
+    task = await _task(client, s["admin"], "superproject")
+
+    def merge_then_commit_all(workspace: Workspace) -> None:
+        package.merge_moved_base(workspace)
+        _git(workspace.path, "add", "-A")
+        _git(workspace.path, "commit", "-qm", "work")
+
+    await _work(sdk, s["agent"], Adapter(merge_then_commit_all), forge)
+
+    [run] = (await _get(client, s["admin"], "/runs", taskId=task["id"]))["items"]
+    assert (run["status"], run["failureReason"]) == ("failed", "neighbour_pointer_regressed")
+    reason = run["output"]["reason"]
+    assert package.tip in reason and package.pin in reason
+    assert "git checkout origin/main -- package-sdk" in reason
+    assert str(tmp_path) not in reason
+    assert _branches(forge.superproject) == []
+
+
 async def test_a_superproject_task_that_moved_a_pin_itself_is_blocked(
     client: httpx.AsyncClient, sdk: Make, tmp_path: Path
 ) -> None:

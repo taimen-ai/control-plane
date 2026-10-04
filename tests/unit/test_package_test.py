@@ -16,8 +16,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import yaml
+from jsonschema import Draft202012Validator
 
-from control_plane.application.commands.package_test import sql_writes
+from control_plane.application.commands.package_test import sandbox_rules, sql_writes
 from control_plane.application.commands.process_instances import remembered
 from control_plane.application.context.graph import entity_key
 from control_plane.domain import package_source
@@ -35,6 +36,7 @@ from control_plane.domain.package_source import (
     SourceError,
     load_file,
     load_yaml,
+    package_test_schema,
     parse_package,
     select_tests,
 )
@@ -829,6 +831,75 @@ stages:
     assert wrong.status == "failed" and "field schema" in wrong.failures[0].message
 
 
+AUTHORED = """
+start:
+  on: {observation: case.opened}
+  key: event.payload.number
+  set: {number: string(event.payload.number), author: string(event.actorId)}
+correlate:
+  - on: {observation: case.changed}
+    key: event.payload.number
+    set: {note: event.actorId}
+stages:
+  - id: s
+    steps:
+      - {id: hold, human: {taskType: review, assign: [{role: lead}]}}
+"""
+
+
+def _emit(observation: str, **extra: Any) -> dict[str, Any]:
+    return {"emit": {"observation": observation, "payload": {"number": "N-1"}, **extra}}
+
+
+def test_the_author_of_an_emitted_event_is_its_actor_id() -> None:
+    steps = [
+        _emit("case.opened", by="alice"),
+        {"expect": {"status": "running", "data": {"author": "alice"}}},
+        _emit("case.changed", by="agent:writer"),
+        {"expect": {"data": {"author": "alice", "note": "agent:writer"}}},
+    ]
+    result = run(AUTHORED, steps, given={"principals": {"lead": ["alice"]}})
+    assert result.status == "passed", result.failures
+
+
+def test_the_author_of_an_event_is_the_actor_of_the_inputs_it_feeds() -> None:
+    box = sb.Sandbox(world(AUTHORED), {"process": "test", "steps": []}, seed="t")
+    box.emit(_emit("case.opened", by="alice")["emit"])
+    box.emit(_emit("case.changed", by="bob")["emit"])
+    box.emit(_emit("case.changed")["emit"])
+    (journal,) = box.journals.values()
+    inputs = [e["data"]["input"] for e in journal if e["kind"] == "input"]
+    assert [(i["kind"], i["actorId"]) for i in inputs] == [
+        ("start", "alice"),
+        ("event", "bob"),
+        ("event", None),
+    ]
+
+
+def test_an_event_without_an_author_has_no_actor_id_as_before() -> None:
+    # As before ``by``: no actorId in the event, and the instance fails on it.
+    failed = {"status": "failed", "error": "expression_error"}
+    assert run(AUTHORED, [_emit("case.opened"), {"expect": failed}]).status == "passed"
+    guarded = AUTHORED.replace(
+        "author: string(event.actorId)",
+        "author: \"has(event.actorId) ? event.actorId : 'nobody'\"",
+    )
+    steps = [_emit("case.opened"), {"expect": {"data": {"author": "nobody"}}}]
+    assert run(guarded, steps).status == "passed"
+
+
+def test_the_schema_takes_a_principal_or_an_agent_as_the_author_of_an_emit() -> None:
+    validator = Draft202012Validator(package_test_schema())
+
+    def errors(by: Any) -> list[str]:
+        step = {"emit": {"observation": "case.opened", "by": by}}
+        test = {"name": "t", "process": "p", "steps": [step]}
+        return [e.message for e in validator.iter_errors(test)]
+
+    assert errors("alice") == [] and errors("agent:writer") == []
+    assert errors("") and errors(None) and errors(7) and errors(["alice"])
+
+
 def test_an_expectation_that_does_not_hold_names_what_was_expected_and_what_is() -> None:
     result = run(
         "stages: [{id: s, steps: [{id: note, set: {note: \"'x'\"}}]}]",
@@ -1313,3 +1384,262 @@ def test_a_lesson_of_a_closed_case_is_recalled_by_the_next_case_of_the_customer(
         given={"principals": {"lead": ["alice"]}},
     )
     assert other.remembered == []
+
+
+PREFILLED = """
+stages:
+  - id: s
+    steps:
+      - id: review
+        human:
+          taskType: review
+          assign: [{role: lead}]
+          customFields: {decision: "data.number + '-draft'"}
+        output: {as: {decision: step.result.decision}}
+"""
+
+
+def test_a_human_step_fills_its_task_from_the_case_and_the_person_may_keep_it() -> None:
+    """``human.customFields`` (CP-ADR-0074 §7, amendment 2026-10-01): as on the core."""
+    given = {"principals": {"lead": ["alice"]}}
+    kept = run(
+        PREFILLED,
+        [
+            opened(),
+            {"expect": {"tasks": [{"step": "review", "customFields": {"decision": "N-1-draft"}}]}},
+            {"complete": {"step": "review", "by": "alice"}},
+            {"expect": {"status": "completed", "data": {"decision": "N-1-draft"}}},
+        ],
+        given=given,
+    )
+    assert kept.status == "passed", kept.failures
+    changed = run(
+        PREFILLED,
+        [
+            opened(),
+            {"complete": {"step": "review", "by": "alice", "output": {"decision": "yes"}}},
+            {"expect": {"status": "completed", "data": {"decision": "yes"}}},
+        ],
+        given=given,
+    )
+    assert changed.status == "passed", changed.failures
+    other = run(
+        PREFILLED,
+        [opened(), {"expect": {"tasks": [{"step": "review", "customFields": {"decision": "x"}}]}}],
+        given=given,
+    )
+    assert other.status == "failed"
+    assert other.failures[0].actual == [
+        {
+            "step": "review",
+            "status": "open",
+            "assignee": "role:lead",
+            "due": None,
+            "customFields": {"decision": "N-1-draft"},
+        }
+    ]
+
+
+def test_fields_the_type_refuses_fail_the_step_as_on_the_core() -> None:
+    narrow = {"type": "object", "properties": {"decision": {"type": "string", "maxLength": 3}}}
+    task_types = {**CATALOG.task_types, "review": narrow}
+    catalog = dataclasses.replace(CATALOG, task_types=task_types)
+    definition = Definition.build("test", pd.normalized_spec(spec(PREFILLED)), catalog)
+    narrow_world = sb.World(
+        definitions={"test": definition},
+        skills=catalog.skills,
+        task_types=task_types,
+        agents=catalog.agents,
+        roles=frozenset({"lead"}),
+        calendars=CALENDARS,
+    )
+    result = sb.run_test(
+        narrow_world,
+        "tests/t.test.yaml",
+        {
+            "process": "test",
+            "name": "t",
+            "given": {"principals": {"lead": ["alice"]}},
+            "steps": [opened(), {"expect": {"status": "failed", "error": "intent_failed"}}],
+        },
+    )
+    assert result.status == "passed", result.failures
+
+
+# --- rules that close the task an observation is bound to (CP-ADR-0063 Zh5; I013) --------
+
+REVIEWED = """
+stages:
+  - id: s
+    steps:
+      - id: review
+        human: {taskType: review, assign: [{role: lead}]}
+      - id: done
+        complete: {outcome: reviewed}
+"""
+
+
+def _closing(kind: str = "complete_work", **extra: Any) -> dict[str, Any]:
+    return {
+        "trigger": {"kind": "observation", "type": "case.closed", "agent": "observer"},
+        "condition": True,
+        "interpretation": None,
+        "action": {"kind": kind, "target": "task", "taskTypes": ["review"], "fields": {}, **extra},
+    }
+
+
+def closed(task: str | None = "review", **payload: Any) -> dict[str, Any]:
+    emit: dict[str, Any] = {"observation": "case.closed", "payload": payload}
+    if task is not None:
+        emit["task"] = task
+    return {"emit": emit}
+
+
+def run_rules(
+    steps: list[dict[str, Any]], rules: dict[str, dict[str, Any]], body: str = REVIEWED
+) -> sb.TestResult:
+    return sb.run_test(
+        world(body, rules=rules),
+        "tests/t.test.yaml",
+        {"process": "test", "name": "t", "steps": steps},
+    )
+
+
+def test_an_observation_closes_the_task_of_a_step_by_a_rule_of_the_package() -> None:
+    steps = [
+        opened(),
+        {"expect": {"tasks": [{"step": "review", "status": "open"}]}},
+        closed(),
+        {
+            "expect": {
+                "status": "completed",
+                "outcome": "reviewed",
+                "tasks": [{"step": "review", "status": "completed"}],
+                "rules": [{"rule": "close-review", "result": "matched", "step": "review"}],
+            }
+        },
+        # Another fact about the same task: done is done.
+        closed(),
+        {
+            "expect": {
+                "rules": [{"rule": "close-review", "result": "skipped", "reason": "already_done"}]
+            }
+        },
+    ]
+    result = run_rules(steps, {"close-review": _closing()})
+    assert result.status == "passed", result.failures
+
+
+def test_a_rule_cancels_the_bound_task_and_a_closed_task_stays_closed() -> None:
+    steps = [
+        opened(),
+        closed(),
+        {"expect": {"tasks": [{"step": "review", "status": "cancelled"}]}},
+        closed(),
+        {"expect": {"rules": [{"result": "skipped", "reason": "already_closed"}]}},
+    ]
+    result = run_rules(steps, {"cancel-review": _closing("cancel_work")})
+    assert result.status == "passed", result.failures
+
+
+def test_a_rule_skips_a_type_it_does_not_list_and_an_observation_bound_to_nothing() -> None:
+    rule = _closing(taskTypes=["sign-off"])
+    steps = [
+        opened(),
+        closed(),
+        closed(task=None),
+        {
+            "expect": {
+                "tasks": [{"step": "review", "status": "open"}],
+                "rules": [
+                    {"result": "skipped", "reason": "bound_task_type_not_listed"},
+                    {"result": "skipped", "reason": "no_bound_task"},
+                ],
+            }
+        },
+    ]
+    result = run_rules(steps, {"close-review": rule})
+    assert result.status == "passed", result.failures
+
+
+def test_a_rule_condition_reads_the_bound_task_and_the_observation() -> None:
+    rule = {
+        **_closing(),
+        "condition": {
+            "and": [
+                {"eq": [{"var": "task.typeKey"}, "review"]},
+                {"eq": [{"var": "payload.state"}, "won"]},
+            ]
+        },
+    }
+    steps = [
+        opened(),
+        closed(state="lost"),
+        {
+            "expect": {
+                "tasks": [{"step": "review", "status": "open"}],
+                "rules": [{"result": "not_matched"}],
+            }
+        },
+        closed(state="won"),
+        {"expect": {"tasks": [{"step": "review", "status": "completed"}]}},
+    ]
+    result = run_rules(steps, {"close-review": rule})
+    assert result.status == "passed", result.failures
+
+
+def test_an_expected_rule_decision_that_was_not_taken_fails_the_test() -> None:
+    steps = [
+        opened(),
+        closed(),
+        {"expect": {"rules": [{"rule": "close-review", "result": "matched"}]}},
+    ]
+    result = run_rules(steps, {"close-review": _closing(taskTypes=["sign-off"])})
+    assert result.status == "failed"
+    assert "no decision of a rule" in result.failures[0].message
+
+
+def test_emit_task_needs_an_observation_and_a_step_with_a_task() -> None:
+    on_event = run_rules(
+        [opened(), {"emit": {"event": "case.touched", "task": "review"}}], {"r": _closing()}
+    )
+    assert on_event.status == "failed" and "emit.task" in on_event.failures[0].message
+    no_task = run_rules([opened(), closed(task="done")], {"r": _closing()})
+    assert no_task.status == "failed" and "has no task" in no_task.failures[0].message
+    interpreted = run_rules(
+        [opened(), closed()],
+        {"r": {**_closing(), "interpretation": {"skill": "work.do@1", "inputs": {}}}},
+    )
+    assert interpreted.status == "failed" and "interpretation" in interpreted.failures[0].message
+
+
+def test_the_package_rules_with_target_task_are_checked_and_handed_to_the_sandbox() -> None:
+    def rule(key: str, action: str) -> tuple[str, str]:
+        return (
+            f"rules/{key}.yaml",
+            f"apiVersion: {API_VERSION}\nkind: WorkRule\nkey: {key}\nspec:\n"
+            "  trigger: {kind: observation, type: case.closed, agent: observer}\n"
+            f"  action: {action}\n",
+        )
+
+    package = parse_package(
+        [
+            ("package.yaml", f"apiVersion: {API_VERSION}\nkind: Package\nkey: p\nspec: {{}}\n"),
+            rule("good", "{kind: complete_work, target: task, taskTypes: [review]}"),
+            rule(
+                "keyed",
+                "{kind: complete_work, target: task, taskTypes: [review], dedupKeyTemplate: k}",
+            ),
+            rule("filing", "{kind: ensure_work, taskType: review, dedupKeyTemplate: k}"),
+        ]
+    )
+    rules, problems = sandbox_rules(package)
+    assert list(rules) == ["good"]
+    assert rules["good"]["action"] == {
+        "kind": "complete_work",
+        "target": "task",
+        "taskTypes": ["review"],
+    }
+    assert [(p.code, p.file, p.path, p.line) for p in problems] == [
+        ("invalid_rule_action", "rules/keyed.yaml", "/spec/action/dedupKeyTemplate", 6)
+    ]

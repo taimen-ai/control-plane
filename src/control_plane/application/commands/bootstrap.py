@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from control_plane.application.authorization import VISIBILITY_TENANT
 from control_plane.application.commands.task_types import ensure_system_task_type
 from control_plane.application.commands.workspace_types import ensure_system_workspace_type
 from control_plane.application.common import new_uuid, utcnow
@@ -172,6 +173,7 @@ async def bootstrap(
                 "iamTenantId": str(binding.iam_tenant_id),
                 "iamPrincipalId": str(binding.iam_principal_id),
                 "permissions": binding.permissions,
+                "visibility": binding.visibility or VISIBILITY_TENANT,
             },
         )
     return BootstrapResult(

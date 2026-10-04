@@ -55,8 +55,8 @@ async def record_observation(
                 payload.external_ref.model_dump() if payload.external_ref is not None else None
             ),
         )
-        # A repeated (source, dedupKey) is not a creation: 200 with the
-        # observation the key first produced (CP-ADR-0057).
+        # A (source, dedupKey) repeated by its author is not a creation: 200
+        # with the observation the key first produced (CP-ADR-0057).
         return 200 if recorded.deduplicated else 201, {
             "id": str(recorded.id),
             "eventId": str(recorded.event_id),

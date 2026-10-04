@@ -1,6 +1,7 @@
 """Read-side queries for the organization model."""
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from sqlalchemy import ColumnElement, exists, or_, select
@@ -13,6 +14,7 @@ from control_plane.application.commands.workspaces import (
 )
 from control_plane.application.queries.lists import Page, _paginate, clamp_limit
 from control_plane.application.queries.package_links import in_package
+from control_plane.application.visibility import workspace_condition
 from control_plane.domain.enums import Permission, WorkspaceStatus
 from control_plane.domain.errors import AuthorizationError, NotFoundError, ValidationError
 from control_plane.infrastructure.db.models import (
@@ -41,11 +43,20 @@ async def list_workspaces(
     await authorize(ctx, Permission.WORKSPACES_READ)
     if status is not None and status not in set(WorkspaceStatus):
         raise ValidationError("invalid_status", f"Unknown workspace status: {status}")
-    stmt = select(Workspace).where(Workspace.tenant_id == ctx.tenant_id)
+    stmt = select(Workspace).where(
+        Workspace.tenant_id == ctx.tenant_id, workspace_condition(ctx, Workspace.id)
+    )
     if parent_id is not None:
         stmt = stmt.where(Workspace.parent_id == parent_id)
     elif roots_only:
-        stmt = stmt.where(Workspace.parent_id.is_(None))
+        # A visible workspace whose parent is not visible is a root to the
+        # caller (CP-ADR-0082 §3.9).
+        stmt = stmt.where(
+            or_(
+                Workspace.parent_id.is_(None),
+                ~workspace_condition(ctx, Workspace.parent_id),
+            )
+        )
     if status is not None:
         stmt = stmt.where(Workspace.status == status)
     return await _paginate(
@@ -65,7 +76,8 @@ async def get_workspace(
     workspace = await session.scalar(
         select(Workspace).where(Workspace.id == workspace_id, Workspace.tenant_id == ctx.tenant_id)
     )
-    if workspace is None:
+    # An invisible workspace answers as a missing one (CP-ADR-0082 §3.6).
+    if workspace is None or not ctx.sees_workspace(workspace.id):
         raise NotFoundError("Workspace not found", details={"workspaceId": str(workspace_id)})
     return workspace
 
@@ -130,28 +142,10 @@ async def list_workspace_participants(
     the rule of ``GET /roles/{id}/principals?workspaceId=`` (CP-ADR-0068) and
     either the role belongs to this workspace or the assignment is scoped to it.
     """
-    await authorize(ctx, Permission.WORKSPACES_READ)
-    # Who holds which role is org data, as in GET /roles/{id}/principals.
-    await authorize(ctx, Permission.ORG_READ, Permission.PRINCIPALS_READ)
+    await authorize_participants_read(ctx)
     await get_workspace(session, ctx, workspace_id)
-    scope = await role_assignment_scope(session, ctx.tenant_id, workspace_id)
-    role_here = or_(Role.workspace_id == workspace_id, PrincipalRole.workspace_id == workspace_id)
-    is_member = exists().where(
-        WorkspaceMember.tenant_id == ctx.tenant_id,
-        WorkspaceMember.workspace_id == workspace_id,
-        WorkspaceMember.principal_id == Principal.id,
-    )
-    holds_role = (
-        exists()
-        .where(
-            PrincipalRole.principal_id == Principal.id,
-            PrincipalRole.tenant_id == ctx.tenant_id,
-            scope,
-            role_here,
-        )
-        .where(Role.id == PrincipalRole.role_id)
-    )
-    stmt = select(Principal).where(Principal.tenant_id == ctx.tenant_id, or_(is_member, holds_role))
+    rule = await _participant_rule(session, ctx.tenant_id, workspace_id)
+    stmt = select(Principal).where(Principal.tenant_id == ctx.tenant_id, rule.condition)
     page = await _paginate(
         session,
         stmt,
@@ -160,7 +154,73 @@ async def list_workspace_participants(
         limit=clamp_limit(limit),
         cursor=cursor,
     )
-    ids = [p.id for p in page.items]
+    return Page(
+        items=await _describe_participants(session, ctx.tenant_id, rule, page.items),
+        next_cursor=page.next_cursor,
+    )
+
+
+async def authorize_participants_read(ctx: AuthContext) -> None:
+    """The right to read who takes part in a workspace."""
+    await authorize(ctx, Permission.WORKSPACES_READ)
+    # Who holds which role is org data, as in GET /roles/{id}/principals.
+    await authorize(ctx, Permission.ORG_READ, Permission.PRINCIPALS_READ)
+
+
+async def workspace_participants(
+    session: AsyncSession, tenant_id: uuid.UUID, workspace_id: uuid.UUID, *, kind: str
+) -> list[WorkspaceParticipant]:
+    """Every participant of ``kind``, unpaged; the caller has authorized the read."""
+    rule = await _participant_rule(session, tenant_id, workspace_id)
+    principals = (
+        await session.scalars(
+            select(Principal)
+            .where(Principal.tenant_id == tenant_id, Principal.kind == kind, rule.condition)
+            .order_by(Principal.created_at, Principal.id)
+        )
+    ).all()
+    return await _describe_participants(session, tenant_id, rule, principals)
+
+
+@dataclass(frozen=True)
+class _ParticipantRule:
+    workspace_id: uuid.UUID
+    # Assignments that count in the workspace, and those that make a participant.
+    scope: ColumnElement[bool]
+    role_here: ColumnElement[bool]
+    condition: ColumnElement[bool]
+
+
+async def _participant_rule(
+    session: AsyncSession, tenant_id: uuid.UUID, workspace_id: uuid.UUID
+) -> _ParticipantRule:
+    scope = await role_assignment_scope(session, tenant_id, workspace_id)
+    role_here = or_(Role.workspace_id == workspace_id, PrincipalRole.workspace_id == workspace_id)
+    is_member = exists().where(
+        WorkspaceMember.tenant_id == tenant_id,
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.principal_id == Principal.id,
+    )
+    holds_role = (
+        exists()
+        .where(
+            PrincipalRole.principal_id == Principal.id,
+            PrincipalRole.tenant_id == tenant_id,
+            scope,
+            role_here,
+        )
+        .where(Role.id == PrincipalRole.role_id)
+    )
+    return _ParticipantRule(workspace_id, scope, role_here, or_(is_member, holds_role))
+
+
+async def _describe_participants(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    rule: _ParticipantRule,
+    principals: Sequence[Principal],
+) -> list[WorkspaceParticipant]:
+    ids = [p.id for p in principals]
     members: set[uuid.UUID] = set()
     roles: dict[uuid.UUID, list[ParticipantRole]] = {pid: [] for pid in ids}
     if ids:
@@ -168,8 +228,8 @@ async def list_workspace_participants(
             (
                 await session.scalars(
                     select(WorkspaceMember.principal_id).where(
-                        WorkspaceMember.tenant_id == ctx.tenant_id,
-                        WorkspaceMember.workspace_id == workspace_id,
+                        WorkspaceMember.tenant_id == tenant_id,
+                        WorkspaceMember.workspace_id == rule.workspace_id,
                         WorkspaceMember.principal_id.in_(ids),
                     )
                 )
@@ -179,10 +239,10 @@ async def list_workspace_participants(
             select(PrincipalRole, Role)
             .join(Role, Role.id == PrincipalRole.role_id)
             .where(
-                PrincipalRole.tenant_id == ctx.tenant_id,
+                PrincipalRole.tenant_id == tenant_id,
                 PrincipalRole.principal_id.in_(ids),
-                scope,
-                role_here,
+                rule.scope,
+                rule.role_here,
             )
             .order_by(PrincipalRole.created_at, PrincipalRole.id)
         )
@@ -196,20 +256,17 @@ async def list_workspace_participants(
                     assignment_workspace_id=assignment.workspace_id,
                 )
             )
-    return Page(
-        items=[
-            WorkspaceParticipant(
-                principal_id=p.id,
-                kind=p.kind,
-                display_name=p.display_name,
-                status=p.status,
-                member=p.id in members,
-                roles=roles[p.id],
-            )
-            for p in page.items
-        ],
-        next_cursor=page.next_cursor,
-    )
+    return [
+        WorkspaceParticipant(
+            principal_id=p.id,
+            kind=p.kind,
+            display_name=p.display_name,
+            status=p.status,
+            member=p.id in members,
+            roles=roles[p.id],
+        )
+        for p in principals
+    ]
 
 
 async def list_roles(

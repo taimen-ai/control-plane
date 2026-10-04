@@ -152,6 +152,10 @@ def error_from_response(status: int, body: dict[str, Any]) -> ControlPlaneError:
 #: Control Plane itself said nothing, so nothing about ownership is known.
 UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
 
+#: Codes of a failure to reach a service the command depends on, raised before
+#: any answer exists (status 0): the IAM exchange that could not connect.
+UNREACHABLE_CODES = frozenset({"iam_unreachable"})
+
 
 def is_transient(exc: BaseException) -> bool:
     """Is ``exc`` a failure to reach the Control Plane rather than its answer?
@@ -161,9 +165,21 @@ def is_transient(exc: BaseException) -> bool:
     core looks like this for a few seconds. Such a failure is no verdict on a
     lease or a command and is worth repeating; an answer of the core itself
     (409, 404, 403, a 500 with its own code) is not.
+
+    The IAM exchange that precedes each command with an IAM credential counts
+    the same way. Its 502/503/504 (``IamCredentialError.status``) and a failed
+    connection to IAM (``iam_unreachable``, status 0) are both a restarting
+    IAM: a ``HeartbeatRunner`` must outlive that within its outage budget
+    rather than report lost ownership, and treating the refused connection as
+    final while the 503 of the same restart is not would make the outcome
+    depend on which half of the restart the beat hit. A verdict of IAM — 401,
+    403, 400, an empty or malformed exchange, a missing local credential — is
+    final.
     """
     if isinstance(exc, TransportError):
         return True
     if not isinstance(exc, ControlPlaneError):
         return False
+    if exc.code in UNREACHABLE_CODES:
+        return True
     return exc.status in UNAVAILABLE_STATUSES or (exc.code == "http_error" and exc.status >= 500)

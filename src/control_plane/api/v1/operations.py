@@ -23,11 +23,13 @@ from control_plane.application.commands import operations as commands
 router = APIRouter(tags=["operations"], prefix="/operations")
 
 
+# visibility: tenant — operations on the journal and the memory adapter of the whole tenant
 @router.get("/context-adapter", responses=ERROR_RESPONSES)
 async def context_adapter_status(ctx: AuthDep, db: DbDep) -> JSONResponse:
     return JSONResponse(await commands.adapter_diagnostics(db, ctx))
 
 
+# visibility: tenant — operations on the journal and the memory adapter of the whole tenant
 @router.post("/context-adapter/{tenant_id}:redrive", responses=ERROR_RESPONSES)
 async def redrive_context_adapter(
     tenant_id: uuid.UUID,
@@ -53,6 +55,7 @@ async def redrive_context_adapter(
     )
 
 
+# visibility: tenant — operations on the journal and the memory adapter of the whole tenant
 @router.post("/context-adapter/{tenant_id}:rebuild", responses=ERROR_RESPONSES)
 async def rebuild_context_adapter(
     tenant_id: uuid.UUID,
@@ -80,6 +83,7 @@ async def rebuild_context_adapter(
     )
 
 
+# visibility: tenant — operations on the journal and the memory adapter of the whole tenant
 @router.post("/journal:archive", responses=ERROR_RESPONSES)
 async def archive_journal(
     payload: JournalArchiveRequest,
@@ -108,6 +112,7 @@ async def archive_journal(
     )
 
 
+# visibility: tenant — operations on the journal and the memory adapter of the whole tenant
 @router.post("/journal:prune", responses=ERROR_RESPONSES)
 async def prune_journal(
     payload: JournalArchiveRequest,

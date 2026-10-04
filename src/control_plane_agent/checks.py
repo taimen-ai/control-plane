@@ -14,8 +14,10 @@ runs them after the executor has worked and before it commits:
   another in the order of the file, every one of them whatever the previous
   gave; the environment is the daemon's without the reserved names
   (``runner_config.reserved_entry``, in any case) but those a program needs
-  to run at all (:data:`KEPT_RESERVED_ENTRIES`) and without anything named
-  as a secret (:func:`is_secret_name`), plus the ``env`` of the run's
+  to run at all (:data:`KEPT_RESERVED_ENTRIES`), without anything named
+  as a secret (:func:`is_secret_name`) and without anything whose value
+  carries one (:func:`is_secret_value`: ``DATABASE_URL`` with a password, a
+  connection string with ``Password=``), plus the ``env`` of the run's
   services; the values of known secrets (:func:`secrets_of`) and the
   ``user:password@`` of any URL are masked in what a check prints — best
   effort: a secret split by a line break or encoded is not recognised;
@@ -110,6 +112,13 @@ _NOT_SECRET_SUFFIXES = ("_FILE", "_PATH", "_DIR", "_SOCK", "_URL_FILE")
 # The userinfo of a URL (``scheme://user:password@host``), whatever variable
 # or line carries it: ``https_proxy``, ``DATABASE_URL`` or a traceback.
 _USERINFO = re.compile(r"(?<=://)([^\s/?#@:]*)(?::([^\s/?#@]*))?@")
+# A key of a connection string (``Server=db;User Id=u;Password=<pw>``, Azure
+# ``AccountKey=``, ``SharedAccessKey=``; ``Pwd=`` of ODBC) that holds a secret
+# when something follows its ``=``. Only at the start or after ``;``:
+# ``SharedAccessKeyName=`` is a name, ``--password=`` an argument.
+_CONNECTION_SECRET = re.compile(
+    r"(?:^|;)\s*(?:PASSWORD|PWD|ACCOUNTKEY|SHAREDACCESSKEY)\s*=\s*[^;\s]", re.IGNORECASE
+)
 
 PASSED = "passed"
 FAILED = "failed"
@@ -259,19 +268,20 @@ def check_environment(
 ) -> dict[str, str]:
     """The daemon's environment without the reserved names and secrets, plus the run's."""
     values = os.environ if base is None else base
-    kept = {k: v for k, v in values.items() if _kept(k)}
+    kept = {k: v for k, v in values.items() if _kept(k, v)}
     return {**kept, **run_environment(env)}
 
 
-def _kept(name: str) -> bool:
+def _kept(name: str, value: str) -> bool:
     # Upper case whatever the parser matches exactly: a service env never
     # writes gh_token, but the daemon may have it, and a tool may read it.
     entry = reserved_entry(name.upper())
     if entry is not None:
         return entry in KEPT_RESERVED_ENTRIES or name.upper() in KEPT_PROXY_NAMES
     # Masked in the output is not enough: a check runs the executor's code,
-    # which can read a token and send it anywhere.
-    return not is_secret_name(name)
+    # which can read a token and send it anywhere. A name says nothing of
+    # DATABASE_URL, so the value is looked at too.
+    return not is_secret_name(name) and not is_secret_value(value)
 
 
 def is_secret_name(name: str) -> bool:
@@ -280,6 +290,16 @@ def is_secret_name(name: str) -> bool:
     if upper in _NOT_SECRET_NAMES or upper.endswith(_NOT_SECRET_SUFFIXES):
         return False
     return bool(_SECRET_NAME.search(upper))
+
+
+def is_secret_value(value: str) -> bool:
+    """Whether ``value`` carries a secret, whatever the variable is named.
+
+    A URL with a password (``scheme://user:password@``, not ``user@`` nor
+    ``user:@``) or a connection string with ``Password=``, ``Pwd=``,
+    ``AccountKey=`` or ``SharedAccessKey=`` that is not empty.
+    """
+    return bool(_url_passwords(value)) or bool(_CONNECTION_SECRET.search(value))
 
 
 def secrets_of(

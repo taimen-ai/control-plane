@@ -219,3 +219,123 @@ async def test_entity_list_contract_errors(client: httpx.AsyncClient, app) -> No
         assert upstream.json()["error"]["code"] == "memory_unavailable"
     finally:
         app.state.context_provider = None
+
+
+async def test_relations_of_the_entities_with_the_callers_visibility(
+    client: httpx.AsyncClient, memory: FakeGraphMemory
+) -> None:
+    """``include.relations`` (CP-ADR-0060, amendment 2026-10-03): each entity's
+    relations and the other end; an end the caller cannot see is not answered."""
+    s = await _setup(client)
+    response = await client.post(
+        PATH,
+        json={
+            "workspaceId": s["child"]["id"],
+            "kinds": ["endpoint"],
+            "where": [{"attr": "method", "op": "eq", "value": "POST"}],
+            "include": {"relations": ["calls", "calls", "defined_in"], "limit": 2},
+        },
+        headers=auth(s["reader_key"]),
+    )
+    assert response.status_code == 200, response.text
+    [claim] = response.json()["items"]
+    assert claim["relations"] == [
+        {
+            "relation": "calls",
+            "direction": "in",
+            "kind": "client_method",
+            "key": "control-plane:control_plane_client.client.ControlPlaneClient.claim_task",
+            "title": "control-plane:control_plane_client.client.ControlPlaneClient.claim_task",
+        },
+        {
+            "relation": "calls",
+            "direction": "in",
+            "kind": "ui_call",
+            "key": "platform-web:src/api/tasks.ts:42",
+            "title": "platform-web:src/api/tasks.ts:42",
+        },
+    ]
+    [body] = memory.typed_requests
+    root_ns = f"tenant:{s['tenant']}:ws:{s['root']['id']}"
+    # The list's namespace and visibility, the names once each.
+    assert body["scope"] == {"namespace": root_ns}
+    assert body["allowedScopes"] == memory.entities_requests[0]["allowedScopes"]
+    assert [step["relation"] for step in body["traverse"]] == ["calls", "defined_in"]
+
+    # Every relation the namespace's packs declare, the caller's ends only.
+    star = await client.post(
+        PATH,
+        json={
+            "workspaceId": s["child"]["id"],
+            "kinds": ["endpoint"],
+            "include": {"relations": "*", "direction": "in"},
+        },
+        headers=auth(s["reader_key"]),
+    )
+    assert star.status_code == 200, star.text
+    ends = [r["key"] for item in star.json()["items"] for r in item["relations"]]
+    assert ends and "secret-app:src/api.ts:1" not in ends
+    assert all(r["direction"] == "in" for item in star.json()["items"] for r in item["relations"])
+
+
+async def test_source_fields_follow_the_contract(
+    client: httpx.AsyncClient, memory: FakeGraphMemory
+) -> None:
+    s = await _setup(client)
+    response = await client.post(
+        PATH, json={"workspaceId": s["root"]["id"], "kinds": ["adr"]}, headers=auth(s["reader_key"])
+    )
+    assert response.status_code == 200, response.text
+    [adr] = response.json()["items"]
+    assert adr["validFrom"] == "2026-01-01T00:00:00+00:00"
+    assert adr["validTo"] is None
+    assert adr["sources"] == [
+        {
+            "source": "git:control-plane",
+            "sourcePath": "",
+            "snapshotId": "s1",
+            "source_path": "",
+            "snapshot_id": "s1",
+            "scope": "",
+        }
+    ]
+    # Transitional snake_case fields stay until a later amendment removes them.
+    assert adr["valid_from"] == adr["validFrom"]
+    assert adr["source"] == "git:control-plane"
+    # No relations unless asked for, and no traversal either.
+    assert "relations" not in adr
+    assert memory.typed_requests == []
+
+
+async def test_include_contract_errors(client: httpx.AsyncClient, memory: FakeGraphMemory) -> None:
+    s = await _setup(client)
+    good = {"workspaceId": s["root"]["id"], "kinds": KINDS}
+    for include in (
+        {},
+        {"relations": []},
+        {"relations": "all"},
+        {"relations": ["Calls"]},
+        {"relations": ["calls"], "direction": "sideways"},
+        {"relations": ["calls"], "limit": 0},
+        {"relations": ["calls"], "limit": 201},
+        {"relations": ["calls"], "depth": 2},
+    ):
+        refused = await client.post(
+            PATH, json={**good, "include": include}, headers=auth(s["reader_key"])
+        )
+        assert refused.status_code == 400, (include, refused.text)
+        assert refused.json()["error"]["code"] == "invalid_request"
+    too_long = await client.post(
+        PATH,
+        json={**good, "limit": 101, "include": {"relations": ["calls"]}},
+        headers=auth(s["reader_key"]),
+    )
+    assert too_long.status_code == 400, too_long.text
+    assert memory.entities_requests == [] and memory.typed_requests == []
+
+    memory.fail = "typed"
+    failed = await client.post(
+        PATH, json={**good, "include": {"relations": ["calls"]}}, headers=auth(s["reader_key"])
+    )
+    assert failed.status_code == 502, failed.text
+    assert failed.json()["error"]["code"] == "memory_unavailable"

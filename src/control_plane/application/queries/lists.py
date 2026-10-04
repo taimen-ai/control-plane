@@ -25,6 +25,7 @@ from control_plane.application.common import (
     parse_created_cursor,
     parse_date_cursor,
 )
+from control_plane.application.visibility import task_condition, task_visible
 from control_plane.domain.enums import (
     ClaimStatus,
     Permission,
@@ -290,6 +291,29 @@ def task_search_clause(terms: list[str]) -> ColumnElement[bool]:
     return and_(*clauses)
 
 
+async def readable_tasks(ctx: AuthContext) -> ColumnElement[bool] | None:
+    """The tasks of the tenant ``GET /tasks`` lists to the caller; ``None`` — all of them.
+
+    policy mode: only tasks in workspaces the principal may read, plus the
+    ones it owns or is assigned to (mirrors the task rule of the PDP model).
+    In members mode strictly the visible workspaces: own work elsewhere is
+    not shown either (CP-ADR-0082 §3.5). A view of tasks reads the same
+    (CP-ADR-0080, amendment of stage 6).
+    """
+    workspaces = await visible_objects(ctx, Permission.TASKS_READ, "workspace")
+    if workspaces is None:
+        return None
+    in_workspaces = Task.workspace_id.in_([uuid.UUID(w) for w in workspaces])
+    if ctx.visible_workspaces is not None:
+        return in_workspaces
+    return or_(
+        in_workspaces,
+        Task.owner_id == ctx.principal_id,
+        Task.assignee_id == ctx.principal_id,
+        Task.created_by == ctx.principal_id,
+    )
+
+
 async def list_tasks(
     session: AsyncSession,
     ctx: AuthContext,
@@ -335,18 +359,9 @@ async def list_tasks(
             "invalid_sort", f"Unknown sort: {sort}", details={"known": sorted(TASK_SORTS)}
         )
     stmt = select(Task).where(Task.tenant_id == ctx.tenant_id)
-    # policy mode: only tasks in workspaces the principal may read, plus the
-    # ones it owns or is assigned to (mirrors the task rule of the PDP model).
-    workspaces = await visible_objects(ctx, Permission.TASKS_READ, "workspace")
-    if workspaces is not None:
-        stmt = stmt.where(
-            or_(
-                Task.workspace_id.in_([uuid.UUID(w) for w in workspaces]),
-                Task.owner_id == ctx.principal_id,
-                Task.assignee_id == ctx.principal_id,
-                Task.created_by == ctx.principal_id,
-            )
-        )
+    readable = await readable_tasks(ctx)
+    if readable is not None:
+        stmt = stmt.where(readable)
     if status is not None:
         stmt = stmt.where(Task.status == status)
     if system_status_category is not None:
@@ -390,7 +405,9 @@ async def list_tasks(
             from control_plane.application.commands.workspaces import workspace_subtree_ids
 
             subtree = await workspace_subtree_ids(session, ctx.tenant_id, workspace_id)
-            if not subtree:
+            # An invisible workspace answers as a missing one, not with an
+            # empty page that tells it exists (CP-ADR-0082 §3.7).
+            if not subtree or not ctx.sees_workspace(workspace_id):
                 raise NotFoundError(
                     "Workspace not found", details={"workspaceId": str(workspace_id)}
                 )
@@ -441,7 +458,8 @@ async def get_task(session: AsyncSession, ctx: AuthContext, task_ref: str) -> Ta
     except ValueError:
         conditions.append(Task.public_id == task_ref.upper())
     task = await session.scalar(select(Task).where(*conditions))
-    if task is None:
+    # Invisible work answers exactly as missing work (CP-ADR-0082 §3.7).
+    if task is None or not ctx.sees_workspace(task.workspace_id):
         raise NotFoundError("Task not found", details={"task": task_ref})
     await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task.id)))
     return task
@@ -460,7 +478,9 @@ async def list_claims(
     await authorize(ctx, Permission.TASKS_READ)
     if status is not None and status not in set(ClaimStatus):
         raise ValidationError("invalid_status", f"Unknown claim status: {status}")
-    stmt = select(TaskClaim).where(TaskClaim.tenant_id == ctx.tenant_id)
+    stmt = select(TaskClaim).where(
+        TaskClaim.tenant_id == ctx.tenant_id, task_condition(ctx, TaskClaim.task_id)
+    )
     if task_id is not None:
         stmt = stmt.where(TaskClaim.task_id == task_id)
     if session_id is not None:
@@ -482,6 +502,7 @@ async def get_claim(session: AsyncSession, ctx: AuthContext, claim_id: uuid.UUID
     claim = await session.scalar(
         select(TaskClaim).where(TaskClaim.id == claim_id, TaskClaim.tenant_id == ctx.tenant_id)
     )
-    if claim is None:
+    # A claim on invisible work is a missing claim (CP-ADR-0082 §3.7).
+    if claim is None or not await task_visible(session, ctx, claim.task_id):
         raise NotFoundError("Claim not found", details={"claimId": str(claim_id)})
     return claim

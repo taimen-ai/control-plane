@@ -22,6 +22,14 @@ The ``recall`` steps of instances are asked of memory here, outside any
 transaction, and answered into their journals (``process_recalls``,
 CP-ADR-0076 §4).
 
+It keeps agents' access in the secret store (CP-ADR-0079 §9,
+``connections-policy-sync``): its own journal cursor per tenant brings the
+policies and roles of a tenant's agents to the records after the events that
+change them, and a full pass every ``connections_sync_seconds`` does it for
+every tenant, expires keys past ``expiresAt`` and deletes policies of
+principals no agent has. An unavailable store holds the tenant back; it never
+stops the worker.
+
 With a content store configured it also sweeps artifact uploads no artifact
 referenced before they expired, and the objects nothing needs any more
 (CP-ADR-0072 §10).
@@ -40,6 +48,7 @@ import logging
 import os
 import signal
 import socket
+import time
 import uuid
 from datetime import timedelta
 
@@ -47,7 +56,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from control_plane.application.authorization import Authorizer, configure_authorizer
-from control_plane.application.commands import process_instances
+from control_plane.application.commands import connection_policies, process_instances
 from control_plane.application.commands._claim_release import (
     release_active_claims_for_session,
     release_claim_on_locked_task,
@@ -93,16 +102,25 @@ from control_plane.infrastructure.db.engine import (
     transaction,
 )
 from control_plane.infrastructure.db.models import (
+    ConnectionOAuthState,
     IdempotencyKey,
     OutboxRecord,
     Session,
     Task,
     TaskClaim,
 )
+from control_plane.infrastructure.secret_store import (
+    SecretStore,
+    SecretStoreError,
+    build_secret_store,
+)
 
 logger = logging.getLogger(__name__)
 
 _SWEEP_BATCH = 100
+# A state of :authorize is kept this long after it was issued (CP-ADR-0079 §6):
+# past its TTL it cannot be used, and a hash without the state is worth nothing.
+_OAUTH_STATE_RETENTION = timedelta(days=1)
 
 
 class Worker:
@@ -114,8 +132,15 @@ class Worker:
         authorizer: Authorizer | None = None,
         content_store: ContentStore | None = None,
         graph_provider: GraphProvider | None = None,
+        secret_store: SecretStore | None = None,
     ) -> None:
         self.settings = settings
+        # Agents' access in the store (CP-ADR-0079 §9); None without CP_SECRET_STORE_URL.
+        self.secret_store = (
+            secret_store if secret_store is not None else build_secret_store(settings)
+        )
+        # Monotonic time of the next full pass of connections-policy-sync: the first cycle.
+        self._next_policy_pass = 0.0
         self.engine = engine or build_engine(settings)
         self.content_store = (
             content_store if content_store is not None else build_content_store(settings)
@@ -181,6 +206,8 @@ class Worker:
                 await aclose()
         if self.content_store is not None:
             await self.content_store.aclose()
+        if self.secret_store is not None:
+            await self.secret_store.aclose()
         aclose_graph = getattr(self.graph_provider, "aclose", None)
         if aclose_graph is not None:
             await aclose_graph()
@@ -202,6 +229,10 @@ class Worker:
             "claims_expired": await self.expire_claims(),
             "skill_leases_expired": await self.expire_skill_invocation_leases(),
             "idempotency_cleaned": await self.cleanup_idempotency(),
+            "oauth_states_cleaned": await self.cleanup_oauth_states(),
+            "connection_keys_expired": await self.expire_connection_keys(),
+            "connection_policy_events_read": await self.process_connection_policy_events(),
+            "connection_policy_changes": await self.sync_connection_policies(),
             "artifact_uploads_swept": await self.sweep_artifact_uploads(),
         }
         if any(stats.values()):
@@ -711,6 +742,102 @@ class Worker:
                 .returning(IdempotencyKey.key)
             )
             return len(result.all())
+
+    async def cleanup_oauth_states(self) -> int:
+        async with transaction(self.session_factory) as session:
+            result = await session.execute(
+                delete(ConnectionOAuthState)
+                .where(ConnectionOAuthState.created_at <= utcnow() - _OAUTH_STATE_RETENTION)
+                .returning(ConnectionOAuthState.id)
+            )
+            return len(result.all())
+
+    # -- agents' access in the secret store (CP-ADR-0079 §9) -------------------------
+
+    async def expire_connection_keys(self) -> int:
+        """Keys past ``expiresAt`` become ``expired``; the event brings the policies along."""
+        async with transaction(self.session_factory) as session:
+            return await connection_policies.expire_keys(
+                session, now=utcnow(), trace_run_id=self.trace_run_id
+            )
+
+    async def process_connection_policy_events(self) -> int:
+        """One journal batch per due tenant; a failing store holds that tenant back."""
+        store = self.secret_store
+        if store is None:
+            return 0
+        async with transaction(self.session_factory) as session:
+            tenants = await connection_policies.due_policy_tenants(
+                session, limit=self.settings.outbox_batch_size
+            )
+        read = 0
+        for tenant_id in tenants:
+            try:
+                async with transaction(self.session_factory) as session:
+                    read += await connection_policies.process_tenant_events(
+                        session,
+                        store,
+                        tenant_id=tenant_id,
+                        batch_size=self.settings.rules_batch_size,
+                    )
+            except Exception as exc:
+                reason = exc.reason if isinstance(exc, SecretStoreError) else type(exc).__name__
+                logger.warning(
+                    "connection policy sync failed",
+                    extra={"tenant": str(tenant_id), "worker": self.name, "error_code": reason},
+                    exc_info=not isinstance(exc, SecretStoreError),
+                )
+                async with transaction(self.session_factory) as session:
+                    await connection_policies.record_tenant_failure(
+                        session,
+                        tenant_id=tenant_id,
+                        reason=reason,
+                        backoff_base_seconds=self.settings.outbox_backoff_base_seconds,
+                        backoff_max_seconds=self.settings.outbox_backoff_max_seconds,
+                    )
+        return read
+
+    async def sync_connection_policies(self, *, force: bool = False) -> int:
+        """The full pass, when it is due (or ``force``): every tenant, then the orphans.
+
+        Each tenant syncs in its own transaction, so one tenant the store fails
+        for does not hold the others; the orphans go last, and only when every
+        tenant went through. Answers the number of changes written.
+        """
+        store = self.secret_store
+        if store is None:
+            return 0
+        if not force and time.monotonic() < self._next_policy_pass:
+            return 0
+        self._next_policy_pass = time.monotonic() + self.settings.connections_sync_seconds
+        async with transaction(self.session_factory) as session:
+            tenants = await connection_policies.policy_tenants(session)
+        stats = connection_policies.SyncStats()
+        failed = False
+        for tenant_id in tenants:
+            try:
+                async with transaction(self.session_factory) as session:
+                    await connection_policies.ensure_policy_cursor(session, tenant_id)
+                    stats.add(
+                        await connection_policies.sync_tenant(session, store, tenant_id, sweep=True)
+                    )
+            except SecretStoreError as exc:
+                failed = True
+                logger.warning(
+                    "connection policy sync failed",
+                    extra={"tenant": str(tenant_id), "worker": self.name, "error_code": exc.reason},
+                )
+        if not failed:
+            try:
+                async with transaction(self.session_factory) as session:
+                    policies, roles = await connection_policies.orphan_principals(session, store)
+                stats.add(await connection_policies.delete_orphans(store, policies, roles))
+            except SecretStoreError as exc:
+                logger.warning(
+                    "connection policy orphans not swept",
+                    extra={"worker": self.name, "error_code": exc.reason},
+                )
+        return stats.changes
 
     async def sweep_artifact_uploads(self) -> int:
         """Uploads without an artifact past their TTL, and orphaned objects."""

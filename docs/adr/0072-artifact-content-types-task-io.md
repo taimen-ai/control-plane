@@ -12,7 +12,9 @@ claim (п.7, 8); A006 (TASK-000522) — выход как критерий пр�
 клиент, MCP и раннеры. Номер 0071 занят `me/attention` фичи `human-harness`.
 Амендмент 2026-09-28 (company-knowledge, K003): содержимое артефакта
 исполнителю скилла по `artifacts.read` на workspace задачи (реализован в K012,
-TASK-000772).
+TASK-000772). Амендмент 2026-10-01 (integrations-connections, хвост I021, план
+Р5): задача, которую исполняет скилл, сдаёт типизированные выходы из `output`
+скилла (TASK-001264).
 
 Контекст: ADR-0013 (артефакт — append-only запись со ссылкой; амендмент
 2026-09-26 — этот ADR), ADR-0020 (ревизии через `supersedes`, head —
@@ -508,6 +510,87 @@ Conformance: contract-тесты доступа K012
 `403`; чужой tenant — `404`; принципал без `skills.execute` с тем же правом —
 `403`.
 
+## Амендмент 2026-10-01 (integrations-connections): выходы задачи, которую исполняет скилл
+
+Основание — ревью I021 (TASK-001008), решение Р5 плана `integrations-connections`
+суперпроекта: результат скилла передаётся дальше типизированным артефактом, а не
+чтением `skill_result`. Реализация — TASK-001264.
+
+**Проблема.** Задачу с `execution: {skill, version}` (ADR-0056 §3) исполняет
+один вызов скилла, и ядро сдаёт по нему только `skill_result`. Выходы
+`artifactSchema.outputs` её типа (п.7) не создаёт никто: агента-исполнителя у
+такой задачи нет. Поэтому вход задачи-получателя от неё (`spawned_by`,
+`depends_on`, `parent`) всегда пуст, а обязательный выход — неявный критерий
+(п.9) — не проходит никогда. Это пробел ядра, а не пакета: так ведёт себя
+любая задача, которую исполняет скилл.
+
+**Решение.**
+
+1. **Когда.** Успешный `:complete` вызова, основание которого — исполнение
+   задачи (`authorizationBasis.kind = execution`), в той же транзакции и до
+   `skill_result` сдаёт выходы типа задачи (версии, которую несёт задача).
+   Вызовы по другим основаниям (агент вызвал скилл в своём run, approval)
+   выходов задачи не сдают: их результат — только свидетельство.
+2. **Отображение — по совпадению имени.** Значение выхода — поле верхнего
+   уровня `output` с именем, равным `key` выхода. Явного отображения
+   (`outputs[].from: "$.output.<поле>"`) нет: грамматика `artifactSchema` и её
+   JSON Schema в `packages/schema/v1` суперпроекта не меняются, пакеты без
+   выходов скилла не затронуты, а пакет сам называет выход так же, как поле
+   контракта своего скилла. Если понадобится переименование, `from` добавится
+   к элементу выхода необязательным полем — без смены смысла для тех, кто его
+   не задал.
+3. **Отсутствие.** Поля нет или оно `null` — артефакта нет, это не ошибка
+   (`absent`). У `required: true` то же самое — `missing`: вызов не
+   проваливается, а неявный критерий выхода (п.9) провалит завершение задачи
+   с `artifact_missing`, как у любого исполнителя, не сдавшего выход.
+4. **Форма артефакта.** Значение (любой JSON) — содержимое в хранилище ядра:
+   UTF-8 JSON с сортированными ключами, `mediaType = application/json`,
+   `contentState = stored`, `name = <key>.json`. Так выход проходит неявный
+   критерий с `content: required` по умолчанию (JSON-артефакт в `content` его
+   не прошёл бы, п.9), а раннер получателя скачивает его как файл входа
+   (п.13). Объект кладётся под той же блокировкой (tenant, sha256), что
+   загрузка (п.4); строки загрузки нет — на эти байты никто не ссылается по
+   `contentRef`. `metadata` — происхождение: `{output, skill, version,
+   invocationId, authorityPrincipalId}`.
+5. **Проверка по типу.** По последней версии типа артефакта (п.6): значение —
+   по `metadataSchema` (это единственная JSON Schema типа; у выхода скилла она
+   описывает сам выход; форматы — аннотации, как у `metadata`), media type —
+   по `mediaTypes` типа и сужению `mediaTypes` выхода, размер — по `maxBytes`.
+   Проверка `metadata` из `POST /artifacts` к такой записи не применяется: её
+   метаданные пишет ядро (как у `skill_result`, п.6). Не прошло — выход
+   `rejected` с причиной (`invalid_output_value` с `details.errors`,
+   `media_type_not_allowed`, `artifact_too_large`); хранилище не настроено или
+   недоступно — `rejected` с `content_store_unavailable`. Вызов остаётся
+   `succeeded`, `skill_result` сохраняется: скилл уже отработал (в том числе
+   его внешнее чтение или запись), и откат результата этого не отменит.
+6. **Автор и видимость.** Автор — исполнитель скилла (тот, кто вызвал
+   `:complete`): он сдаёт результат работы, как агент — свой артефакт.
+   `skill_result` по-прежнему от authority (ADR-0056 §2) — это свидетельство
+   вызова. Артефакт привязан к задаче и run вызова, workspace не задаётся:
+   видимость — как у задачи (п.5), получатель читает его как вход по
+   `?forTask=`.
+7. **Ревизии.** Новый выход вытесняет (`supersedesArtifactId`) самую новую
+   head-ревизию того же типа у задачи: повторное исполнение после провала
+   проверки не удваивает вход получателя.
+8. **Отчёт.** Что стало с выходами — список `[{key, type, status: created |
+   absent | missing | rejected, artifactId?, reason?}]` в `metadata.outputs`
+   артефакта `skill_result` и в поле `outputs` события
+   `skill.invocation_succeeded` (схема v2, ADR-0068 — только новое поле; у
+   вызова не для исполнения задачи — `[]`). Значения выходов в журнал не
+   попадают; `artifact.created` каждого выхода несёт `skillInvocationId`.
+
+Модуль — `application/commands/skill_outputs.py`, проверка значения —
+`check_output_value` в `domain/artifact_type.py`. Ядро знает ключи, типы
+артефактов и JSON; ветвлений по пакету или типу нет (п.12).
+
+Conformance: `tests/integration/test_skill_task_outputs.py` — нейтральный пакет
+(черновик заметки): значение → артефакт объявленного типа → вход задачи,
+порождённой ею по `spawned_by`; `null` — артефакта нет, вход пуст, задача
+берётся; значение не по схеме, сужение media type, недоступное хранилище —
+`rejected` при сохранённом `skill_result`; вытеснение прежней head-ревизии;
+обязательный выход проходит проверку, `null` у обязательного — `artifact_missing`;
+вызов не для исполнения выходов не сдаёт.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -562,5 +645,9 @@ Conformance: contract-тесты доступа K012
 - grep: {path: src/control_plane_mcp/server.py, pattern: 'async def cp_get_artifact_content\('}
   repo: control-plane
 - grep: {path: src/control_plane_agent/inputs.py, pattern: 'FENCE_TAG = "task_inputs"'}
+  repo: control-plane
+- grep: {path: src/control_plane/application/commands/skill_invocations.py, pattern: 'await record_task_outputs\('}
+  repo: control-plane
+- absent: {path: src/control_plane/application/commands/skill_outputs.py, pattern: '(?i)crm|invoice|payment|\bdeal'}
   repo: control-plane
 ```

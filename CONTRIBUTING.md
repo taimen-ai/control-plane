@@ -41,14 +41,14 @@ Requirements: Python ≥ 3.12, [uv](https://docs.astral.sh/uv/), Docker with
 Docker Compose (PostgreSQL 16 is the only supported database).
 
 The Control Plane depends on the enforcement SDK `platform-auth-sdk` by path
-(`../platform-auth-sdk`, see `[tool.uv.sources]` in `pyproject.toml`), so
-either work from a checkout of the umbrella repository or clone the SDK next
-to this repository:
+(`../../sdk/platform-auth-sdk`, see `[tool.uv.sources]` in `pyproject.toml`), so
+either work from a checkout of the umbrella repository or clone both in its
+layout — `services/control-plane` and `sdk/platform-auth-sdk` (TAI-ADR-0064):
 
 ```bash
-git clone https://github.com/taimen-ai/platform-auth-sdk.git platform-auth-sdk
-git clone https://github.com/taimen-ai/control-plane.git control-plane
-cd control-plane
+git clone https://github.com/taimen-ai/platform-auth-sdk.git sdk/platform-auth-sdk
+git clone https://github.com/taimen-ai/control-plane.git services/control-plane
+cd services/control-plane
 uv sync                     # runtime deps + the `dev` group (pytest, ruff, mypy)
 ```
 
@@ -101,9 +101,9 @@ uv run python -m control_plane.worker    # in a second terminal
 Schema changes come with an Alembic migration
 (`uv run alembic revision --autogenerate -m "..."` against a running
 database); `/health/ready` returns 503 when the database revision is behind
-the code. The Docker image is built from the parent directory, because the
-SDK must be next to the repository:
-`docker build -f control-plane/Dockerfile -t control-plane ..`.
+the code. The Docker image is built from the root of the umbrella layout, because the
+SDK must be at `../../sdk/platform-auth-sdk`:
+`docker build -f services/control-plane/Dockerfile -t control-plane ../..`.
 
 The SDK in `client/` is a separate distribution (`control-plane-client`,
 depends on `httpx` only) and is versioned in step with the server; keep the

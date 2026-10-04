@@ -8,7 +8,8 @@ memory, so a Memory failure is the caller's failure (502).
 The company-knowledge amendment of CP-ADR-0060 is implemented: the snapshot
 preview and ``expectedState`` (K008), knowledge base documents (K009) and tenant
 packs (K010). ``POST /knowledge/entities:query`` (K031) reads the entities of
-a workspace's knowledge, with the caller's visibility; ``GET
+a workspace's knowledge, with the caller's visibility, and with
+``include.relations`` their relations (amendment 2026-10-03); ``GET
 /workspaces/{id}/knowledge-packs`` and ``GET /knowledge/packs/{ref}`` read back
 what a pack install writes (amendment 2026-09-30).
 """
@@ -24,6 +25,7 @@ from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     ErrorEnvelope,
     KnowledgeDocumentRequest,
+    KnowledgeEntitiesInclude,
     KnowledgeEntitiesPageOut,
     KnowledgeEntitiesQueryRequest,
     KnowledgePackOut,
@@ -64,6 +66,17 @@ def _provider(request: Request) -> KnowledgeProvider:
 
 def _trace(request: Request) -> str | None:
     return getattr(request.state, "trace_run_id", "") or None
+
+
+def _relations(
+    include: KnowledgeEntitiesInclude | None,
+) -> knowledge_entities.RelationsInclude | None:
+    if include is None:
+        return None
+    names = None if include.relations == "*" else tuple(dict.fromkeys(include.relations))
+    return knowledge_entities.RelationsInclude(
+        names=names, direction=include.direction, limit=include.limit
+    )
 
 
 @router.post("/knowledge/snapshots", responses=_SNAPSHOT_RESPONSES)
@@ -159,7 +172,8 @@ async def query_entities(
 ) -> JSONResponse:
     """The entities of ``kinds`` valid at ``asOf`` that satisfy ``where``, a
     page at a time, from the namespace of the workspace tree root with the
-    caller's visibility (the right to read the workspace's context)."""
+    caller's visibility (the right to read the workspace's context);
+    ``include.relations`` adds each entity's relations with a visible end."""
     provider = recall.require_graph(getattr(request.app.state, "context_provider", None))
     async with transaction(session_factory) as db:
         call = await knowledge_entities.prepare_entities_query(
@@ -172,6 +186,7 @@ async def query_entities(
             as_of=payload.as_of,
             limit=payload.limit,
             cursor=payload.cursor,
+            relations=_relations(payload.include),
         )
     page = await knowledge_entities.fetch_entities(
         call, provider, settings, trace_run_id=_trace(request) or ""
@@ -179,6 +194,7 @@ async def query_entities(
     return JSONResponse(page)
 
 
+# visibility: tenant — a knowledge pack is an object of the tenant, used per workspace
 @router.post("/knowledge/packs", responses=_MEMORY_RESPONSES)
 async def register_pack(
     body: KnowledgePackRegisterRequest,
@@ -196,6 +212,7 @@ async def register_pack(
     return JSONResponse(answer)
 
 
+# visibility: tenant — a knowledge pack is an object of the tenant, used per workspace
 @router.get(
     "/knowledge/packs/{ref}",
     response_model=KnowledgePackOut,

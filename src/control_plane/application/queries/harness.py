@@ -20,6 +20,11 @@ from control_plane.application.commands.workspaces import workspace_ancestor_ids
 from control_plane.application.common import utcnow
 from control_plane.application.event_cursor import encode_position
 from control_plane.application.queries.events import current_position
+from control_plane.application.visibility import (
+    approval_condition,
+    task_condition,
+    workspace_condition,
+)
 from control_plane.domain.enums import (
     HARNESS_PROTOCOL_NAME,
     SUPPORTED_HARNESS_PROTOCOL_VERSIONS,
@@ -206,6 +211,8 @@ async def get_harness_context(
                 TaskClaim.holder_id == ctx.principal_id,
                 TaskClaim.status == ClaimStatus.ACTIVE,
                 TaskClaim.expires_at > now,
+                # Only work of the visible workspaces (CP-ADR-0082 §4).
+                workspace_condition(ctx, Task.workspace_id),
             )
             .order_by(TaskClaim.acquired_at.desc())
         )
@@ -218,6 +225,7 @@ async def get_harness_context(
                 Run.tenant_id == ctx.tenant_id,
                 Run.principal_id == ctx.principal_id,
                 Run.status == RunStatus.RUNNING,
+                task_condition(ctx, Run.task_id),
             )
             .order_by(Run.started_at.desc())
         )
@@ -229,6 +237,7 @@ async def get_harness_context(
                 Run.tenant_id == ctx.tenant_id,
                 Run.principal_id == ctx.principal_id,
                 Run.status == RunStatus.SUSPENDED,
+                task_condition(ctx, Run.task_id),
             )
             .order_by(Run.finished_at.desc())
             .limit(_SUSPENDED_RUNS_LIMIT)
@@ -288,6 +297,7 @@ async def get_harness_context(
                 Approval.tenant_id == ctx.tenant_id,
                 Approval.status == ApprovalStatus.PENDING,
                 approval_filter,
+                approval_condition(ctx),
             )
             .order_by(Approval.created_at.desc())
             .limit(_PENDING_APPROVALS_LIMIT * 4)

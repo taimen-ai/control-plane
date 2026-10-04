@@ -282,3 +282,129 @@ async def test_lease_lost_during_execution_sends_nothing(
     assert final["status"] == "cancelled"
     assert final["output"] is None
     assert final["error"]["details"]["wasRunning"] is True
+
+
+def spy_listings(client: ControlPlaneClient) -> list[dict[str, Any]]:
+    """Record the arguments of every ``list_available_work`` the daemon makes."""
+    calls: list[dict[str, Any]] = []
+    listing = client.list_available_work
+
+    async def recorded(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return await listing(**kwargs)
+
+    client.list_available_work = recorded  # type: ignore[method-assign]
+    return calls
+
+
+async def test_skills_executor_finds_its_work_behind_a_full_page_of_other_work(
+    client: httpx.AsyncClient, sdk: Make, actors: dict[str, Any]
+) -> None:
+    """CP-ADR-0056 Ж2: 60 older, more urgent tasks of another type do not hide its own.
+
+    The executor of kind ``skills`` (no adapter) lists only the types whose
+    skill it runs, so its task is on the first page whatever stands above it.
+    """
+    admin = actors["admin"]
+    skill = await publish(
+        client, admin, "repo.merge", merge.CONTRACT, side_effects="external_write"
+    )
+    await assign_skill(client, admin, actors["runnerId"], skill["id"])
+    response = await client.post(
+        "/api/v1/task-types",
+        json={
+            "key": "merge",
+            "displayName": "Merge",
+            "execution": {
+                "skill": "repo.merge",
+                "version": "1",
+                "inputs": {"branch": "$.customFields.branch", "into": "$.customFields.target"},
+            },
+        },
+        headers=auth(admin),
+    )
+    assert response.status_code == 201, response.text
+    for n in range(60):
+        await create_task(client, admin, title=f"Someone else's {n}", priority="critical")
+    task = await create_task(
+        client,
+        admin,
+        title="Merge TASK-1",
+        typeKey="merge",
+        priority="low",
+        customFields={"branch": "task/TASK-1", "target": "main"},
+    )
+
+    async with sdk(actors["runner"]) as runner:
+        listings = spy_listings(runner)
+        await Agent(
+            runner, None, poll_interval=0.05, max_cycles=1, skills=executor(runner)
+        ).run_forever()
+
+    record = (await client.get(f"/api/v1/tasks/{task['id']}", headers=auth(admin))).json()
+    assert record["status"] == "done"
+    assert [call["type_keys"] for call in listings] == [["merge"]]
+
+
+async def test_skills_executor_without_a_type_it_runs_does_not_list_work(
+    client: httpx.AsyncClient, sdk: Make, actors: dict[str, Any]
+) -> None:
+    """No type's skill is runnable here: nothing to look for, the queue is not read."""
+    admin = actors["admin"]
+    await publish(client, admin, "arith.double", arith.CONTRACT)
+    response = await client.post(
+        "/api/v1/task-types",
+        json={
+            "key": "calc",
+            "displayName": "Calc",
+            "execution": {"skill": "arith.double", "version": "1"},
+        },
+        headers=auth(admin),
+    )
+    assert response.status_code == 201, response.text
+    await create_task(client, admin, title="Calc", typeKey="calc")
+    await create_task(client, admin, title="Ordinary")
+    merge_only = ["tests.skill_stubs.merge:run"]
+
+    async with sdk(actors["runner"]) as runner:
+        listings = spy_listings(runner)
+        skills = SkillExecutor(
+            runner,
+            {"local": LocalProtocol(merge_only)},
+            local_entrypoints=merge_only,
+            poll_interval=0.05,
+        )
+        await Agent(runner, None, poll_interval=0.05, max_cycles=1, skills=skills).run_forever()
+
+    assert listings == []
+
+
+async def test_daemon_pages_past_a_page_it_takes_nothing_from(
+    client: httpx.AsyncClient, sdk: Make, actors: dict[str, Any]
+) -> None:
+    """Another kind keeps its listing; a page its own filter empties is followed by the next."""
+    admin = actors["admin"]
+    response = await client.post(
+        "/api/v1/task-types", json={"key": "chore", "displayName": "Chore"}, headers=auth(admin)
+    )
+    assert response.status_code == 201, response.text
+    for n in range(60):
+        await create_task(client, admin, title=f"Someone else's {n}", priority="critical")
+    chore = await create_task(client, admin, title="Chore", typeKey="chore", priority="low")
+
+    async with sdk(actors["runner"]) as runner:
+        listings = spy_listings(runner)
+        await Agent(
+            runner,
+            EchoAdapter(),
+            poll_interval=0.05,
+            max_cycles=1,
+            task_types=frozenset({"chore"}),
+        ).run_forever()
+
+    [run] = (
+        await client.get("/api/v1/runs", params={"taskId": chore["id"]}, headers=auth(admin))
+    ).json()["items"]
+    assert run["status"] == "succeeded"
+    assert [call["type_keys"] for call in listings] == [None, None]
+    assert listings[0]["cursor"] is None and listings[1]["cursor"] is not None

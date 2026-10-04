@@ -317,12 +317,22 @@ class ControlPlaneClient:
         project_id: str | None = None,
         include_subprojects: bool = False,
         assigned_to_me: bool = False,
+        type_keys: Sequence[str] | None = None,
     ) -> Json:
+        """``type_keys`` — only tasks of these types (``typeKey``, repeated).
+
+        An empty ``type_keys`` is refused: sent as no parameter at all, it
+        would ask for the whole queue instead of none of it.
+        """
+        if type_keys is not None and not type_keys:
+            raise ValueError("type_keys must not be empty; pass None for every type")
         params: Json = {}
         if limit is not None:
             params["limit"] = limit
         if cursor is not None:
             params["cursor"] = cursor
+        if type_keys is not None:
+            params["typeKey"] = list(type_keys)
         if workspace_id is not None:
             params["workspaceId"] = workspace_id
         if include_descendants:
@@ -1570,8 +1580,9 @@ class ControlPlaneClient:
         memory. Submit only intentional, externalized knowledge.
 
         External observations name their ``source`` system (required with
-        ``dedup_key``/``external_ref``). A repeated ``(source, dedup_key)``
-        returns the existing observation with ``deduplicated: true``."""
+        ``dedup_key``/``external_ref``). A ``(source, dedup_key)`` repeated by
+        the same author returns the existing observation with
+        ``deduplicated: true``."""
         body: Json = {"kind": kind, "content": content}
         if assertions is not None:
             body["assertions"] = assertions
@@ -1645,6 +1656,7 @@ class ControlPlaneClient:
         as_of: str | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        include: Json | None = None,
     ) -> Json:
         """One page of the entities of ``kinds`` in the workspace's knowledge
         valid at ``as_of`` (now when omitted) whose attributes satisfy every
@@ -1652,9 +1664,17 @@ class ControlPlaneClient:
         ``items`` and ``nextCursor``: pass it back as ``cursor`` with the same
         arguments for the next page; the list ends at ``nextCursor: None``.
         The server reads the namespace of the workspace tree root with the
-        caller's visibility."""
+        caller's visibility. ``include={"relations": [...] | "*", "direction":
+        "out" | "in" | "both", "limit": n}`` adds each entity's ``relations``
+        (``{relation, direction, kind, key, title}`` of the other end)."""
         body: Json = {"workspaceId": workspace_id, "kinds": kinds}
-        for key, value in (("where", where), ("asOf", as_of), ("limit", limit), ("cursor", cursor)):
+        for key, value in (
+            ("where", where),
+            ("asOf", as_of),
+            ("limit", limit),
+            ("cursor", cursor),
+            ("include", include),
+        ):
             if value is not None:
                 body[key] = value
         return await self._request("POST", "/knowledge/entities:query", json_body=body)
@@ -1959,9 +1979,11 @@ class ControlPlaneClient:
         IAM ``audiences`` it issues tokens for. A remote protocol without any
         of its endpoints gets nothing.
 
-        Returns ``{"invocation": ..., "skill": ...}`` — the skill as an
-        executor sees it: name, version and the full contract, no catalog
-        ``config``. ``invocation_id`` narrows the claim to that one call.
+        Returns ``{"invocation": ..., "skill": ..., "settings": ...}`` — the
+        skill as an executor sees it: name, version and the full contract, no
+        catalog ``config``; ``settings`` — the effective settings of the
+        skill's package or ``None``. ``invocation_id`` narrows the claim to
+        that one call.
         """
         body: Json = {
             "protocols": protocols,
@@ -2355,7 +2377,10 @@ class ControlPlaneClient:
     # -- agents (CP-ADR-0073) --------------------------------------------------
 
     async def get_my_agent(self) -> Json:
-        """The agent the caller is, with its current revision (``AgentOut``).
+        """The agent the caller is, with its current revision (``AgentMeOut``).
+
+        ``packageSettings`` — the effective settings of the package that
+        installed the agent, or ``None``.
 
         ``NotFoundError`` when the caller's principal is not bound to an agent;
         a retired agent is returned with ``status: retired``.

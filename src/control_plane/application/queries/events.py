@@ -32,22 +32,27 @@ already final (point 2 of event_cursor.py), so a backward walk can neither
 skip nor repeat an event.
 """
 
+import dataclasses
 import re
 import uuid
 from dataclasses import dataclass
-from typing import TypeVar
+from datetime import datetime
+from typing import Any, TypeVar
 
 from sqlalchemy import (
     BigInteger,
     ColumnElement,
     Select,
     Text,
+    and_,
     cast,
+    exists,
     func,
     or_,
     select,
     text,
     tuple_,
+    union,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,7 +73,15 @@ from control_plane.application.event_cursor import (
 from control_plane.application.queries.lists import clamp_limit
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import ValidationError
-from control_plane.infrastructure.db.models import Event, EventArchive
+from control_plane.infrastructure.db.models import (
+    Approval,
+    Artifact,
+    Event,
+    EventArchive,
+    Run,
+    SkillInvocation,
+    Task,
+)
 
 # A replay page may span the cold archive and the hot journal. Both carry the
 # same column names, so response serialization is identical (ADR-0038).
@@ -97,14 +110,23 @@ class EventFilter:
 
     ``types`` are prefixes of the event type (``approval.`` covers every
     approval event, ``task.verified`` that type); ``workspace_ids`` is the
-    subtree a ``workspaceId`` filter resolved to (CP-ADR-0068). Filters narrow
-    the ordered replay scan, they never change the order or the cursor.
+    subtree a ``workspaceId`` filter resolved to (CP-ADR-0068), or the
+    workspace alone with ``includeDescendants=false``. ``actor_id`` is the
+    principal who acted, ``occurred_from``/``occurred_to`` a half-open period
+    of ``occurred_at`` (CP-ADR-0068 amendment Б1-Б4). Filters narrow the ordered
+    replay scan, they never change the order or the cursor.
     """
 
     entity_type: str | None = None
     entity_id: uuid.UUID | None = None
     types: tuple[str, ...] = ()
     workspace_ids: tuple[uuid.UUID, ...] | None = None
+    actor_id: uuid.UUID | None = None
+    occurred_from: datetime | None = None
+    occurred_to: datetime | None = None
+    # The caller's visible workspaces in ``members`` mode (CP-ADR-0082 §4):
+    # events of other workspaces are not read, those of the tenant are.
+    visible_workspaces: tuple[uuid.UUID, ...] | None = None
 
     @property
     def narrows(self) -> bool:
@@ -120,8 +142,87 @@ class EventFilter:
                 or_(*(model.event_type.startswith(p, autoescape=True) for p in self.types))
             )
         if self.workspace_ids is not None:
-            stmt = stmt.where(model.workspace_id.in_(self.workspace_ids))
+            if len(self.workspace_ids) == 1:
+                # An equality keeps the (tenant, workspace, tx_id, sequence)
+                # index usable as an ordered scan.
+                stmt = stmt.where(model.workspace_id == self.workspace_ids[0])
+            else:
+                stmt = stmt.where(model.workspace_id.in_(self.workspace_ids))
+        if self.actor_id is not None:
+            stmt = stmt.where(model.actor_id == self.actor_id)
+        if self.occurred_from is not None:
+            stmt = stmt.where(model.occurred_at >= self.occurred_from)
+        if self.occurred_to is not None:
+            stmt = stmt.where(model.occurred_at < self.occurred_to)
+        if self.visible_workspaces is not None:
+            stmt = stmt.where(
+                or_(
+                    model.workspace_id.in_(self.visible_workspaces),
+                    and_(
+                        model.workspace_id.is_(None),
+                        ~_about_work(model),
+                        _names_visible(model, self.visible_workspaces),
+                    ),
+                )
+            )
         return stmt
+
+
+def _about_work(model: type[Event] | type[EventArchive]) -> ColumnElement[bool]:
+    """An event without a workspace that is about work all the same: work
+    without a workspace is not visible in ``members`` mode (CP-ADR-0082 B2),
+    and neither is what hangs off it."""
+    hanging = [
+        (model.entity_type == name)
+        & exists().where(table.id == model.entity_id, table.task_id.is_not(None))
+        for name, table in (
+            ("approval", Approval),
+            ("artifact", Artifact),
+            ("skill_invocation", SkillInvocation),
+        )
+    ]
+    return or_(model.entity_type.in_(("task", "run", "claim")), *hanging)
+
+
+def _names_visible(
+    model: type[Event] | type[EventArchive], visible: tuple[uuid.UUID, ...]
+) -> ColumnElement[bool]:
+    """An event without a workspace names only visible work and workspaces.
+
+    Such an event is not about an entity with a workspace (an observation,
+    attention feedback, an event of a package trial), but its payload may
+    still point at work: ``taskId``, ``runId``, ``workspaceId``, or
+    ``entityType``/``entityId`` of attention feedback. Each one present must
+    be visible (CP-ADR-0082 V7). Compared as text: a payload is JSON, and a
+    malformed id must hide the event, not fail the read.
+    """
+    tasks = select(Task.id).where(Task.workspace_id.in_(visible))
+    task_ids = select(cast(Task.id, Text)).where(Task.workspace_id.in_(visible))
+    run_ids = select(cast(Run.id, Text)).where(Run.task_id.in_(tasks))
+    approval_ids = select(cast(Approval.id, Text)).where(
+        or_(Approval.workspace_id.is_(None), Approval.workspace_id.in_(visible)),
+        or_(Approval.task_id.is_(None), Approval.task_id.in_(tasks)),
+    )
+    workspace_ids = [str(w) for w in visible]
+
+    def absent_or(key: str, allowed: Any) -> ColumnElement[bool]:
+        # A missing key and a JSON null both read as SQL NULL.
+        ref = model.payload[key].astext
+        return or_(ref.is_(None), ref.in_(allowed))
+
+    entity_type = model.payload["entityType"].astext
+    entity_ref = model.payload["entityId"].astext
+    return and_(
+        absent_or("taskId", task_ids),
+        absent_or("runId", run_ids),
+        absent_or("workspaceId", workspace_ids),
+        or_(
+            entity_type.is_(None),
+            entity_type.not_in(("task", "approval")),
+            and_(entity_type == "task", entity_ref.in_(task_ids)),
+            and_(entity_type == "approval", entity_ref.in_(approval_ids)),
+        ),
+    )
 
 
 def parse_type_prefixes(values: list[str] | None) -> tuple[str, ...]:
@@ -149,6 +250,30 @@ def parse_type_prefixes(values: list[str] | None) -> tuple[str, ...]:
     return tuple(prefixes)
 
 
+def check_event_period(occurred_from: datetime | None, occurred_to: datetime | None) -> None:
+    """``occurredFrom``/``occurredTo`` carry a zone and do not run backwards.
+
+    A naive value would be read in the session's timezone — an audit period
+    must not depend on server settings, so it is refused, not guessed.
+    """
+    for name, value in (("occurredFrom", occurred_from), ("occurredTo", occurred_to)):
+        if value is not None and value.utcoffset() is None:
+            raise ValidationError(
+                "invalid_event_period",
+                f"'{name}' is an ISO 8601 date-time with a zone, e.g. 2026-07-01T00:00:00Z",
+                details={name: value.isoformat()},
+            )
+    if occurred_from is not None and occurred_to is not None and occurred_from > occurred_to:
+        raise ValidationError(
+            "invalid_event_period",
+            "'occurredFrom' must not be after 'occurredTo'",
+            details={
+                "occurredFrom": occurred_from.isoformat(),
+                "occurredTo": occurred_to.isoformat(),
+            },
+        )
+
+
 def past_filtered_out(position: EventCursor, frontier: EventPosition | None) -> EventCursor:
     """Move a filtered reader's cursor over the events its filter skipped.
 
@@ -172,28 +297,76 @@ async def authorize_event_read(
     entity_type: str | None = None,
     entity_id: uuid.UUID | None = None,
     types: tuple[str, ...] = (),
+    include_descendants: bool | None = None,
+    actor_id: uuid.UUID | None = None,
+    occurred_from: datetime | None = None,
+    occurred_to: datetime | None = None,
 ) -> EventFilter:
     """Check ``events.read`` for the requested scope and build the filter.
 
     Without ``workspace_id`` the question is asked at tenant level, as before
     CP-ADR-0068. With it — on that workspace (a policy decision point honours
     grants on its ancestors), and the reader sees the events of the workspace
-    and its descendants only, subtree evaluated at read time.
+    and its descendants only, subtree evaluated at read time;
+    ``include_descendants=False`` narrows that to the workspace itself.
+    Absent, it means the subtree, as before the parameter existed.
     """
+    check_event_period(occurred_from, occurred_to)
+    narrowing = EventFilter(
+        entity_type=entity_type,
+        entity_id=entity_id,
+        types=types,
+        actor_id=actor_id,
+        occurred_from=occurred_from,
+        occurred_to=occurred_to,
+        visible_workspaces=visible_tuple(ctx),
+    )
     if workspace_id is None:
         await authorize(ctx, Permission.EVENTS_READ)
-        return EventFilter(entity_type=entity_type, entity_id=entity_id, types=types)
+        return narrowing
     await authorize(
         ctx, Permission.EVENTS_READ, resource=ResourceRef("workspace", str(workspace_id))
     )
     await get_tenant_workspace(session, ctx, workspace_id)
-    subtree = await workspace_subtree_ids(session, ctx.tenant_id, workspace_id)
-    return EventFilter(
-        entity_type=entity_type,
-        entity_id=entity_id,
-        types=types,
-        workspace_ids=tuple(subtree),
-    )
+    if include_descendants is False:
+        scope = [workspace_id]
+    else:
+        scope = await workspace_subtree_ids(session, ctx.tenant_id, workspace_id)
+    return dataclasses.replace(narrowing, workspace_ids=tuple(scope))
+
+
+async def recorded_observations(
+    session: AsyncSession, ctx: AuthContext, observation_ids: set[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Those of ``observation_ids`` recorded in this tenant and visible to the caller.
+
+    An observation IS its journal event, which retention may have moved to
+    the archive (ADR-0038) — both tables are the journal. It is visible when
+    the journal would hand its event to the caller (CP-ADR-0082 V7): a
+    reference to an invisible observation answers as one to a missing one.
+    """
+    if not observation_ids:
+        return set()
+    filters = EventFilter(visible_workspaces=visible_tuple(ctx))
+
+    def recorded(table: type[_Row]) -> Select[tuple[uuid.UUID]]:
+        stmt = select(table).where(
+            table.tenant_id == ctx.tenant_id,
+            table.entity_type == "observation",
+            table.event_type == "observation.recorded",
+            table.entity_id.in_(observation_ids),
+        )
+        return filters.apply(stmt, table).with_only_columns(table.entity_id)
+
+    rows = await session.scalars(union(recorded(Event), recorded(EventArchive)))
+    return set(rows.all())
+
+
+def visible_tuple(ctx: AuthContext) -> tuple[uuid.UUID, ...] | None:
+    """The filter value of the caller's visibility; ``None`` in ``tenant`` mode."""
+    if ctx.visible_workspaces is None:
+        return None
+    return tuple(uuid.UUID(w) for w in sorted(ctx.visible_workspaces))
 
 
 async def journal_floors(
@@ -544,6 +717,10 @@ async def list_events(
     entity_id: uuid.UUID | None = None,
     types: tuple[str, ...] = (),
     workspace_id: uuid.UUID | None = None,
+    include_descendants: bool | None = None,
+    actor_id: uuid.UUID | None = None,
+    occurred_from: datetime | None = None,
+    occurred_to: datetime | None = None,
 ) -> EventPage:
     backward_to: EventPosition | None = None
     if before is not None:
@@ -569,6 +746,10 @@ async def list_events(
         entity_type=entity_type,
         entity_id=entity_id,
         types=types,
+        include_descendants=include_descendants,
+        actor_id=actor_id,
+        occurred_from=occurred_from,
+        occurred_to=occurred_to,
     )
     effective_limit = clamp_limit(limit)
 

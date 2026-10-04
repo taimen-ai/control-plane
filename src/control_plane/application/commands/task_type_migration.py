@@ -38,6 +38,7 @@ from control_plane.application.commands.tasks import (
 )
 from control_plane.application.common import utcnow
 from control_plane.application.events import record_event
+from control_plane.application.visibility import workspace_condition
 from control_plane.domain.enums import ApprovalStatus, Permission, RunStatus
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -275,6 +276,9 @@ async def migrate_type_tasks(
         Task.tenant_id == ctx.tenant_id,
         Task.type_id == source.id,
         Task.system_status_category.not_in(TERMINAL_CATEGORIES),
+        # Work of an invisible workspace is left out like work the caller may
+        # not write (CP-ADR-0082 §3.7).
+        workspace_condition(ctx, Task.workspace_id),
     )
     if cursor is not None:
         stmt = stmt.where(Task.id > cursor)

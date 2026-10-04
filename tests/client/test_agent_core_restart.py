@@ -16,11 +16,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+import control_plane_agent.main as agent_module
 import control_plane_client.client as client_module
 from control_plane_agent.main import Agent, ArtifactSpec
 from control_plane_agent.supervision import SupervisionSettings
 from control_plane_agent.workspace import Workspace
-from control_plane_client import ControlPlaneClient
+from control_plane_client import ControlPlaneClient, HeartbeatRunner
 from tests.client.test_agent import RUNNER_PERMISSIONS
 from tests.helpers import auth, create_agent_with_key, create_task, do_bootstrap
 
@@ -73,6 +74,22 @@ def _fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(client_module, "_RETRY_BACKOFF_MAX", 0.05)
 
 
+#: The daemon's patience for its leases here: the same as the client's
+#: ``retry_window`` below. In production it is three intervals, 180 s against a
+#: rollout of seven to ten. Three of the test's 50 ms intervals are 150 ms —
+#: about what a few in-process calls to the core take on a busy CI runner, so
+#: one 502 met by a beat that came late ended the lease (``lease_lost``).
+LEASE_PATIENCE = 5.0
+
+
+class PatientHeartbeats(HeartbeatRunner):
+    """The daemon's heartbeats at the production ratio of patience to outage."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("outage_budget_seconds", LEASE_PATIENCE)
+        super().__init__(*args, **kwargs)
+
+
 async def _setup(client: httpx.AsyncClient) -> tuple[str, str, dict[str, Any]]:
     boot = await do_bootstrap(client)
     admin_key = boot["apiKey"]["key"]
@@ -99,8 +116,12 @@ def _agent(
 
 
 async def test_a_restart_in_the_middle_of_a_run_does_not_fail_it(
-    client: httpx.AsyncClient, app: FastAPI
+    client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Beats every 50 ms meet the outages below; the budget stays the
+    # daemon's, not a multiple of the compressed interval. A 502 taken for an
+    # answer of the core still ends the lease at once.
+    monkeypatch.setattr(agent_module, "HeartbeatRunner", PatientHeartbeats)
     admin_key, agent_key, task = await _setup(client)
     core = RestartingCore(app)
     # The calls of the 10:45 log, and the heartbeat of the 09:49 one.

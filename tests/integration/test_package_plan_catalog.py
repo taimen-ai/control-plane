@@ -5,13 +5,15 @@ The acceptance of TASK-000903:
 - the plan of a package with a task type, an agent and a rule shows three
   additions, the apply writes them, the same plan applied again — ``409
   plan_stale``;
-- a key applied the way ``cp_packages apply --install`` applies it (the
+- a key applied the way the installer (package-sdk) applies it (the
   ordinary routes, with the file's spec) plans ``unchanged``: both paths leave
   the same catalog.
 
 Per kind: create, update, unchanged, a stale plan; a field a person changed
 is kept unless ``overwriteConsole``; the right of each kind; findings of the
-commands; what the core does not plan (``outside``).
+commands; what the core does not plan (``outside``). A package that mixes the
+catalog kinds with a process migration that moves deadlines plans both and
+writes nothing (TASK-001225).
 """
 
 import copy
@@ -20,11 +22,28 @@ from typing import Any
 
 import httpx
 import yaml
+from sqlalchemy.engine import Engine
 
 from control_plane.domain.work_item import SYSTEM_TASK_LIFECYCLE
 from tests.helpers import auth, create_agent_with_key, create_workspace, do_bootstrap
 from tests.integration.test_package_plan import _apply, _errors, _plan, _plan_and_apply
 from tests.integration.test_package_test import API_VERSION
+from tests.integration.test_process_instances import _events, _instance, _journal, _time
+from tests.integration.test_process_sla_migration import (
+    DUE,
+    MIGRATED_AT,
+    Still,
+    _changed,
+    _normal,
+    _section,
+    _spec,
+    _timers,
+    _waiting,
+    still,
+)
+from tests.integration.test_process_sla_migration import _package as _deadlines_package
+
+__all__ = ["still"]
 
 TYPE = "sample-triage"
 AGENT = "sample-triager"
@@ -314,7 +333,7 @@ async def test_a_field_a_person_changed_is_kept_for_every_kind_unless_overwritte
 
 
 async def test_what_the_installer_applied_plans_unchanged(client: httpx.AsyncClient) -> None:
-    """``cp_packages apply --install`` sends the file's spec to the ordinary routes."""
+    """The installer (package-sdk) sends the file's spec to the ordinary routes."""
     key = await _admin(client)
     installed = [
         ("/api/v1/task-types", {"key": TYPE, **_type_spec()}),
@@ -427,6 +446,45 @@ async def test_the_plan_names_what_a_command_would_refuse_and_what_it_does_not_p
     assert invalid.status_code == 422 and invalid.json()["error"]["code"] == "invalid_package"
 
 
+async def test_fractional_cpus_are_a_finding_of_the_plan_and_of_the_check(
+    client: httpx.AsyncClient,
+) -> None:
+    """Amendment 2026-10-03 of CP-ADR-0073: the field and its path, before the revision hash."""
+    key = await _admin(client)
+    placed = {
+        "executor": {"kind": "skills"},
+        "placement": {"resources": {"cpus": 0.5, "memoryMb": 1024}},
+    }
+    package = _package(agent=_agent_spec(**placed))
+    plan = await _plan(client, key, package)
+    [problem] = [p for p in plan["problems"] if p["file"] == "agents/triager.yaml"]
+    assert (problem["code"], problem["severity"], problem["path"]) == (
+        "invalid_agent",
+        "error",
+        "/spec/placement/resources/cpus",
+    )
+    assert "whole number" in problem["message"]
+    refused = await _apply(client, key, package, plan["planHash"])
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["code"] == "invalid_package"
+    page = await _get(client, key, "/agents", limit=10)
+    assert [a["key"] for a in page["items"] if a["key"] == AGENT] == []
+
+    checked = await client.post(
+        "/api/v1/packages:test?checkOnly=true", json={"package": package}, headers=auth(key)
+    )
+    assert checked.status_code == 200, checked.text
+    assert checked.json()["status"] == "invalid"
+    problems = checked.json()["problems"]
+    assert [(p["code"], p["path"]) for p in problems if p["file"] == "agents/triager.yaml"] == [
+        ("invalid_agent", "/spec/placement/resources/cpus")
+    ]
+
+    # Whole CPUs plan and apply.
+    placed["placement"]["resources"]["cpus"] = 1
+    await _plan_and_apply(client, key, _package(agent=_agent_spec(**placed)))
+
+
 async def test_a_retired_agent_and_another_workspace_of_a_rule_are_refused(
     client: httpx.AsyncClient,
 ) -> None:
@@ -511,3 +569,102 @@ async def test_an_object_of_another_package_is_a_warning_of_the_plan(
     assert agent["package"]["key"] == "other-catalog"
     again = await _plan(client, key, package)
     assert [p for p in again["problems"] if p["code"] == "package_owner_changed"] == []
+
+
+async def test_a_gate_addressed_to_a_role_needs_the_role_of_the_package(
+    client: httpx.AsyncClient,
+) -> None:
+    """``role:<slug>`` is resolved when the type is published (CP-ADR-0061, 2026-10-01)."""
+    key = await _admin(client)
+    gated = _type_spec(
+        completionSchema={
+            "onComplete": {
+                "actions": [
+                    {
+                        "ensureWork": {
+                            "type": TYPE,
+                            "key": "after:$.task.id",
+                            "title": "After $.task.publicId",
+                            "requestApproval": {"assignee": "role:sample-approvers"},
+                        }
+                    }
+                ]
+            }
+        }
+    )
+    plan = await _plan(client, key, _package(task_type=gated))
+    [refused] = [p for p in plan["problems"] if p["severity"] == "error"]
+    assert (refused["code"], refused["file"], refused["path"]) == (
+        "unknown_role",
+        "task-types/triage.yaml",
+        "/spec/completionSchema/onComplete/actions/0/ensureWork/requestApproval/assignee",
+    )
+
+    role = {
+        "apiVersion": API_VERSION,
+        "kind": "Role",
+        "key": "sample-approvers",
+        "spec": {"name": "Sample approvers"},
+    }
+    plan = await _plan(client, key, _package(task_type=gated, extra=[("roles/a.yaml", role)]))
+    assert [p for p in plan["problems"] if p["severity"] == "error"] == []
+
+
+async def test_a_plan_of_catalog_kinds_and_a_migration_with_deadlines_writes_nothing(
+    client: httpx.AsyncClient, sync_engine: Engine, still: Still
+) -> None:
+    """The section ``deadlines`` is counted beside the trial of the catalog kinds, all rolled back.
+
+    One package brings a task type and an agent (``shapes``, ``_trial``) and the
+    version of a process that migrates its open instances to a shorter due
+    (``_deadlines``). The plan lists both; the catalog, the instances, their
+    journals and timers are as they were; the apply of that plan counts the
+    deadlines the plan listed.
+    """
+    s, instances = await _waiting(client, still)
+    key = s["key"]
+    journals = {iid: await _journal(client, key, iid) for iid in instances.values()}
+    timers = {iid: _timers(sync_engine, iid) for iid in instances.values()}
+
+    still.at = MIGRATED_AT
+    process = _deadlines_package(_spec(s["admin"], version=2, workdays=1, policy="migrate"))
+    catalog = _package(task_type=_type_spec(), agent=_agent_spec())
+    package = {
+        "files": process["files"] + [f for f in catalog["files"] if f["path"] != "package.yaml"]
+    }
+    plan = await _plan(client, key, package)
+    assert _errors(plan) == [], plan["problems"]
+    assert {(c["kind"], c["key"], c["action"]) for c in plan["changes"]} >= {
+        ("TaskType", TYPE, "create"),
+        ("Agent", AGENT, "create"),
+    }
+    planned = _section(plan)
+    assert {(d["instanceId"], d["element"]) for d in planned} == {
+        (iid, "review") for iid in instances.values()
+    }
+    for name, iid in instances.items():
+        [deadline] = [d for d in planned if d["instanceId"] == iid]
+        assert _time(deadline["dueAt"]) == _time(DUE[name])
+        assert deadline["breached"] is (name != "HALF")
+
+    # The transaction of the plan rolled back: nothing of either part is written.
+    assert await _types(client, key) == {}
+    missing = await client.get(f"/api/v1/agents/{AGENT}", headers=auth(key))
+    assert missing.status_code == 404, missing.text
+    for iid in instances.values():
+        assert (await _instance(client, key, iid))["definitionVersion"] == 1
+        assert await _journal(client, key, iid) == journals[iid]
+        assert _timers(sync_engine, iid) == timers[iid]
+    assert not await _events(client, key, "process.sla_breached")
+
+    applied = await _apply(client, key, package, plan["planHash"])
+    assert applied.status_code == 200, applied.text
+    assert {(a["kind"], a["action"]) for a in applied.json()["applied"]} >= {
+        ("TaskType", "create"),
+        ("Agent", "create"),
+    }
+    assert (await _instance(client, key, instances["HALF"]))["definitionVersion"] == 2
+    recorded = [
+        d for iid in instances.values() for d in _changed(await _journal(client, key, iid), iid)
+    ]
+    assert _normal(planned) == _normal(recorded)

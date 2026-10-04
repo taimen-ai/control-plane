@@ -27,7 +27,9 @@ from typing import Any
 
 from control_plane.domain.package_plan import PLANNED_KINDS
 
-# The catalog kinds the core holds, in the order of the catalog schema.
+# The catalog kinds the core holds, in the order of the catalog schema
+# (``ConnectionType`` right after ``Capability``: the installer's order,
+# CP-ADR-0079 §2).
 # NotificationRule lives in the notification service, Package and
 # Installation are not objects of a tenant's catalog.
 LINKED_KINDS = (
@@ -37,14 +39,17 @@ LINKED_KINDS = (
     "WorkspaceType",
     "Role",
     "Capability",
+    "ConnectionType",
     "Skill",
     "WorkRule",
     "Agent",
     "Process",
     "Calendar",
+    "View",
 )
-# The kinds the process engine publishes: linked only by POST /packages:apply.
-ENGINE_KINDS = ("Process", "Calendar")
+# The kinds only POST /packages:apply publishes and links: those of the
+# process engine and the screens of a package (CP-ADR-0080).
+ENGINE_KINDS = ("Process", "Calendar", "View")
 assert set(ENGINE_KINDS) <= set(PLANNED_KINDS)
 # The kinds the installer records: all but the engine's.
 RECORDED_KINDS = tuple(kind for kind in LINKED_KINDS if kind not in ENGINE_KINDS)

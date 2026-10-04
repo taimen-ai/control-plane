@@ -30,6 +30,12 @@ credentials reach the adapter as ``env`` of this run only. No budget in time
 sends the task back to the queue (``test_services_unavailable``); a template
 the node does not have sends it to a person (``service_template_unavailable``).
 
+Setup (TAI-ADR-0063 §4, ``setup_command.py``): ``setup`` of the base's
+``runner.yaml`` runs in the copy after the services are ready and before the
+adapter, in the environment of a check with the services' ``env``; a non-zero
+exit or its time limit sends the task to a person (``setup_failed``) and the
+adapter never starts. No ``setup`` — the cycle is what it was.
+
 Checks before hand-in (universal-runner U014, ``checks.py``): with ``checks``
 on (``workingCopy.checks`` of the agent's description), the ``checks`` of the
 base's ``runner.yaml`` run after the adapter; a failed one gives the adapter
@@ -142,6 +148,7 @@ from control_plane_agent.revision import (
     my_agent,
     settings_of,
     skills_of,
+    skills_params,
     workspace_pool_of,
 )
 from control_plane_agent.services import (
@@ -149,6 +156,17 @@ from control_plane_agent.services import (
     RunServicesSource,
     ServicesBlocked,
     ServicesUnavailable,
+)
+from control_plane_agent.setup_command import (
+    DEFAULT_TIMEOUT_SECONDS as DEFAULT_SETUP_TIMEOUT_SECONDS,
+)
+from control_plane_agent.setup_command import (
+    SETUP_ACTION,
+    SETUP_FAILED,
+    SetupPlan,
+    run_setup,
+    setup_at_base,
+    setup_failure,
 )
 from control_plane_agent.skills import SkillExecutor, executor_from_environment
 from control_plane_agent.supervision import (
@@ -162,6 +180,7 @@ from control_plane_agent.workspace import (
     ARTIFACT_TYPE,
     CHECKPOINT_KIND,
     NEIGHBOUR_MODIFIED,
+    NEIGHBOUR_POINTER_REGRESSED,
     ExecutionWorkspacePool,
     Outcome,
     Workspace,
@@ -177,6 +196,7 @@ from control_plane_client import (
     ControlPlaneClient,
     ControlPlaneError,
     HeartbeatRunner,
+    IamCredentialError,
     NotEligibleError,
     PermissionDeniedError,
     SessionExpiredError,
@@ -191,6 +211,18 @@ logger = logging.getLogger("control_plane_agent")
 #: not take (a skill it cannot run), or one another replica claimed first,
 #: should not hide the next one.
 WORK_SCAN = 50
+#: How many pages of available Work one cycle reads while every item of the
+#: page before was one this daemon does not take: its own Work further down
+#: the queue must not wait behind more than a page of someone else's.
+WORK_PAGES = 5
+#: How long the task types an executor of kind ``skills`` takes are kept
+#: before they are read again: a type published later is taken after that.
+SKILL_TYPES_REFRESH_SECONDS = 60.0
+#: Task types read to find those (``GET /task-types``, page of 100).
+SKILL_TYPES_PAGES = 20
+#: The most ``typeKey`` values the core takes in one listing; past it the
+#: daemon lists without the filter and pages instead.
+TYPE_KEYS_MAX = 50
 #: What the message of a WIP commit carries: the work saved when a run
 #: stopped, not a result handed in (FR-022).
 WIP_TRAILER = "Control-Plane-WIP: true"
@@ -314,7 +346,8 @@ def adapter_for_revision(
     """The executor a revision names, built from its ``params`` and ``instructions``.
 
     ``skills`` has no adapter: such an agent runs only the skills of its
-    ``skills`` section, and ordinary Work is left to others (None). A kind
+    ``skills`` section, and ordinary Work is left to others (None); its only
+    params are ``env``, the settings of its skills. A kind
     this daemon does not know, or parameters its adapter refuses, is a
     :class:`RevisionError` — the core stores ``executor.params`` without
     reading them, so the adapter is where they are checked.
@@ -338,10 +371,16 @@ def adapter_for_revision(
         raise RevisionError(f"executor {kind} is not installed on this runner: {exc}") from exc
     except ValueError as exc:
         raise RevisionError(str(exc)) from exc
-    if kind == "skills" or kind in ADAPTERS:
+    if kind == "skills":
+        # Its params are the skills' settings (params.env), checked here and
+        # handed to the skill host by skills_environ.
+        skills_params(revision)
+        return None
+    if kind in ADAPTERS:
         if params:
             raise RevisionError(f"executor {kind} takes no params, got {sorted(params)}")
-        return None if kind == "skills" else ADAPTERS[kind]()
+        adapter: Adapter = ADAPTERS[kind]()
+        return adapter
     raise RevisionError(f"executor kind {kind!r} is not run by this daemon")
 
 
@@ -372,6 +411,7 @@ class Agent:
         orphan_grace: float = ORPHAN_GRACE_SECONDS,
         checks: bool = False,
         checks_budget: float = DEFAULT_BUDGET_SECONDS,
+        setup_timeout: float = DEFAULT_SETUP_TIMEOUT_SECONDS,
     ) -> None:
         self.client = client
         # None: ordinary Work is not taken — an agent of kind ``skills`` runs
@@ -401,6 +441,10 @@ class Agent:
         # Work, and Work whose type is executed by a skill.
         self.skills = skills
         self._executions: dict[str, dict[str, Any] | None] = {}
+        # Keys of the task types whose skill this executor runs (kind
+        # ``skills`` only), and the monotonic time they were read.
+        self._skill_type_keys: frozenset[str] | None = None
+        self._skill_types_read_at = -math.inf
         # This principal's id, read once for the comments of a task
         # (comments.py): its own "blocked" comments are left out of the prompt.
         self._own_principal: str | None = None
@@ -442,6 +486,9 @@ class Agent:
         self.checks = checks
         # How long all checks of one hand-in may take together, both rounds.
         self.checks_budget = checks_budget
+        # How long ``setup`` of runner.yaml may take before the executor
+        # (``setup_command.py``); it runs whenever the base declares it.
+        self.setup_timeout = setup_timeout
         # Take only work addressed to this Principal. Off by default, because
         # the reference harness exists to prove the protocol and an unassigned
         # queue is the simplest way to do that — but any runner doing real work
@@ -635,7 +682,11 @@ class Agent:
                     worked = await self.run_once()
                 except ControlPlaneError as exc:
                     if is_transient(exc):
-                        logger.warning("core unreachable, backing off: %s", exc)
+                        # The IAM exchange precedes every command: its outage
+                        # is not the core's, and the operator restarts another
+                        # service.
+                        unreachable = "IAM" if isinstance(exc, IamCredentialError) else "core"
+                        logger.warning("%s unreachable, backing off: %s", unreachable, exc)
                     else:
                         logger.warning("cycle error: %s", exc)
                     worked = False
@@ -695,6 +746,52 @@ class Agent:
             return False
         return self.skills.can_execute(skill)
 
+    async def _listing_type_keys(self) -> frozenset[str] | None:
+        """The ``typeKey`` filter of the listing; None — no filter.
+
+        Only an executor of kind ``skills`` (no adapter) narrows the listing:
+        to the types whose ``execution`` skill it runs — what ``_takes`` would
+        decide item by item. Without ``task_types.read``, or with more types
+        than one listing takes, it lists as before and pages instead.
+        """
+        if self.adapter is not None or self.skills is None:
+            return None
+        now = time.monotonic()
+        if now - self._skill_types_read_at < SKILL_TYPES_REFRESH_SECONDS:
+            return self._skill_type_keys
+        keys = await self._read_skill_type_keys()
+        if keys is not None and len(keys) > TYPE_KEYS_MAX:
+            logger.warning("%d task types taken: listing every type", len(keys))
+            keys = None
+        self._skill_type_keys = frozenset(keys) if keys is not None else None
+        self._skill_types_read_at = now
+        return self._skill_type_keys
+
+    async def _read_skill_type_keys(self) -> set[str] | None:
+        """Keys of the task types this skill executor runs; None — unknown."""
+        keys: set[str] = set()
+        cursor: str | None = None
+        try:
+            for _ in range(SKILL_TYPES_PAGES):
+                params: dict[str, Any] = {"limit": 100}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                page = await self.client.list_task_types(**params)
+                for task_type in page["items"]:
+                    key = str(task_type.get("key") or "")
+                    if key in keys or (self.task_types and key not in self.task_types):
+                        continue
+                    if await self._takes(task_type.get("execution")):
+                        keys.add(key)
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    return keys
+        except PermissionDeniedError as exc:
+            logger.warning("task types not readable (%s): listing every type", exc.code)
+            return None
+        logger.warning("more task types than %d pages: listing every type", SKILL_TYPES_PAGES)
+        return None
+
     async def run_once(self) -> bool:
         """Discover, take ONE task through the full cycle. True if work done.
 
@@ -704,60 +801,71 @@ class Agent:
         session_id = await self._ensure_session()
         await self._publish_pending()
         await self._close_foreign_orphans()
-        page = await self.client.list_available_work(
-            limit=WORK_SCAN,
-            workspace_id=self.workspace_id,
-            include_descendants=True,
-            project_id=self.project_id,
-            include_subprojects=self.include_subprojects,
-            assigned_to_me=self.only_assigned,
-        )
+        type_keys = await self._listing_type_keys()
         task: dict[str, Any] | None = None
         execution: dict[str, Any] | None = None
         claim: dict[str, Any] = {}
-        for item in self._candidates(page["items"]):
-            try:
-                execution = await self._execution_of(item)
-            except _TypeUnreadable:
-                continue
-            if not await self._takes(execution):
-                continue
-            # Autonomous policy: claim automatically (the human harness would ask).
-            try:
-                claim = await self.client.claim_task(
-                    item["id"], session_id, intent="autonomous-agent auto"
-                )
-            except SessionExpiredError:
-                # Our session died between the poll and the claim; drop it so
-                # the next cycle reopens, and treat this cycle as no-op.
-                await self._open_session()
-                return False
-            except PermissionDeniedError as exc:
-                if _refused_for_task(exc):
-                    # This task only: a scoped binding that does not cover
-                    # it, requirements this agent does not meet. The next
-                    # candidate may well be allowed.
-                    logger.info(
-                        "claim of %s forbidden for this task (%s); trying the next",
+        cursor: str | None = None
+        # An executor of kind ``skills`` with no type it runs has no Work to
+        # look for.
+        pages = 0 if type_keys is not None and not type_keys else WORK_PAGES
+        for _ in range(pages):
+            page = await self.client.list_available_work(
+                limit=WORK_SCAN,
+                cursor=cursor,
+                workspace_id=self.workspace_id,
+                include_descendants=True,
+                project_id=self.project_id,
+                include_subprojects=self.include_subprojects,
+                assigned_to_me=self.only_assigned,
+                type_keys=sorted(type_keys) if type_keys else None,
+            )
+            for item in self._candidates(page["items"]):
+                try:
+                    execution = await self._execution_of(item)
+                except _TypeUnreadable:
+                    continue
+                if not await self._takes(execution):
+                    continue
+                # Autonomous policy: claim automatically (the human harness would ask).
+                try:
+                    claim = await self.client.claim_task(
+                        item["id"], session_id, intent="autonomous-agent auto"
+                    )
+                except SessionExpiredError:
+                    # Our session died between the poll and the claim; drop it so
+                    # the next cycle reopens, and treat this cycle as no-op.
+                    await self._open_session()
+                    return False
+                except PermissionDeniedError as exc:
+                    if _refused_for_task(exc):
+                        # This task only: a scoped binding that does not cover
+                        # it, requirements this agent does not meet. The next
+                        # candidate may well be allowed.
+                        logger.info(
+                            "claim of %s forbidden for this task (%s); trying the next",
+                            item["publicId"],
+                            exc.code,
+                        )
+                        continue
+                    # Not a race: this agent may not claim, and every next
+                    # candidate would say the same. The cycle stops here.
+                    logger.warning(
+                        "claim of %s forbidden (%s); no more claims this cycle",
                         item["publicId"],
                         exc.code,
                     )
+                    return False
+                except ControlPlaneError as exc:
+                    # Another replica of this agent took it since the listing: the
+                    # next candidate, not an idle cycle.
+                    logger.info("claim lost race for %s: %s", item["publicId"], exc.code)
                     continue
-                # Not a race: this agent may not claim, and every next
-                # candidate would say the same. The cycle stops here.
-                logger.warning(
-                    "claim of %s forbidden (%s); no more claims this cycle",
-                    item["publicId"],
-                    exc.code,
-                )
-                return False
-            except ControlPlaneError as exc:
-                # Another replica of this agent took it since the listing: the
-                # next candidate, not an idle cycle.
-                logger.info("claim lost race for %s: %s", item["publicId"], exc.code)
-                continue
-            task = item
-            break
+                task = item
+                break
+            cursor = page.get("nextCursor")
+            if task is not None or not cursor:
+                break
         if task is None:
             if self.skills is not None and self.skills.concurrency == 0:
                 return await self.skills.run_once(session_id)
@@ -852,14 +960,51 @@ class Agent:
                         return True
                 env = run_services.env if run_services is not None else None
                 secrets = run_services.secrets if run_services is not None else ()
-                inputs = await self._fetch_inputs(task, run)
-                task = await self._with_comments(await self._with_feedback(task))
                 supervisor = RunSupervisor(
                     self.client,
                     str(run["id"]),
                     self.supervision,
                     drain_deadline=self._drain_deadline_of,
                 )
+                if workspace is not None:
+                    try:
+                        setup = await asyncio.to_thread(setup_at_base, workspace)
+                    except WorkspaceBlocked as exc:
+                        await self._settle_blocked(
+                            task, run, claim, exc.reason, failure_reason=exc.code
+                        )
+                        return True
+                    if setup is not None:
+                        # After the copy, its neighbours and the services, before
+                        # the executor (TAI-ADR-0063 §4): a copy that does not
+                        # install is not worked in; a person fixes the base.
+                        installed = await supervisor.run(
+                            self._run_setup(run, workspace, setup, env, secrets)
+                        )
+                        if not installed.passed:
+                            await self._settle_blocked(
+                                task,
+                                run,
+                                claim,
+                                setup_failure(setup, installed, secrets),
+                                failure_reason=SETUP_FAILED,
+                            )
+                            return True
+                        if heartbeats.error is not None:
+                            # The claim died while setup ran: as after the
+                            # wait for the services, the executor never starts.
+                            logger.warning(
+                                "lease lost during setup of %s (%s); aborting",
+                                task["publicId"],
+                                heartbeats.error.code,
+                            )
+                            with contextlib.suppress(ControlPlaneError):
+                                await self.client.fail_run(
+                                    str(run["id"]), failure_reason="lease_lost"
+                                )
+                            return False
+                inputs = await self._fetch_inputs(task, run)
+                task = await self._with_comments(await self._with_feedback(task))
                 artifacts = await supervisor.run(self._execute(task, run, workspace, inputs, env))
                 stopped = await self._after_execution(
                     task, run, claim, workspace, heartbeats, artifacts
@@ -995,8 +1140,9 @@ class Agent:
     ) -> bool:
         """Work executed by a skill (ADR-0056 §3): one invocation, then the run.
 
-        The ``skill_result`` artifact is written by the core when the call
-        succeeds; the run carries only references to it. No workspace, no
+        The ``skill_result`` artifact and the task's typed outputs
+        (``artifactSchema.outputs``, CP-ADR-0072) are written by the core when
+        the call succeeds; the run carries only references. No workspace, no
         adapter: the skill is the whole execution, and what it did
         is decided by its contract, not by this daemon.
         """
@@ -1159,15 +1305,19 @@ class Agent:
             with contextlib.suppress(ControlPlaneError):
                 await self.client.fail_run(str(run["id"]), failure_reason="lease_lost")
             return False
-        changed = (
-            await asyncio.to_thread(workspace.neighbour_changes) if workspace is not None else {}
+        check = (
+            await asyncio.to_thread(workspace.neighbour_check) if workspace is not None else None
         )
-        if changed:
+        if check is not None and check.changes:
             # Neighbours are read-only (FR-007): the work was done
             # against revisions no checkpoint names, and a change
             # there belongs to a task of that repository. Nothing is
             # committed or published; the copies stay for a person.
             await self._publish(task, run, artifacts)
+            changed = {
+                **check.changes,
+                **{name: r.what for name, r in check.regressions.items()},
+            }
             reason = "; ".join(f"neighbour {n} {what}" for n, what in changed.items())
             await self._settle_blocked(
                 task,
@@ -1176,6 +1326,20 @@ class Agent:
                 f"{reason}. Neighbours are read-only: move the change to a task of "
                 "that repository or drop it, then return the task",
                 failure_reason=NEIGHBOUR_MODIFIED,
+            )
+            return True
+        if check is not None and check.regressions:
+            # The branch would undo a pointer the base moved on (a merge of
+            # the base, then ``commit -a`` over the old checkout): nothing is
+            # handed in, and the reason tells the next attempt the one
+            # checkout that fixes it.
+            await self._publish(task, run, artifacts)
+            await self._settle_blocked(
+                task,
+                run,
+                claim,
+                "; ".join(r.reason() for r in check.regressions.values()),
+                failure_reason=NEIGHBOUR_POINTER_REGRESSED,
             )
             return True
         blocked = await blocked_reason(self.client, str(run["id"]))
@@ -1241,6 +1405,37 @@ class Agent:
                 "as it found it: fix the check at the base, then return the task",
             )
         return results
+
+    async def _run_setup(
+        self,
+        run: dict[str, Any],
+        workspace: Workspace,
+        plan: SetupPlan,
+        env: Mapping[str, str] | None,
+        secrets: Sequence[str] = (),
+    ) -> CheckResult:
+        """``setup`` of the base in the copy, an action of the run while it goes."""
+        run_id = str(run["id"])
+        action: dict[str, Any] | None = None
+        try:
+            action = await self.client.record_action(
+                run_id, action=SETUP_ACTION, status="started", metadata={"revision": plan.revision}
+            )
+        except ControlPlaneError as exc:
+            # As for a check: a core that does not answer for a moment does
+            # not stop the run; a lost claim or an ended run does.
+            if not record_failure_tolerated(exc):
+                raise
+            logger.warning("could not record setup: %s", exc)
+        result = await run_setup(
+            plan, workspace, env, secrets=secrets, time_limit=self.setup_timeout
+        )
+        if action is not None:
+            with contextlib.suppress(ControlPlaneError):
+                await self.client.finish_action(
+                    run_id, str(action["id"]), status="completed" if result.passed else "failed"
+                )
+        return result
 
     async def _each_check(
         self,

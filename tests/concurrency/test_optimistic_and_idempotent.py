@@ -5,7 +5,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from tests.helpers import auth, create_task, do_bootstrap
+from tests.helpers import auth, create_agent_with_key, create_task, do_bootstrap
 
 
 async def test_concurrent_updates_only_one_wins(client: httpx.AsyncClient) -> None:
@@ -94,4 +94,40 @@ async def test_parallel_external_observations_dedup_to_one(
                 text("SELECT count(*) FROM events WHERE event_type = 'observation.recorded'")
             ).scalar()
             == 1
+        )
+
+
+async def test_parallel_reports_of_one_key_by_two_actors(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """Two authors racing for one (source, dedupKey): each records its own
+    event, the author is part of the key (CP-ADR-0057, 2026-10-01)."""
+    body = await do_bootstrap(client)
+    admin_key = body["apiKey"]["key"]
+    _, first = await create_agent_with_key(client, admin_key, name="first")
+    _, second = await create_agent_with_key(client, admin_key, name="second")
+
+    async def report(key: str) -> httpx.Response:
+        return await client.post(
+            "/api/v1/observations",
+            json={
+                "kind": "external_fact",
+                "content": "Alert fired",
+                "source": "alertmanager",
+                "dedupKey": "alert-18",
+            },
+            headers=auth(key),
+        )
+
+    responses = await asyncio.gather(report(first), report(second), report(first), report(second))
+    assert sorted(r.status_code for r in responses) == [200, 200, 201, 201]
+    assert responses[0].json()["id"] == responses[2].json()["id"]
+    assert responses[1].json()["id"] == responses[3].json()["id"]
+    assert responses[0].json()["id"] != responses[1].json()["id"]
+    with sync_engine.connect() as conn:
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM events WHERE event_type = 'observation.recorded'")
+            ).scalar()
+            == 2
         )

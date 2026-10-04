@@ -21,6 +21,7 @@ arguments the daemon and its parts already take.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -52,11 +53,13 @@ from control_plane_agent.skills import (
     ENV_AUDIENCES,
     ENV_CONCURRENCY,
     ENV_HTTP_ORIGINS,
+    ENV_LOCAL_ENV,
     ENV_LOCAL_PACKAGES,
     ENV_MCP_ORIGINS,
     ENV_PROTOCOLS,
     SkillExecutor,
     executor_from_environment,
+    parse_skill_env,
 )
 from control_plane_agent.workspace import (
     ExecutionWorkspacePool,
@@ -264,6 +267,23 @@ def drain_seconds_of(revision: AgentRevision) -> float | None:
 # -- skills ----------------------------------------------------------------------
 
 
+def skills_params(revision: AgentRevision) -> dict[str, str]:
+    """``params.env`` of a ``skills`` executor (CP-ADR-0073, amendment 2026-10-01).
+
+    The only parameter of the kind: non-secret settings of the skills, as a
+    portal's address. Anything else, or a name the host keeps, is a
+    :class:`RevisionError` — the core stores the params without reading them.
+    """
+    params = revision.executor_params
+    unknown = sorted(set(params) - {"env"})
+    if unknown:
+        raise RevisionError(f"executor skills takes only params.env, got {unknown}")
+    try:
+        return parse_skill_env(params.get("env"), where="executor.params.env")
+    except ValueError as exc:
+        raise RevisionError(str(exc)) from exc
+
+
 def skills_environ(revision: AgentRevision, environ: Mapping[str, str]) -> dict[str, str] | None:
     """``CONTROL_PLANE_SKILLS_*`` as the revision sets them; None without ``skills``.
 
@@ -274,13 +294,18 @@ def skills_environ(revision: AgentRevision, environ: Mapping[str, str]) -> dict[
     skills = revision.section("skills")
     if not skills:
         return None
-    values = {k: v for k, v in environ.items() if k not in {*_SKILL_ENV.values(), ENV_CONCURRENCY}}
+    owned = {*_SKILL_ENV.values(), ENV_CONCURRENCY, ENV_LOCAL_ENV}
+    values = {k: v for k, v in environ.items() if k not in owned}
     for name, variable in _SKILL_ENV.items():
         items = skills.get(name) or []
         if items:
             values[variable] = ",".join(str(item) for item in items)
     if "concurrency" in skills:
         values[ENV_CONCURRENCY] = str(int(skills["concurrency"]))
+    if revision.executor_kind == "skills":
+        settings = skills_params(revision)
+        if settings:
+            values[ENV_LOCAL_ENV] = json.dumps(settings, sort_keys=True)
     return values
 
 
@@ -551,5 +576,6 @@ __all__ = [
     "settings_of",
     "skills_environ",
     "skills_of",
+    "skills_params",
     "workspace_pool_of",
 ]

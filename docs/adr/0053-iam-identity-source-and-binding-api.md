@@ -163,7 +163,7 @@ Upsert той же identity на тот же principal не меняется: у
 владельца. `iam_binding.updated` при переносе получает `previousPrincipalId`
 (необязательное поле схемы, версия события прежняя).
 
-Ещё два правила TASK-001120 (CP-ADR-0073, амендмент 2026-09-30, Е2 п.5а и Е4):
+Ещё два правила TASK-001120 (CP-ADR-0073, амендмент 2026-09-30, И2 п.5а и И4):
 
 - `issuer` должен совпадать с `CP_IAM_ISSUER` — иначе `422
   iam_issuer_untrusted` с `details {issuer, expected}`: связка issuer'а, чьи

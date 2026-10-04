@@ -13,9 +13,15 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
+    ValidatorFunctionWrapHandler,
+    WithJsonSchema,
+    field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic.alias_generators import to_camel
+from pydantic.json_schema import SkipJsonSchema
 
 from control_plane.domain.work_item import MAX_COMMENT_BODY_LENGTH
 from control_plane.infrastructure.db.models import Base
@@ -54,8 +60,18 @@ class BootstrapRequest(ApiModel):
     iam_binding: IamIdentitySpec | None = None
 
 
+BindingVisibility = Literal["tenant", "members"]
+
+
 class IamBindingUpsertRequest(IamIdentitySpec):
     permissions: list[str] = Field(min_length=1)
+    # Absent — unchanged (``tenant`` for a new binding). Taken as is and
+    # checked by the command after principals.write: a wrong value is a
+    # ``422 validation_error`` with a JSON Pointer, not the generic
+    # ``400 invalid_request`` (CP-ADR-0082 §2.2).
+    visibility: Annotated[
+        Any, WithJsonSchema({"type": "string", "enum": ["tenant", "members"]})
+    ] = None
 
 
 class PrincipalCreateRequest(ApiModel):
@@ -579,6 +595,31 @@ class KnowledgeDocumentRequest(ApiModel):
 # Memory's entity list bounds (``context/entities``: MAX_KINDS, MAX_LIMIT, KIND_RE).
 KNOWLEDGE_ENTITY_KIND = r"^[A-Za-z][A-Za-z0-9_]{0,62}$"
 KNOWLEDGE_ENTITIES_MAX_LIMIT = 500
+# Relations of an entity (amendment 2026-10-03): a relation name as Memory's
+# packs declare it (``RelationSpecIn``), at most a step limit of its typed
+# traversal per entity, and a smaller page: each entity is one traversal.
+KNOWLEDGE_RELATION_NAME = r"^[a-z][a-z0-9_]{0,62}$"
+KNOWLEDGE_RELATIONS_MAX_NAMES = 20
+KNOWLEDGE_RELATIONS_MAX_LIMIT = 200
+KNOWLEDGE_RELATIONS_MAX_PAGE = 100
+
+
+class KnowledgeEntitiesInclude(ApiModel):
+    """What to add to every entity of the page (CP-ADR-0060, amendment 2026-10-03).
+
+    ``relations`` -- the relation names, or ``"*"`` for every relation the
+    namespace's packs declare; ``direction`` -- the entity as the subject
+    (``out``), the object (``in``) or either; ``limit`` -- relations per entity."""
+
+    relations: (
+        Literal["*"]
+        | Annotated[
+            list[Annotated[str, Field(pattern=KNOWLEDGE_RELATION_NAME)]],
+            Field(min_length=1, max_length=KNOWLEDGE_RELATIONS_MAX_NAMES),
+        ]
+    )
+    direction: Literal["out", "in", "both"] = "both"
+    limit: int = Field(default=20, ge=1, le=KNOWLEDGE_RELATIONS_MAX_LIMIT)
 
 
 class KnowledgeEntitiesQueryRequest(ApiModel):
@@ -598,19 +639,86 @@ class KnowledgeEntitiesQueryRequest(ApiModel):
     as_of: AwareDatetime | None = None
     limit: int = Field(default=100, ge=1, le=KNOWLEDGE_ENTITIES_MAX_LIMIT)
     cursor: str | None = Field(default=None, min_length=1, max_length=4096)
+    include: KnowledgeEntitiesInclude | None = None
+
+    @model_validator(mode="after")
+    def _include_page(self) -> "KnowledgeEntitiesQueryRequest":
+        if self.include is not None and self.limit > KNOWLEDGE_RELATIONS_MAX_PAGE:
+            raise ValueError(
+                f"limit is at most {KNOWLEDGE_RELATIONS_MAX_PAGE} when include is given"
+            )
+        return self
+
+
+def _transitional(description: str) -> Any:
+    return Field(
+        default=None,
+        deprecated=True,
+        description=f"{description} Transitional (CP-ADR-0060, amendment 2026-10-03): "
+        "removed only by a later amendment.",
+    )
+
+
+class KnowledgeEntitySourceOut(BaseModel):
+    """A source the entity's version was merged from, the senior first."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    source: str
+    citation: str = Field(
+        default="", alias="sourcePath", description="Path or link to the source's version."
+    )
+    snapshot: str | None = Field(default=None, alias="snapshotId")
+    source_path: str | None = _transitional("sourcePath.")
+    snapshot_id: str | None = _transitional("snapshotId.")
+    scope: str | None = _transitional("The visibility scope of the source.")
+
+
+class KnowledgeEntityRelationOut(BaseModel):
+    """A relation of the entity and its other end (``include.relations``)."""
+
+    relation: str
+    direction: Literal["out", "in"] = Field(
+        description="out: the entity is the subject; in: the object."
+    )
+    kind: str
+    key: str
+    title: str = ""
 
 
 class KnowledgeEntityOut(BaseModel):
-    """An entity of the list: the version valid at ``asOf``, as Memory gives it
-    (``EntityItem``: kind, key, namespace, title, attributes, source, scope,
-    snapshot_id, source_path, valid_from, valid_to)."""
+    """An entity of the list: the version valid at ``asOf``, merged from its
+    sources (CP-ADR-0060, amendment 2026-10-03). ``validFrom``, ``validTo``
+    and ``sources`` are the contract; the snake_case fields are Memory's
+    ``EntityItem`` as it was passed before, kept for the transition."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(populate_by_name=True)
 
     kind: str
     key: str
     title: str = ""
     attributes: dict[str, Any] = Field(default_factory=dict)
+    valid_from_at: str | None = Field(
+        default=None, alias="validFrom", description="Start of the version valid at asOf."
+    )
+    valid_to_at: str | None = Field(
+        default=None, alias="validTo", description="End of that version; null -- open."
+    )
+    sources: list[KnowledgeEntitySourceOut] = Field(
+        default_factory=list,
+        description="Every source the entity is merged from, the senior first. Each also "
+        "carries the transitional scope, snapshot_id and source_path.",
+    )
+    relations: list[KnowledgeEntityRelationOut] | None = Field(
+        default=None, description="Only when the request has include.relations."
+    )
+    source: str | None = _transitional("The senior source: sources[0].source.")
+    source_path: str | None = _transitional("The senior citation: sources[0].sourcePath.")
+    snapshot_id: str | None = _transitional("The senior snapshot: sources[0].snapshotId.")
+    valid_from: str | None = _transitional("validFrom.")
+    valid_to: str | None = _transitional("validTo.")
+    namespace: str | None = _transitional("Memory's namespace of the workspace tree root.")
+    scope: str | None = _transitional("The visibility scope of the senior source.")
 
 
 class KnowledgeEntitiesPageOut(BaseModel):
@@ -698,6 +806,98 @@ class TenantOut(ApiModel):
     updated_at: datetime
 
 
+def _is_none(value: object) -> bool:
+    return value is None
+
+
+def _absent_not_null(schema: dict[str, Any]) -> None:
+    """Drop ``default: null``: an optional field here is absent, ``null`` is refused."""
+    for prop in schema.get("properties", {}).values():
+        if prop.get("default", ...) is None:
+            del prop["default"]
+
+
+class PrincipalProfile(ApiModel):
+    """Display details of a principal in the organization (CP-ADR-0082 §1.2).
+
+    Every field is optional; an absent one is left out of the answer, not
+    sent as ``null``. ``PATCH /principals/{id}`` checks a profile it receives
+    against ``domain/principal_profile.PROFILE_SCHEMA``, the same shape.
+    """
+
+    model_config = ConfigDict(json_schema_extra=_absent_not_null)
+
+    job_title: str | SkipJsonSchema[None] = Field(
+        default=None, min_length=1, max_length=200, exclude_if=_is_none
+    )
+    email: str | SkipJsonSchema[None] = Field(
+        default=None, max_length=254, json_schema_extra={"format": "email"}, exclude_if=_is_none
+    )
+    phone: str | SkipJsonSchema[None] = Field(
+        default=None, min_length=1, max_length=50, exclude_if=_is_none
+    )
+    note: str | SkipJsonSchema[None] = Field(
+        default=None, min_length=1, max_length=2000, exclude_if=_is_none
+    )
+
+
+class PrincipalUpdateRequest(ApiModel):
+    """Body of ``PATCH /principals/{id}``; ``profile`` replaces the whole profile.
+
+    Documentation of the route only: the route checks the body itself, in the
+    order of CP-ADR-0082 §1.4 (``domain/principal_profile``).
+    """
+
+    model_config = ConfigDict(json_schema_extra=_absent_not_null)
+
+    display_name: str | SkipJsonSchema[None] = Field(default=None, min_length=1, max_length=200)
+    profile: PrincipalProfile | SkipJsonSchema[None] = None
+
+
+class FieldError(ApiModel):
+    """One field error; never the value of the field (CP-ADR-0082 §1.4, CP-ADR-0081 §4.3)."""
+
+    model_config = ConfigDict(json_schema_extra=_absent_not_null)
+
+    path: str = Field(
+        description=(
+            "JSON Pointer into the request body; query.<name> or path.<name> for a "
+            "request parameter with nul_character (CP-ADR-0083)"
+        ),
+        examples=["/profile/email"],
+    )
+    code: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description="JSON Schema keyword, or nul_character (CP-ADR-0083)",
+        examples=["format"],
+    )
+    message: str | SkipJsonSchema[None] = Field(
+        default=None, description="Explanation without the value"
+    )
+    field: str | SkipJsonSchema[None] = Field(
+        default=None, description="secret_material_rejected only, in addition to path"
+    )
+    match: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description="secret_material_rejected only: kind of material, never the material",
+    )
+
+
+class FieldErrorDetails(ApiModel):
+    errors: list[FieldError] = Field(min_length=1)
+
+
+class FieldErrorBody(ApiModel):
+    code: Literal["validation_error", "secret_material_rejected", "visibility_requires_human"]
+    message: str
+    details: FieldErrorDetails
+    request_id: str
+
+
+class FieldErrorResponse(ApiModel):
+    error: FieldErrorBody
+
+
 class PrincipalOut(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -705,6 +905,8 @@ class PrincipalOut(ApiModel):
     display_name: str
     status: str
     metadata_json: dict[str, Any] = Field(serialization_alias="metadata")
+    profile: PrincipalProfile
+    version: int = Field(ge=1)
     created_at: datetime
     updated_at: datetime
 
@@ -754,6 +956,7 @@ class IamBindingOut(ApiModel):
     iam_principal_id: uuid.UUID
     permissions: list[str]
     status: str
+    visibility: BindingVisibility
     revoked_at: datetime | None
     last_used_at: datetime | None
     created_at: datetime
@@ -949,6 +1152,38 @@ class EventPageOut(ApiModel):
     has_more: bool
 
 
+class EventTypeVersionOut(ApiModel):
+    changes: str | None = Field(
+        default=None, description="What the version added to the previous one; absent for v1"
+    )
+    payload_schema: dict[str, Any] = Field(
+        alias="schema", description="JSON Schema 2020-12 of the payload of this version"
+    )
+
+
+class EventTypeOut(ApiModel):
+    """A type of the core's event journal as ``docs/events/catalog.json`` declares it,
+    plus what a console groups and labels it by (CP-ADR-0068, amendment of 2026-10-04)."""
+
+    type: str
+    group: str = Field(description="The prefix of the type before its first dot: a types= filter")
+    entity_type: str
+    description: str = Field(description="The caption of the type in the language of `locale`")
+    label_key: str = Field(
+        description="event.<type>: the key of the console's dictionary for its own caption"
+    )
+    current_version: int = Field(description="The version a new event of the type is written with")
+    supported_versions: list[int] = Field(
+        description="Every version the journal may hold, ascending; a consumer reads them all"
+    )
+    versions: dict[str, EventTypeVersionOut] = Field(description="By the version as a string")
+
+
+class EventTypeListOut(ApiModel):
+    locale: str = Field(description="The language of the captions: the one asked or en")
+    items: list[EventTypeOut] = Field(description="Every type of the catalog, by name; no pages")
+
+
 class ErrorDetail(ApiModel):
     code: str
     message: str
@@ -998,6 +1233,24 @@ class WorkspaceUpdateRequest(ApiModel):
     type_id: uuid.UUID | None = None
     type_key: str | None = Field(default=None, min_length=1, max_length=63)
     custom_fields: dict[str, Any] | None = None
+    # CP-ADR-0008 amendment 2026-10-03 (A1): keys of the task types allowed
+    # here. Explicit null inherits from the ancestors, [] allows none.
+    task_types: (
+        list[Annotated[str, Field(min_length=1, max_length=63, pattern=r"^[a-z0-9][a-z0-9_-]*$")]]
+        | None
+    ) = Field(
+        default=None,
+        max_length=100,
+        description="Keys of the task types allowed in this workspace; null inherits "
+        "from the nearest ancestor that sets them (every type when none does), [] allows none",
+    )
+
+    @field_validator("task_types")
+    @classmethod
+    def _task_types_unique(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("items must be unique")
+        return value
 
 
 class WorkspaceMoveRequest(ApiModel):
@@ -1313,10 +1566,25 @@ class WorkspaceOut(ApiModel):
     name: str
     description: str
     custom_fields: dict[str, Any]
+    task_types: list[str] | None = Field(
+        default=None,
+        description="Own setting: keys of the task types allowed here; null inherits "
+        "(CP-ADR-0008, amendment 2026-10-03 A1)",
+    )
     status: str
     version: int
     created_at: datetime
     updated_at: datetime
+
+
+class WorkspaceDetailOut(WorkspaceOut):
+    """One workspace with what its position in the tree makes of its settings."""
+
+    effective_task_types: list[str] | None = Field(
+        default=None,
+        description="Task types allowed here after inheritance: the own taskTypes or "
+        "those of the nearest ancestor that sets them; null allows every type",
+    )
 
 
 class WorkspaceMemberOut(ApiModel):
@@ -1369,6 +1637,15 @@ class PackageLinkOut(ApiModel):
         " the installer named in POST /packages:record"
     )
     installed_at: datetime
+
+
+class PackageSettingsValuesOut(ApiModel):
+    """The effective settings of the package of an agent or a skill (CP-ADR-0081 §8)."""
+
+    package: str = Field(description="The key of the package")
+    version: int = Field(description="The version of the values; 0 — nothing saved yet")
+    schema_revision: int = Field(description="The active schema revision they were read by")
+    values: dict[str, Any] = Field(description="The saved values over the defaults")
 
 
 PACKAGE_FILTER_DESCRIPTION = (
@@ -1706,6 +1983,12 @@ class ApprovalOutcomeOut(ApiModel):
 _TYPE_KEY_FIELD = Field(min_length=1, max_length=63, pattern=r"^[a-z0-9][a-z0-9_-]*$")
 
 
+def _unique_items(items: list[str]) -> list[str]:
+    if len(set(items)) != len(items):
+        raise ValueError("items must be unique")
+    return items
+
+
 class WorkspaceTypeCreateRequest(ApiModel):
     key: str = _TYPE_KEY_FIELD
     display_name: str = Field(min_length=1, max_length=200)
@@ -1798,6 +2081,13 @@ class TaskTypeCreateRequest(ApiModel):
     # CP-ADR-0067 amendment 2026-09-27 (B5): checks every task of this version
     # passes, after the required outputs and before the task's own acceptance.
     acceptance: list[AcceptanceCheckSpec] = Field(default_factory=list, max_length=50)
+    # CP-ADR-0048 amendment 2026-10-03 (A1): slugs of the roles a person needs
+    # to take work of this version; empty does not restrict people.
+    executor_roles: Annotated[
+        list[Annotated[str, _SLUG_FIELD]],
+        Field(max_length=20),
+        AfterValidator(_unique_items),
+    ] = Field(default_factory=list)
 
 
 class TaskTypeMigratedTaskOut(ApiModel):
@@ -1845,11 +2135,33 @@ class TaskTypeOut(ApiModel):
     completion_schema: dict[str, Any] = Field(default_factory=dict)
     artifact_schema: dict[str, Any] = Field(default_factory=dict)
     acceptance: list[dict[str, Any]] = Field(default_factory=list)
+    executor_roles: list[str] = Field(default_factory=list)
     status: str
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
     package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
+
+
+class TaskTypeExecutorOut(ApiModel):
+    """Who may take a task type in a workspace (CP-ADR-0048 amendment 2026-10-03, A2)."""
+
+    principal_id: uuid.UUID
+    kind: str = Field(description="human, agent or service")
+    display_name: str
+    roles: list[str] = Field(
+        description="role: the executor roles of the type the person holds here; any: the "
+        "person's roles from participants; agents and services: empty"
+    )
+    reason: Literal["role", "any", "agent_task_types", "agent_any"] = Field(
+        description="role: holds an executor role of the type; any: the type has no executor "
+        "roles; agent_task_types: spec.work.taskTypes names the type; agent_any: the agent "
+        "takes every type"
+    )
+
+
+class TaskTypeExecutorsOut(ApiModel):
+    items: list[TaskTypeExecutorOut]
 
 
 class ArtifactTypeCreateRequest(ApiModel):
@@ -1884,6 +2196,298 @@ class ArtifactTypeOut(ApiModel):
     created_at: datetime
     updated_at: datetime
     package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
+
+
+# --- connection types (CP-ADR-0079 §2) -----------------------------------------------------
+
+_CONNECTION_KEY_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
+
+
+class ConnectionTypeOAuth2(ApiModel):
+    authorize_url: str = Field(
+        max_length=2000, pattern=r"^https://", json_schema_extra={"format": "uri"}
+    )
+    token_url_template: str = Field(
+        max_length=2000,
+        pattern=r"^https://",
+        description="The only placeholder is {account}; the host is an external DNS name"
+        " (two or more labels, the last one not numeric, no port, no userinfo)",
+    )
+    account_param: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+        description="The callback parameter that names the account;"
+        " required when tokenUrlTemplate names {account}",
+    )
+    auth_style: Literal["in_params", "in_header"] = Field(
+        description="How the client id and secret go to the exchange address"
+        " (provider_options.auth_style of the plugin)"
+    )
+    scopes: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(max_length=50)
+
+
+class ConnectionTypeAccountField(ApiModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    pattern: str = Field(
+        min_length=1,
+        max_length=500,
+        description="A regular expression the whole account matches",
+    )
+
+
+class ConnectionTypeSpec(ApiModel):
+    """``spec`` of the catalog kind ``ConnectionType``; ``null`` in a response — not set."""
+
+    display_name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    auth: list[Literal["oauth2", "token"]] = Field(
+        min_length=1, json_schema_extra={"uniqueItems": True}
+    )
+    oauth2: ConnectionTypeOAuth2 | None = Field(
+        default=None, description="Required when auth names oauth2"
+    )
+    account_field: ConnectionTypeAccountField | None = Field(
+        default=None,
+        description="Required when auth names token or tokenUrlTemplate names {account}",
+    )
+    settings_schema: dict[str, Any] = Field(
+        description="JSON Schema (draft 2020-12, at most 64 KiB, root type: object) of the"
+        " connection's non-secret settings"
+    )
+    default_key: str = Field(pattern=_CONNECTION_KEY_PATTERN)
+
+
+class ConnectionTypePublishRequest(ApiModel):
+    key: str = Field(pattern=_CONNECTION_KEY_PATTERN)
+    version: int = Field(ge=1, le=999_999_999)
+    # Checked by the core, not by the request's shape: a violation of the table
+    # of CP-ADR-0079 §2 is 422 invalid_connection_type with details.field, an
+    # unknown field 400 invalid_request.
+    spec: Annotated[
+        dict[str, Any],
+        WithJsonSchema({"allOf": [{"$ref": "#/components/schemas/ConnectionTypeSpec"}]}),
+    ]
+
+
+class ConnectionTypeUpdateRequest(ApiModel):
+    status: Literal["active", "deprecated", "disabled"]
+
+
+class ConnectionTypeOut(ApiModel):
+    id: uuid.UUID
+    key: str
+    version: int
+    status: Literal["active", "deprecated", "disabled"]
+    spec: ConnectionTypeSpec
+    spec_hash: str = Field(description="sha256 of the canonical JSON of spec")
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
+    created_by: uuid.UUID
+    created_at: datetime
+    row_version: int = Field(description='ETag "connection-type-<rowVersion>"')
+
+
+# --- connections (CP-ADR-0079 §3) ------------------------------------------------------------
+
+ConnectionStatusValue = Literal["pending", "active", "expired", "revoked"]
+_REASON_CODE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+
+
+class ConnectionCreateRequest(ApiModel):
+    key: str | None = Field(
+        default=None,
+        pattern=_CONNECTION_KEY_PATTERN,
+        description="Default: defaultKey of the latest active version of the type",
+    )
+    type: str = Field(min_length=1, max_length=63)
+    display_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Default: displayName of the type",
+    )
+    settings: dict[str, Any] | None = Field(
+        default=None, description="By settingsSchema of the type version; default {}"
+    )
+
+
+class ConnectionUpdateRequest(ApiModel):
+    """At least one field; a field sent is a value, never ``null``."""
+
+    model_config = ConfigDict(json_schema_extra={"minProperties": 1})
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+    settings: dict[str, Any] | None = Field(
+        default=None,
+        description="Replaced whole; checked by the schema of the type version after the edit",
+    )
+    type_version: int | None = Field(
+        default=None,
+        ge=1,
+        le=999_999_999,
+        description="A published version of the same type that is not disabled",
+    )
+
+    @model_validator(mode="after")
+    def _one_field_and_no_nulls(self) -> "ConnectionUpdateRequest":
+        if not self.model_fields_set:
+            raise ValueError("at least one of displayName, settings, typeVersion is required")
+        nulls = sorted(name for name in self.model_fields_set if getattr(self, name) is None)
+        if nulls:
+            raise ValueError(f"fields must not be null: {', '.join(to_camel(n) for n in nulls)}")
+        return self
+
+    def changes(self) -> dict[str, Any]:
+        """The fields sent, by their API names."""
+        return self.model_dump(by_alias=True, exclude_unset=True)
+
+
+class ConnectionStatusReport(ApiModel):
+    """``PUT /connections/{key}/status``: the connector's report as of ``checkedAt``."""
+
+    status: Literal["active", "expired"]
+    reason: str | None = Field(
+        default=None,
+        pattern=_REASON_CODE_PATTERN,
+        description="A code; required when an active connection expired",
+    )
+    message: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Stored without anything shaped like credentials",
+    )
+    checked_at: AwareDatetime
+
+
+class ConnectionOut(ApiModel):
+    id: uuid.UUID
+    key: str
+    type: str
+    type_version: int
+    display_name: str
+    account: str | None
+    auth: Literal["oauth2", "token"] | None
+    status: ConnectionStatusValue
+    status_reason: str | None
+    status_message: str | None
+    settings: dict[str, Any]
+    secret_ref: str | None = Field(description="The path of the material in the secret store")
+    expires_at: datetime | None
+    connected_by: uuid.UUID | None
+    connected_at: datetime | None
+    last_checked_at: datetime | None
+    agents: list[str] | None = Field(
+        default=None,
+        description="Only in GET /connections/{key}: keys of the agents whose current"
+        " revision names the connection",
+    )
+    created_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+    version: int = Field(description='ETag "connection-<version>"')
+
+
+# --- access to connections (CP-ADR-0079 §5, §6, §7) --------------------------------------------
+
+
+class OAuthAppSetRequest(ApiModel):
+    client_id: str = Field(min_length=1, max_length=500)
+    client_secret: str = Field(
+        min_length=1,
+        max_length=4096,
+        json_schema_extra={"writeOnly": True},
+        description="Goes to the secret store in transit; never stored or answered by the core",
+    )
+
+
+class OAuthAppOut(ApiModel):
+    type: str
+    configured: bool
+    client_id: str | None
+    updated_at: datetime | None
+
+
+class ConnectionAuthorizeRequest(ApiModel):
+    """``{}``: the connection and the caller say everything."""
+
+
+class ConnectionAuthorizeOut(ApiModel):
+    authorize_url: str | None = Field(
+        description="Where to send the person for consent; null only in the replay of an"
+        " Idempotency-Key — the state is kept hashed and is not issued twice"
+    )
+    expires_at: datetime
+
+
+class ConnectionTokenRequest(ApiModel):
+    account: str = Field(
+        min_length=1,
+        max_length=253,
+        description="The account in the external system; matches accountField.pattern",
+    )
+    token: str = Field(
+        min_length=1,
+        max_length=8192,
+        json_schema_extra={"writeOnly": True},
+        description="Goes to the secret store in transit; never stored or answered by the core",
+    )
+    expires_at: AwareDatetime | None = Field(
+        default=None, description="When the key expires; in the future"
+    )
+
+
+class ConnectionRevokeRequest(ApiModel):
+    """``POST /connections/{key}:revoke``: an optional reason, kept as the status message."""
+
+    reason: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Why the connection is revoked; stored without anything shaped like"
+        " credentials",
+    )
+
+
+class AgentConnectionOut(ApiModel):
+    """What an agent learns of a connection its current revision names (CP-ADR-0079 §8)."""
+
+    key: str
+    type: str
+    type_version: int
+    account: str | None
+    auth: Literal["oauth2", "token"] | None
+    status: ConnectionStatusValue
+    settings: dict[str, Any]
+    secret_ref: str | None = Field(
+        description="The path to read in the secret store with the agent's own token; not a value"
+    )
+    expires_at: datetime | None
+
+
+class AgentConnectionListOut(ApiModel):
+    items: list[AgentConnectionOut]
+
+
+class AgentSecretSetRequest(ApiModel):
+    """``PUT /agents/{key}/secrets/{name}``: the value, in transit to the secret store."""
+
+    value: str = Field(
+        min_length=1,
+        max_length=65_536,
+        json_schema_extra={"writeOnly": True},
+        description="Goes to the secret store in transit; never stored or answered by the core",
+    )
+
+
+class AgentSecretOut(ApiModel):
+    """One secret of an agent: the name and who set it last — never the value (§11)."""
+
+    name: str
+    updated_at: datetime
+    updated_by: uuid.UUID
+
+
+class AgentSecretListOut(ApiModel):
+    items: list[AgentSecretOut]
 
 
 class ProjectCreateRequest(ApiModel):
@@ -2025,6 +2629,13 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorEnvelope, "description": "Not found"},
     409: {"model": ErrorEnvelope, "description": "Concurrency conflict"},
     422: {"model": ErrorEnvelope, "description": "Domain validation failed"},
+}
+
+# Routes that reach the secret store (CP-ADR-0079 §1): not configured, not
+# reachable or sealed is 503 secret_store_unavailable, and nothing changed.
+SECRET_STORE_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **ERROR_RESPONSES,
+    503: {"model": ErrorEnvelope, "description": "Secret store unavailable; nothing changed"},
 }
 
 
@@ -2170,6 +2781,8 @@ _AGENT_NODE_LABEL = Annotated[
     str, Field(max_length=100, pattern=r"^[a-z0-9][a-z0-9.-]*(=[a-zA-Z0-9._-]+)?$")
 ]
 _AGENT_SECRET_NAME = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+_AGENT_CONNECTION_KEY = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+AGENT_MAX_CONNECTIONS = 20
 # Id of the tenant's object, or ${VARIABLE} of the installation.
 _AGENT_TOPOLOGY = Annotated[str, Field(min_length=1, max_length=200)]
 _AGENT_ITEMS = 200
@@ -2182,15 +2795,19 @@ AgentPhaseValue = Literal[
 ]
 
 
-def _unique_items(items: list[str]) -> list[str]:
-    if len(set(items)) != len(items):
-        raise ValueError("items must be unique")
-    return items
-
-
-# An IAM scope: ``<audience>:<action>``, as ``control-plane:read`` or ``memory:write``.
+# An IAM scope: ``<audience>:<action>``, as ``control-plane:read`` or
+# ``iam:identities.link``. Names are separated by ``:``, segments of a name by
+# ``.``; a segment is lowercase letters, digits, ``_`` and ``-``, and starts
+# with a letter or a digit (IAM audience keys may start with a digit).
 _AGENT_IAM_SCOPE = Annotated[
-    str, Field(max_length=200, pattern=r"^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$")
+    str,
+    Field(
+        max_length=200,
+        pattern=(
+            r"^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)*"
+            r"(:[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)*)+$"
+        ),
+    ),
 ]
 
 
@@ -2243,7 +2860,7 @@ class AgentWorkSpec(ApiModel):
 # An OCI image reference with a tag or a digest (the ``distribution/reference``
 # grammar with the implicit ``latest`` taken away): ``[registry[:port]/]path``
 # then ``:tag``, ``@sha256:<hex>`` or both. ``@`` only precedes ``sha256:``, so
-# a reference cannot carry credentials (ADR-0073 E1).
+# a reference cannot carry credentials (CP-ADR-0073, Z1).
 _OCI_HOST_PART = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"
 _OCI_REGISTRY = rf"{_OCI_HOST_PART}(?:\.{_OCI_HOST_PART})*"
 _OCI_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
@@ -2278,6 +2895,26 @@ class AgentExecutorSpec(ApiModel):
     )
 
 
+def _whole_number(value: Any) -> Any:
+    """An integer as the catalog schema has it: ``2`` and ``2.0``, not ``0.5``, ``"2"`` or ``true``.
+
+    The revision hash takes no floats (``domain/canonical.py``): a fraction is
+    refused here, with the path of its field, instead of as ``non_canonical_value``
+    of the whole spec (CP-ADR-0073, amendment 2026-10-03).
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("must be a whole number")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("must be a whole number: a fraction such as 0.5 is not accepted")
+        return int(value)
+    return value
+
+
+# A number of the spec: every one is hashed with the revision, so none is a float.
+_AgentWholeNumber = Annotated[int, BeforeValidator(_whole_number)]
+
+
 # A pinned skill version the agent invokes: ``name@version``.
 _AGENT_SKILL_REF = Annotated[str, Field(max_length=251, pattern=r"^[^@\s/]{1,200}@[^@\s/]{1,50}$")]
 
@@ -2302,7 +2939,7 @@ class AgentSkillsSpec(ApiModel):
         max_length=_AGENT_ITEMS,
         description="IAM audiences the skills get a token for",
     )
-    concurrency: int | None = Field(default=None, ge=1, le=32)
+    concurrency: _AgentWholeNumber | None = Field(default=None, ge=1, le=32)
     invoke: Annotated[
         list[_AGENT_SKILL_REF],
         Field(max_length=_AGENT_ITEMS),
@@ -2317,8 +2954,10 @@ class AgentSkillsSpec(ApiModel):
 
 
 class AgentResourcesSpec(ApiModel):
-    cpus: int | float | None = Field(default=None, gt=0, le=64)
-    memory_mb: int | None = Field(default=None, ge=64, le=262_144)
+    cpus: _AgentWholeNumber | None = Field(
+        default=None, ge=1, le=64, description="Whole CPUs; a fraction is refused"
+    )
+    memory_mb: _AgentWholeNumber | None = Field(default=None, ge=64, le=262_144)
 
 
 class AgentPlacementSpec(ApiModel):
@@ -2335,10 +2974,10 @@ class AgentPlacementSpec(ApiModel):
         description="Names of node secrets; a value never reaches the core (FR-008)",
     )
     resources: AgentResourcesSpec | None = None
-    replicas: int = Field(
+    replicas: _AgentWholeNumber = Field(
         default=1, ge=0, le=AGENT_MAX_REPLICAS, description="Desired state, not revision"
     )
-    drain_seconds: int = Field(default=14_400, ge=0, le=14_400)
+    drain_seconds: _AgentWholeNumber = Field(default=14_400, ge=0, le=14_400)
 
 
 class AgentSpec(ApiModel):
@@ -2357,10 +2996,35 @@ class AgentSpec(ApiModel):
         "checked by the schema of the executor kind, not by the core (TAI-ADR-0063)",
     )
     skills: AgentSkillsSpec | None = None
+    connections: Annotated[
+        list[_AGENT_CONNECTION_KEY],
+        Field(max_length=AGENT_MAX_CONNECTIONS),
+        AfterValidator(_unique_items),
+    ] = Field(
+        default_factory=list,
+        description=(
+            "Keys of the tenant's connections whose material the agent may read"
+            " (CP-ADR-0079 §8); a non-empty list needs connections.manage of whoever applies it"
+        ),
+    )
     placement: AgentPlacementSpec | Literal["none"] | None = Field(
         default=None, description="Absent means placed with the defaults; none means no process"
     )
     state: AgentStateValue = Field(default="running", description="Desired state, not revision")
+
+    @field_validator("placement", mode="wrap")
+    @classmethod
+    def _placement_errors_name_the_field(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> Any:
+        """An object is a placement, not ``none``: its errors carry the path of the field alone.
+
+        Left to the union, ``placement.resources.cpus`` would come back as
+        ``placement.AgentPlacementSpec.resources.cpus`` next to ``Input should be 'none'``.
+        """
+        if isinstance(value, dict):
+            return handler(AgentPlacementSpec.model_validate(value))
+        return handler(value)
 
     @model_validator(mode="after")
     def _placed_agent_executes(self) -> "AgentSpec":
@@ -2469,6 +3133,15 @@ class AgentOut(ApiModel):
     created_at: datetime
     updated_at: datetime
     package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
+
+
+class AgentMeOut(AgentOut):
+    """``GET /agents/me``: the caller's agent and the settings of its package."""
+
+    package_settings: PackageSettingsValuesOut | None = Field(
+        description="The effective settings of the package that installed the agent;"
+        " null for an agent created by hand or a package without settings (CP-ADR-0081 §8)"
+    )
 
 
 class AgentValidationOut(ApiModel):
@@ -2963,6 +3636,384 @@ class CalendarOut(ApiModel):
     package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
 
 
+ViewFormat = Literal[
+    "text",
+    "number",
+    "money",
+    "percent",
+    "date",
+    "datetime",
+    "due",
+    "duration",
+    "principal",
+    "status",
+    "link",
+]
+_VIEW_KEY_DESCRIPTION = "Stable key: the values of the field come by it in the data of the view"
+
+
+class ViewNavOut(ApiModel):
+    group: Literal["work", "knowledge", "packages"] = Field(
+        description="Group of the console menu (a closed list); a view that names none: packages"
+    )
+    icon: str | None = None
+    order: int | None = None
+
+
+class ViewSourceOut(ApiModel):
+    kind: Literal["process", "tasks", "knowledge"]
+    process: str | None = Field(default=None, description="Key of the process of a process source")
+    instance: bool = Field(description="The view shows one instance (a card), opened by its id")
+
+
+class ViewColumnOut(ApiModel):
+    key: str = Field(description=_VIEW_KEY_DESCRIPTION)
+    title: str
+    format: ViewFormat | None = None
+
+
+class ViewCardFieldOut(ApiModel):
+    key: str = Field(description=_VIEW_KEY_DESCRIPTION)
+    format: ViewFormat | None = None
+
+
+class ViewFieldOut(ApiModel):
+    key: str = Field(description=_VIEW_KEY_DESCRIPTION)
+    label: str
+    format: ViewFormat | None = None
+
+
+class ViewFilterOptionOut(ApiModel):
+    value: str | int | float | bool
+    title: str
+
+
+class ViewFilterOut(ApiModel):
+    field: str = Field(description="The key a filter of the data of the view names")
+    title: str
+    type: Literal["text", "enum", "number", "date"] = Field(
+        description="Read by the core from the data schema of the source"
+    )
+    options: list[ViewFilterOptionOut] | None = Field(
+        default=None, description="The values of an enum"
+    )
+
+
+class ViewSortOut(ApiModel):
+    field: str
+    title: str
+
+
+class ViewOpenOut(ApiModel):
+    view: str = Field(description="The view a record opens; its id is the id of the row")
+
+
+class ViewMetricsBlockOut(ApiModel):
+    block: Literal["metrics"]
+    title: str | None = None
+    items: list[ViewColumnOut]
+
+
+class ViewTableBlockOut(ApiModel):
+    block: Literal["table", "list"]
+    title: str | None = None
+    columns: list[ViewColumnOut]
+    filters: list[ViewFilterOut] | None = None
+    sort: list[ViewSortOut] | None = None
+    open: ViewOpenOut | None = None
+
+
+class ViewCardOut(ApiModel):
+    fields: list[ViewCardFieldOut]
+
+
+class ViewBoardBlockOut(ApiModel):
+    block: Literal["board"] = Field(description="A column per stage of the process")
+    title: str | None = None
+    card: ViewCardOut
+    filters: list[ViewFilterOut] | None = None
+    open: ViewOpenOut | None = None
+
+
+class ViewChartBlockOut(ApiModel):
+    block: Literal["chart"]
+    type: Literal["bar", "line", "donut"]
+    title: str | None = None
+    format: ViewFormat | None = None
+
+
+class ViewFieldsBlockOut(ApiModel):
+    block: Literal["fields"]
+    title: str | None = None
+    section: str | None = None
+    items: list[ViewFieldOut]
+
+
+class ViewHeaderBlockOut(ApiModel):
+    block: Literal["header"] = Field(description="Title, status and lead come in its data")
+    actions: Any | None = Field(default=None, description="As the package writes it")
+
+
+class ViewRecordBlockOut(ApiModel):
+    block: Literal["steps", "timeline", "artifacts"]
+    title: str | None = None
+
+
+class ViewRelatedBlockOut(ApiModel):
+    block: Literal["related"]
+    title: str | None = None
+    relations: list[str] | None = Field(default=None, description="Names of the relations shown")
+
+
+class ViewInvokeBlockOut(ApiModel):
+    model_config = ConfigDict(extra="allow")
+
+    block: Literal["invoke"] = Field(description="As the package writes it, its strings in text")
+
+
+class ViewComponentBlockOut(ApiModel):
+    block: Literal["component"]
+    component: str
+    layout: list[dict[str, Any]] = Field(description="The blocks of the component, as a view's")
+
+
+ViewBlockOut = Annotated[
+    ViewMetricsBlockOut
+    | ViewTableBlockOut
+    | ViewBoardBlockOut
+    | ViewChartBlockOut
+    | ViewFieldsBlockOut
+    | ViewHeaderBlockOut
+    | ViewRecordBlockOut
+    | ViewRelatedBlockOut
+    | ViewInvokeBlockOut
+    | ViewComponentBlockOut,
+    Field(discriminator="block"),
+]
+
+
+class ViewSummaryOut(ApiModel):
+    """A screen of a package as the console menu lists it, in one language (CP-ADR-0080 §9).
+
+    The raw source of the package (its CEL ``filter``, ``param.<name>``) is not here.
+    """
+
+    key: str
+    title: str
+    description: str | None = None
+    revision: int = Field(description="Revision of the view; a new one per change")
+    hash: str = Field(description="sha256 of the revision: what a console caches by")
+    blocks: int = Field(description="Version of the set of blocks the layout is written in")
+    locale: str = Field(description="The language of the strings: the one asked or the default")
+    package: PackageLinkOut | None = _PACKAGE_LINK_FIELD
+    nav: ViewNavOut | None = Field(default=None, description="null: opened only by a link")
+    source: ViewSourceOut
+
+
+class ViewOut(ViewSummaryOut):
+    """A screen of a package as a console draws it: no path and no expression in its blocks."""
+
+    layout: list[ViewBlockOut]
+
+
+class ViewSummaryPageOut(ApiModel):
+    items: list[ViewSummaryOut]
+    next_cursor: str | None
+
+
+# --- POST /views/{view_key}:query (CP-ADR-0080 amendment A) ---
+
+_VIEW_VALUES_DESCRIPTION = (
+    "Values by the keys of GET /views/{key}, in their formats: money {amount, currency},"
+    " date/datetime/due ISO 8601, principal an id, status {title, category}, link"
+    " {href, title}; no value: null"
+)
+ViewStatusCategory = Literal["running", "suspended", "completed", "failed", "cancelled"]
+_SCALAR = str | int | float | bool
+
+
+class ViewQueryFilter(ApiModel):
+    field: str = Field(
+        min_length=1, max_length=200, description="A filter the block declares (its field)"
+    )
+    op: Literal["eq", "in", "gte", "lte", "prefix"] = Field(
+        description="enum: eq, in; text: eq, in, prefix; number: eq, in, gte, lte;"
+        " date: eq, gte, lte (a day YYYY-MM-DD)"
+    )
+    value: _SCALAR | list[_SCALAR] = Field(description="A list for in, else one value")
+
+
+class ViewQuerySort(ApiModel):
+    field: str = Field(min_length=1, max_length=200, description="A sort the block declares")
+    dir: Literal["asc", "desc"] = "asc"
+
+
+class ViewQueryRequest(ApiModel):
+    """The data one block of a view draws (TAI-ADR-0066 p.4): values, never expressions."""
+
+    params: dict[str, Any] | None = Field(
+        default=None, description="Params of the view by their types: {id} of a card"
+    )
+    block: int = Field(ge=0, le=49, description="Index of the block in the layout of the view")
+    filter: list[ViewQueryFilter] | None = Field(
+        default=None, max_length=20, description="Only the filters the block declares"
+    )
+    sort: list[ViewQuerySort] | None = Field(
+        default=None, max_length=5, description="Only the sorts a table or a list declares"
+    )
+    limit: int | None = Field(default=None, ge=1, le=200)
+    cursor: str | None = Field(default=None, max_length=4000)
+    workspace_id: uuid.UUID | None = Field(
+        default=None,
+        description="A view of knowledge: the workspace whose tree's knowledge base it reads;"
+        " none — the caller's only tree (several — 422 workspace_required). Not read by other"
+        " sources",
+    )
+
+
+class ViewStatusValueOut(ApiModel):
+    title: str
+    category: ViewStatusCategory = Field(
+        description="Of the status of the instance as ProcessInstanceOut.status: running,"
+        " suspended, completed, failed, cancelled"
+    )
+
+
+class ViewRowOut(ApiModel):
+    id: str = Field(description="What open.view opens: open.id of the view, else the instance id")
+    title: str = Field(description="The key of the instance")
+    values: dict[str, Any] = Field(description=_VIEW_VALUES_DESCRIPTION)
+
+
+class ViewRowsOut(ApiModel):
+    """``table``, ``list``: a page."""
+
+    items: list[ViewRowOut]
+    next_cursor: str | None
+
+
+class ViewBoardCardOut(ApiModel):
+    id: str
+    title: str
+    subtitle: str | None = None
+    values: dict[str, Any] = Field(description=_VIEW_VALUES_DESCRIPTION)
+    badge: ViewStatusValueOut | None = None
+
+
+class ViewBoardColumnOut(ApiModel):
+    key: str = Field(description="The id of the stage")
+    title: str
+    items: list[ViewBoardCardOut]
+
+
+class ViewBoardOut(ApiModel):
+    """``board``: a column per stage of the process, in its order."""
+
+    columns: list[ViewBoardColumnOut]
+
+
+class ViewMetricsOut(ApiModel):
+    """``metrics``: a value per item, in the order of the items.
+
+    An aggregate is over every instance of the source the caller sees, after
+    ``source.filter``: never over a page (CP-ADR-0080 A5).
+    """
+
+    values: list[Any]
+
+
+class ViewChartPointOut(ApiModel):
+    label: str
+    value: Any
+
+
+class ViewChartOut(ApiModel):
+    """``chart``: a point per group of ``groupBy``.
+
+    An aggregate is over every instance of the source the caller sees, after
+    ``source.filter``: never over a page (CP-ADR-0080 A5).
+    """
+
+    points: list[ViewChartPointOut]
+
+
+class ViewHeaderOut(ApiModel):
+    title: str
+    status: ViewStatusValueOut
+    lead: str | None = None
+
+
+class ViewFieldsOut(ApiModel):
+    values: dict[str, Any] = Field(description=_VIEW_VALUES_DESCRIPTION)
+
+
+class ViewStepTaskOut(ApiModel):
+    ref: str = Field(description="The public id of the task: the console opens its form by it")
+    title: str
+
+
+class ViewStepOut(ApiModel):
+    key: str = Field(description="The id of the step")
+    title: str
+    task: ViewStepTaskOut | None = Field(
+        default=None, description="The task of the step, when the caller may read it"
+    )
+    assignee: str | None = None
+    since: str | None = None
+
+
+class ViewStepsOut(ApiModel):
+    items: list[ViewStepOut]
+
+
+class ViewTimelineItemOut(ApiModel):
+    at: str
+    title: str
+    actor: str | None = None
+
+
+class ViewTimelineOut(ApiModel):
+    items: list[ViewTimelineItemOut]
+
+
+class ViewArtifactItemOut(ApiModel):
+    id: str
+    name: str
+    type: str
+    created_at: str
+
+
+class ViewArtifactsOut(ApiModel):
+    items: list[ViewArtifactItemOut]
+
+
+class ViewRelationOut(ApiModel):
+    relation: str
+    title: str | None = None
+    kind: str
+    key: str
+    entity_title: str
+    direction: Literal["in", "out"]
+
+
+class ViewRelatedOut(ApiModel):
+    items: list[ViewRelationOut]
+
+
+ViewQueryOut = (
+    ViewRowsOut
+    | ViewBoardOut
+    | ViewMetricsOut
+    | ViewChartOut
+    | ViewHeaderOut
+    | ViewFieldsOut
+    | ViewStepsOut
+    | ViewTimelineOut
+    | ViewArtifactsOut
+    | ViewRelatedOut
+)
+
+
 def _package_path(path: str) -> str:
     parts = path.split("/")
     if "\\" in path or "\x00" in path or ".." in parts or "" in parts:
@@ -3107,7 +4158,7 @@ class PlanFieldOut(ApiModel):
 
 
 class PlanChangeOut(ApiModel):
-    kind: Literal["TaskType", "Agent", "Calendar", "Process", "WorkRule"] = Field(
+    kind: Literal["TaskType", "Agent", "Calendar", "Process", "WorkRule", "View"] = Field(
         description="The kinds the core plans, in the order the apply publishes them"
     )
     key: str
@@ -3184,6 +4235,52 @@ class RegulationCoverageOut(ApiModel):
     uncovered: list[str] = Field(description="Sections no element is governed by")
 
 
+class PlanSettingsRevisionOut(ApiModel):
+    before: int | None = Field(description="The active schema revision; null — none")
+    after: int | None = Field(
+        description="The revision the apply writes; null — the schema does not change, or"
+        " the package stops declaring settings"
+    )
+
+
+class PlanSettingsAddedOut(ApiModel):
+    path: str = Field(description="JSON Pointer of the new field")
+    default: Any = Field(
+        default=None, description="Its default; absent for a required field without one"
+    )
+
+    @model_serializer(mode="wrap")
+    def _without_absent_default(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # A field without a default has none: absent, not null (a null default is a value).
+        out: dict[str, Any] = handler(self)
+        if "default" not in self.model_fields_set:
+            out.pop("default", None)
+        return out
+
+
+class PlanSettingsRemovedOut(ApiModel):
+    path: str
+    saved: bool = Field(description="The field had a saved value: it stays in the history")
+
+
+class PlanSettingsIncompatibleOut(ApiModel):
+    path: str
+    code: str = Field(description="The JSON Schema keyword the saved value fails; no value")
+
+
+class PlanSettingsOut(ApiModel):
+    """``settings`` of the plan (CP-ADR-0081 §7): the new revision against the active one."""
+
+    schema_revision: PlanSettingsRevisionOut
+    added: list[PlanSettingsAddedOut]
+    removed: list[PlanSettingsRemovedOut]
+    incompatible: list[PlanSettingsIncompatibleOut] = Field(
+        description="Saved values the new schema refuses: each is also an error"
+        " settings_incompatible of the plan"
+    )
+    uischema_changed: bool
+
+
 class PackagePlanOut(ApiModel):
     plan_hash: str = Field(description="sha256 over package, catalog etag and the plan body")
     catalog_etag: str
@@ -3195,6 +4292,11 @@ class PackagePlanOut(ApiModel):
     )
     processes: list[PlanProcessOut]
     regulation_coverage: list[RegulationCoverageOut]
+    settings: PlanSettingsOut | None = Field(
+        default=None,
+        description="Settings of the package against the active revision; null — the package"
+        " neither declared nor declares settings",
+    )
     problems: list[ProcessProblemOut]
     created_at: datetime
 
@@ -3227,6 +4329,7 @@ RecordedKind = Literal[
     "WorkspaceType",
     "Role",
     "Capability",
+    "ConnectionType",
     "Skill",
     "WorkRule",
     "Agent",
@@ -3332,3 +4435,69 @@ class AuthzCheckResultOut(ApiModel):
 
 class AuthzCheckOut(ApiModel):
     results: list[AuthzCheckResultOut] = Field(description="One per check, in request order")
+
+
+# --- settings of packages (CP-ADR-0081 §4) -------------------------------------
+
+
+class PackageSettingsSummaryOut(ApiModel):
+    package: str = Field(description="The key of the package")
+    title: str = Field(description="The string <package>.title in the language asked")
+    package_version: str | None = Field(description="The package version of the active revision")
+    version: int = Field(description="The version of the values; 0 — nothing saved yet")
+    updated_by: uuid.UUID | None
+    updated_at: datetime | None
+
+
+class PackageSettingsListOut(ApiModel):
+    items: list[PackageSettingsSummaryOut] = Field(
+        description="The packages whose active revision declares settings, by key"
+    )
+
+
+class PackageSettingsOut(ApiModel):
+    """The settings of a package as the console draws its form (CP-ADR-0081 §4)."""
+
+    package: str
+    title: str
+    package_version: str | None
+    settings_schema: dict[str, Any] = Field(
+        alias="schema",
+        description="The schema of the active revision, title and description of each"
+        " property put in from the dictionaries",
+    )
+    uischema: dict[str, Any] | None = Field(
+        description="The layout with its labels put in; null — the console lays the fields out"
+    )
+    values: dict[str, Any] = Field(description="The saved values the active schema declares")
+    effective: dict[str, Any] = Field(description="The saved values over the defaults")
+    version: int = Field(description="The version of the values; 0 — nothing saved yet")
+    schema_hash: str
+    updated_by: uuid.UUID | None
+    updated_at: datetime | None
+    can_manage: bool = Field(description="The caller holds packages.settings.manage")
+
+
+class PackageSettingsPutRequest(ApiModel):
+    """The saved values whole: a field the body lacks goes back to its default."""
+
+    # Other members are refused by the route, their names never quoted back
+    # when they look like a credential.
+    model_config = ConfigDict(extra="allow", json_schema_extra={"additionalProperties": False})
+
+    values: dict[str, Any]
+
+
+class PackageSettingsVersionOut(ApiModel):
+    version: int
+    values: dict[str, Any] = Field(description="The saved values of the version, as written")
+    changed_paths: list[str] = Field(
+        description="JSON Pointers of the members whose value changed against the version before"
+    )
+    updated_by: uuid.UUID
+    updated_at: datetime
+
+
+class PackageSettingsVersionPageOut(ApiModel):
+    items: list[PackageSettingsVersionOut]
+    next_cursor: str | None

@@ -25,6 +25,7 @@ router = APIRouter(tags=["bootstrap"])
 
 
 # authz: public — защищён bootstrap-токеном (CP_BOOTSTRAP_TOKEN), сравнение ниже
+# visibility: tenant — no workspace exists before the tenant does
 @router.post(
     "/bootstrap",
     response_model=BootstrapOut,

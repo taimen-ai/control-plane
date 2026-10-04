@@ -1,6 +1,6 @@
 [project]
 name = "control-plane"
-version = "0.9.0"
+version = "0.10.0"
 description = "Control plane: coordination backend for humans, AI agents and automated processes"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -34,7 +34,7 @@ dependencies = [
 # resource services. Здесь он подключается путём: единого внутреннего индекса
 # пакетов у платформы пока нет.
 [tool.uv.sources]
-platform-auth-sdk = { path = "../platform-auth-sdk", editable = true }
+platform-auth-sdk = { path = "../../sdk/platform-auth-sdk", editable = true }
 # Клиент — отдельный дистрибутив в этом же репозитории (client/), чтобы его
 # могли ставить потребители без серверных зависимостей (ADR-0030 суперпроекта).
 control-plane-client = { path = "client", editable = true }
@@ -92,7 +92,10 @@ src = ["src", "client/src", "tests"]
 "tests/unit/test_agent_review.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/unit/test_execution_workspace.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/integration/test_org.py" = ["RUF001", "RUF002", "RUF003"]
+# Dictionaries of a package in Russian (CP-ADR-0080): the texts are the data.
+"tests/integration/test_package_views.py" = ["RUF001"]
 "tests/unit/test_claude_adapter.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/unit/test_adr_amendment_labels.py" = ["RUF001", "RUF002", "RUF003"]
 "migrations/versions/e3b8c1a6d9f4_approval_outcomes.py" = ["RUF001"]
 # The generated event catalog page (docs/events/catalog.md) is Russian documentation.
 "src/control_plane/domain/event_catalog.py" = ["RUF001"]

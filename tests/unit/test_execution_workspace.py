@@ -479,7 +479,7 @@ def superproject(tmp_path: Path, neighbour_origin: Path) -> Path:
 def pin(superproject: Path, path: str, revision: str) -> str:
     """Record a submodule at an exact revision, without needing the network."""
     git(superproject, "update-index", "--add", "--cacheinfo", f"160000,{revision},{path}")
-    git(superproject, "commit", "-qm", f"pin {path} at {revision[:12]}")
+    git(superproject, "commit", "-q", "--allow-empty", "-m", f"pin {path} at {revision[:12]}")
     return revision
 
 
@@ -520,8 +520,11 @@ def test_path_dependencies_of_this_repository_resolve_in_a_fresh_copy(
     """Every ``../x`` this project declares must exist in a copy, unaided.
 
     Read from the real pyproject rather than hardcoded: a path dependency added
-    later must fail here, not on the runner as an unbuildable copy.
+    later must fail here, not on the runner as an unbuildable copy. The copy and
+    its neighbours are laid out as in the superproject (TAI-ADR-0064), where these
+    paths are written: control-plane at ``services/control-plane``.
     """
+    import posixpath
     import tomllib
 
     manifest = Path(__file__).resolve().parents[2] / "pyproject.toml"
@@ -533,12 +536,17 @@ def test_path_dependencies_of_this_repository_resolve_in_a_fresh_copy(
     ]
     assert relative, "expected this project to declare at least one path dependency"
 
+    repo_dir = "services/control-plane"
+    # Each neighbour at its path in the superproject, pinned there as a submodule.
+    paths = [posixpath.normpath(posixpath.join(repo_dir, path)) for path in relative]
+    for neighbour in paths:
+        pin(superproject, neighbour, git(neighbour_origin, "rev-parse", "HEAD~1"))
     pool = ExecutionWorkspacePool(
         origin,
         tmp_path / "workspaces",
-        repo_dir="control-plane",
+        repo_dir=repo_dir,
         # The mirror of each declared neighbour, as a deployment provides it.
-        neighbours=[Neighbour(Path(path).name, neighbour_origin) for path in relative],
+        neighbours=[Neighbour(neighbour, neighbour_origin) for neighbour in paths],
         superproject=superproject,
     )
     workspace = pool.acquire("TASK-000502")
@@ -618,6 +626,262 @@ def test_a_copy_made_before_containers_is_adopted_with_its_work(
     assert adopted.reused is True
     assert (adopted.path / "wip.txt").read_text() == "half-done\n"
     assert git(adopted.path, "rev-parse", "--abbrev-ref", "HEAD") == "task/TASK-000507"
+
+
+# --- the layout with segments (TAI-ADR-0064) -----------------------------------
+#
+# The superproject moves to services/, sdk/, apps/: a service then reaches an
+# SDK two levels up (``../../sdk/platform-auth-sdk``). The container is laid out
+# like the superproject, so the same path resolves in a copy of the runner.
+
+# (directory of the copy, path of the neighbour, path dependency from the copy)
+LAYOUTS = [
+    pytest.param("control-plane", NEIGHBOUR, f"../{NEIGHBOUR}", id="flat"),
+    pytest.param(
+        "services/control-plane",
+        f"sdk/{NEIGHBOUR}",
+        f"../../sdk/{NEIGHBOUR}",
+        id="segments",
+    ),
+]
+
+
+@pytest.mark.parametrize(("repo_dir", "path", "dependency"), LAYOUTS)
+def test_a_path_dependency_resolves_on_both_layouts(
+    origin: Path,
+    neighbour_origin: Path,
+    superproject: Path,
+    tmp_path: Path,
+    repo_dir: str,
+    path: str,
+    dependency: str,
+) -> None:
+    pinned = pin(superproject, path, git(neighbour_origin, "rev-parse", "HEAD~1"))
+    root = tmp_path / "workspaces"
+    pool = ExecutionWorkspacePool(
+        origin,
+        root,
+        repo_dir=repo_dir,
+        neighbours=[Neighbour(path, neighbour_origin)],
+        superproject=superproject,
+    )
+
+    workspace = pool.acquire("TASK-000520")
+
+    assert workspace.path == root / "TASK-000520" / repo_dir
+    assert workspace.container == root / "TASK-000520"
+    sibling = workspace.path / dependency
+    assert (sibling / "sdk.py").read_text() == "pinned\n"
+    assert git(sibling, "rev-parse", "HEAD") == pinned
+    assert workspace.checkpoint_data["neighbours"] == {path: pinned}
+
+    (workspace.path / "result.txt").write_text("result\n")
+    sha = workspace.commit("TASK-000520: work")
+    pool.release(workspace, "succeeded")
+
+    # The container goes whole, the directories of the layout with it.
+    assert not (root / "TASK-000520").exists()
+    assert git(origin, "rev-parse", "task/TASK-000520") == sha
+    assert str(root / "TASK-000520") not in git(neighbour_origin, "worktree", "list")
+
+
+@pytest.mark.parametrize(("repo_dir", "path", "dependency"), LAYOUTS)
+def test_a_failed_copy_is_taken_again_where_it_was_on_both_layouts(
+    origin: Path,
+    neighbour_origin: Path,
+    superproject: Path,
+    tmp_path: Path,
+    repo_dir: str,
+    path: str,
+    dependency: str,
+) -> None:
+    pin(superproject, path, git(neighbour_origin, "rev-parse", "HEAD~1"))
+    pool = ExecutionWorkspacePool(
+        origin,
+        tmp_path / "workspaces",
+        repo_dir=repo_dir,
+        neighbours=[Neighbour(path, neighbour_origin)],
+        superproject=superproject,
+    )
+    workspace = pool.acquire("TASK-000521")
+    (workspace.path / "wip.txt").write_text("half-done\n")
+    pool.release(workspace, "failed")
+    pin(superproject, path, git(neighbour_origin, "rev-parse", "HEAD"))
+
+    again = pool.acquire("TASK-000521")
+
+    assert again.reused is True
+    assert again.path == workspace.path
+    assert (again.path / "wip.txt").read_text() == "half-done\n"
+    assert (again.path / dependency / "sdk.py").read_text() == "moved on\n"
+
+
+@pytest.mark.parametrize(("repo_dir", "path", "dependency"), LAYOUTS)
+def test_the_disk_budget_prunes_a_copy_on_both_layouts(
+    origin: Path,
+    neighbour_origin: Path,
+    superproject: Path,
+    tmp_path: Path,
+    repo_dir: str,
+    path: str,
+    dependency: str,
+) -> None:
+    pin(superproject, path, git(neighbour_origin, "rev-parse", "HEAD~1"))
+    root = tmp_path / "workspaces"
+    pool = ExecutionWorkspacePool(
+        origin,
+        root,
+        repo_dir=repo_dir,
+        neighbours=[Neighbour(path, neighbour_origin)],
+        superproject=superproject,
+        max_workspaces=0,
+    )
+    first = pool.acquire("TASK-000522")
+    pool.release(first, "failed")
+    assert first.path.is_dir()  # its own release keeps it
+
+    second = pool.acquire("TASK-000523")
+    pool.release(second, "failed")
+
+    assert not (root / "TASK-000522").exists()
+    assert (second.path / dependency / "sdk.py").is_file()
+
+
+@pytest.mark.parametrize(("repo_dir", "path", "dependency"), LAYOUTS)
+def test_a_reopened_copy_knows_its_container_on_both_layouts(
+    origin: Path,
+    neighbour_origin: Path,
+    superproject: Path,
+    tmp_path: Path,
+    repo_dir: str,
+    path: str,
+    dependency: str,
+) -> None:
+    """Restart recovery takes the copy as it is: its container is ``<key>``, not inside it."""
+    pin(superproject, path, git(neighbour_origin, "rev-parse", "HEAD~1"))
+    root = tmp_path / "workspaces"
+    pool = ExecutionWorkspacePool(
+        origin,
+        root,
+        repo_dir=repo_dir,
+        neighbours=[Neighbour(path, neighbour_origin)],
+        superproject=superproject,
+    )
+    workspace = pool.acquire("TASK-000525")
+    (workspace.path / "result.txt").write_text("result\n")
+    sha = workspace.commit("TASK-000525: work")
+    pool.release(workspace, "failed")
+
+    reopened = pool.reopen("TASK-000525")
+
+    assert reopened is not None
+    assert reopened.path == root / "TASK-000525" / repo_dir
+    assert reopened.repo_dir == repo_dir
+    assert reopened.container == root / "TASK-000525"
+    assert (reopened.path / dependency / "sdk.py").is_file()
+
+    pool.release(reopened, "succeeded")
+
+    # Removal clears the container itself, the neighbour and the layout's directories with it.
+    assert not (root / "TASK-000525").exists()
+    assert root.is_dir()
+    assert git(origin, "rev-parse", "task/TASK-000525") == sha
+    assert str(root / "TASK-000525") not in git(neighbour_origin, "worktree", "list")
+
+
+def test_a_copy_made_before_containers_is_adopted_into_a_directory_with_segments(
+    origin: Path, tmp_path: Path
+) -> None:
+    root = tmp_path / "workspaces"
+    old = root / "TASK-000524"
+    git(origin, "worktree", "add", "-q", str(old), "-b", "task/TASK-000524")
+    (old / "wip.txt").write_text("half-done\n")
+
+    pool = ExecutionWorkspacePool(origin, root, repo_dir="services/control-plane")
+    adopted = pool.acquire("TASK-000524")
+
+    assert adopted.path == root / "TASK-000524" / "services" / "control-plane"
+    assert adopted.container == root / "TASK-000524"
+    assert (adopted.path / "wip.txt").read_text() == "half-done\n"
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        "",
+        ".",
+        "..",
+        "../control-plane",
+        "services/../control-plane",
+        "/services/control-plane",
+        "services//control-plane",
+        "services/control-plane/",
+        "services\\control-plane",
+        "services/control-plane\n",
+        "services/.hidden",
+        "a" * 101,
+        "/".join(["a" * 100] * 3),
+    ],
+)
+def test_an_unsafe_directory_of_the_copy_or_a_neighbour_is_refused(
+    origin: Path, neighbour_origin: Path, superproject: Path, tmp_path: Path, directory: str
+) -> None:
+    if directory:  # empty: the copy's directory defaults to the origin's name
+        with pytest.raises(WorkspaceError, match="unsafe repository directory"):
+            ExecutionWorkspacePool(origin, tmp_path / "workspaces", repo_dir=directory)
+    with pytest.raises(WorkspaceError, match="unsafe neighbour path"):
+        Neighbour(directory, neighbour_origin)
+    assert not (tmp_path / "workspaces").exists() or not any((tmp_path / "workspaces").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("repo_dir", "path"),
+    [
+        ("services", "services/platform-auth-sdk"),
+        ("services/control-plane", "services"),
+        ("services/control-plane", "services/control-plane"),
+        ("Services/control-plane", "services/control-plane/sdk"),
+    ],
+)
+def test_a_neighbour_inside_the_copy_or_around_it_is_refused(
+    origin: Path,
+    neighbour_origin: Path,
+    superproject: Path,
+    tmp_path: Path,
+    repo_dir: str,
+    path: str,
+) -> None:
+    """One checkout would write into the files of the other."""
+    with pytest.raises(WorkspaceError, match="one inside the other"):
+        ExecutionWorkspacePool(
+            origin,
+            tmp_path / "workspaces",
+            repo_dir=repo_dir,
+            neighbours=[Neighbour(path, neighbour_origin)],
+            superproject=superproject,
+        )
+
+
+def test_a_neighbour_beside_the_copy_in_the_same_directory_is_placed(
+    origin: Path, neighbour_origin: Path, superproject: Path, tmp_path: Path
+) -> None:
+    """``services/control-plane`` and ``services/memory-service``: one ``../`` apart."""
+    revision = git(neighbour_origin, "rev-parse", "HEAD~1")
+    pinned = pin(superproject, "services/memory-service", revision)
+    root = tmp_path / "workspaces"
+    pool = ExecutionWorkspacePool(
+        origin,
+        root,
+        repo_dir="services/control-plane",
+        neighbours=[Neighbour("services/memory-service", neighbour_origin)],
+        superproject=superproject,
+    )
+
+    workspace = pool.acquire("TASK-000525")
+
+    assert git(workspace.path / "../memory-service", "rev-parse", "HEAD") == pinned
+    pool.release(workspace, "succeeded")
+    assert not (root / "TASK-000525").exists()
 
 
 def test_neighbours_without_a_superproject_are_refused(

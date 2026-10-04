@@ -554,7 +554,8 @@ def check_spec(kind: str, spec: dict[str, Any], *, field: str = "spec") -> None:
     * ``external_state`` — ``{}`` or ``{event: "<observation kind or event
       type>"}``: passed by evidence tied to the check;
     * ``human`` — ``{}``, ``{approver: <principal id>}`` or
-      ``{approverRole: <role id>}``: passed by a gate-approval decision;
+      ``{approverRole: <role id> | "role:<slug>"}``: passed by a gate-approval
+      decision;
     * ``llm_judge`` — as ``human``, plus an optional ``rubric`` for the
       person who decides: a model does not close the gate.
 
@@ -592,9 +593,16 @@ def check_spec(kind: str, spec: dict[str, Any], *, field: str = "spec") -> None:
     else:
         if "approver" in spec and "approverRole" in spec:
             raise _spec_error(field, kind, "approver and approverRole are mutually exclusive")
-        for name in ("approver", "approverRole"):
-            if name in spec and not _is_uuid(spec[name]):
-                raise _spec_error(f"{field}.{name}", kind, f"{name} must be a UUID")
+        if "approver" in spec and not _is_uuid(spec["approver"]):
+            raise _spec_error(f"{field}.approver", kind, "approver must be a UUID")
+        # A role by id, or a role of the package by slug (CP-ADR-0061,
+        # amendment 2026-10-01): whether it exists is for the application layer.
+        if "approverRole" in spec and not (
+            _is_uuid(spec["approverRole"]) or _is_role_reference(spec["approverRole"])
+        ):
+            raise _spec_error(
+                f"{field}.approverRole", kind, "approverRole must be a UUID or role:<slug>"
+            )
         if "rubric" in spec:
             rubric = spec["rubric"]
             if (
@@ -608,6 +616,26 @@ def check_spec(kind: str, spec: dict[str, Any], *, field: str = "spec") -> None:
                     f"rubric must be a non-empty string of at most "
                     f"{MAX_CHECK_DESCRIPTION_LENGTH} characters",
                 )
+
+
+_ROLE_REFERENCE_RE = re.compile(r"role:([a-z0-9][a-z0-9-]{0,62})")
+
+
+def role_reference_slug(value: Any) -> str | None:
+    """The slug of a well-formed ``role:<slug>``, else ``None``.
+
+    The one parser of the reference: publication and the opening of a gate
+    read it the same way, so nothing around the slug (spaces, a newline) is
+    trimmed off by one and refused by the other.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _ROLE_REFERENCE_RE.fullmatch(value)
+    return match.group(1) if match else None
+
+
+def _is_role_reference(value: Any) -> bool:
+    return role_reference_slug(value) is not None
 
 
 def _is_uuid(value: Any) -> bool:

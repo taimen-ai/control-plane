@@ -17,6 +17,11 @@ A lease lost while the implementation runs (``stale_invocation_lease``, the
 lease deadline passed without a successful heartbeat) means the result is no
 longer ours to report: it is dropped, never sent.
 
+``settings`` of every protocol is what the claim handed out: the effective
+settings of the skill's package, ``{package, version, schemaRevision,
+values}``, or ``null`` for a skill not from a package (CP-ADR-0081 §8); the
+``_meta`` of an ``mcp`` call leaves a ``null`` member out.
+
 Protocols:
 
 - ``local`` — ``module:function`` run under the contract's ``timeoutSeconds``:
@@ -26,9 +31,9 @@ Protocols:
   ``retryable = True`` is a retryable failure; its ``code`` (if any) names it.
   An entrypoint that carries ``__skill_invoke__(inputs, meta)`` (a skill of
   skill-sdk, TAI-ADR-0045) is called through it: it gets the invocation id,
-  idempotency key and timeout and answers ``{outputs, cost}``.
+  idempotency key, timeout and ``settings`` and answers ``{outputs, cost}``.
 - ``http`` — ``POST implementation.endpoint`` with ``{invocationId,
-  idempotencyKey, inputs}`` and, over ``https`` only, a Bearer token of IAM
+  idempotencyKey, settings, inputs}`` and, over ``https`` only, a Bearer token of IAM
   audience ``implementation.auth.audience``. A 2xx body is the outputs
   object (``X-Skill-Cost`` — its cost); 4xx is a non-retryable failure; 5xx, a
   timeout or a transport error is retryable. An error body ``{"error": {code,
@@ -37,8 +42,8 @@ Protocols:
   server ``implementation.endpoint``: an ``http(s)://`` URL (streamable HTTP)
   or ``stdio:<name>``, a server this executor starts from its own
   configuration (``CONTROL_PLANE_SKILLS_MCP_SERVERS``). The request's
-  ``_meta`` carries ``skill/invocationId`` and ``skill/idempotencyKey`` — the
-  values ``http`` puts in the body. Structured content —
+  ``_meta`` carries ``skill/invocationId``, ``skill/idempotencyKey`` and
+  ``skill/settings`` — the values ``http`` puts in the body. Structured content —
   or a text block holding one JSON object — is the outputs, ``_meta`` key
   ``skill/cost`` its cost; an ``isError`` result whose one text block is
   ``{"error": {code, retryable}}`` names the failure.
@@ -96,6 +101,51 @@ ENV_AUDIENCES = "CONTROL_PLANE_SKILLS_ALLOWED_AUDIENCES"
 ENV_PRIVATE_HOSTS = "CONTROL_PLANE_SKILLS_PRIVATE_HOSTS"
 ENV_LOCAL_ISOLATION = "CONTROL_PLANE_SKILLS_LOCAL_ISOLATION"
 ENV_CONCURRENCY = "CONTROL_PLANE_SKILLS_CONCURRENCY"
+#: JSON ``{NAME: value}`` — non-secret settings of the skills (a portal's
+#: address), set in the environment of each ``local`` call (CP-ADR-0073,
+#: amendment 2026-10-01: ``executor.params.env`` of a ``skills`` agent).
+ENV_LOCAL_ENV = "CONTROL_PLANE_SKILLS_LOCAL_ENV"
+
+#: ``params.env`` of a ``skills`` executor: names, sizes, what is refused.
+SKILL_ENV_MAX_ITEMS = 50
+SKILL_ENV_MAX_VALUE = 2000
+_SKILL_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
+# A secret goes through the node's secret files, never through a description.
+_SKILL_ENV_SECRET = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|API_KEY)$")
+# The host's own settings are not the package's to set: with ``thread``
+# isolation they land in the daemon's own environment. Refused are whole
+# families by prefix (the daemon, its loaders and the tools it runs: git, node,
+# uv, pip, XDG dirs) and single names (where it goes and whom it trusts:
+# proxies and CA bundles). Compared upper-cased, so ``https_proxy`` is too.
+_SKILL_ENV_RESERVED = (
+    "CONTROL_PLANE_",
+    "IAM_",
+    "PYTHON",
+    "LD_",
+    "DYLD_",
+    "GIT_",
+    "NODE_",
+    "UV_",
+    "PIP_",
+    "XDG_",
+)
+_SKILL_ENV_FIXED = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "TMPDIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    }
+)
 
 PROTOCOLS = ("local", "http", "mcp")
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
@@ -115,6 +165,7 @@ MCP_COST_META = "skill/cost"
 #: Where the executor puts the invocation of an ``mcp`` call (request ``_meta``).
 MCP_INVOCATION_META = "skill/invocationId"
 MCP_IDEMPOTENCY_META = "skill/idempotencyKey"
+MCP_SETTINGS_META = "skill/settings"
 #: The local wire contract of skill-sdk: ``(inputs, meta) -> {outputs, cost}``.
 SDK_INVOKE = "__skill_invoke__"
 SDK_CONTRACT = "__skill_contract__"
@@ -156,6 +207,9 @@ class SkillCall:
     skill: str
     implementation: dict[str, Any]
     timeout_seconds: float
+    #: The settings of the skill's package the claim handed out (CP-ADR-0081 §8):
+    #: ``{package, version, schemaRevision, values}``; ``None`` — not from a package.
+    settings: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -294,20 +348,68 @@ def _invoke_local(function: Any, inputs: dict[str, Any], meta: dict[str, Any]) -
     return SkillOutcome(function(inputs))
 
 
+def _settings_of(value: Any) -> dict[str, Any] | None:
+    """The claim's ``settings``; a core older than CP-ADR-0081 has none."""
+    return value if isinstance(value, dict) else None
+
+
 def _call_meta(call: SkillCall) -> dict[str, Any]:
     return {
         "invocationId": call.invocation_id,
         "idempotencyKey": call.idempotency_key,
         "timeoutSeconds": call.timeout_seconds,
         "skill": call.skill,
+        "settings": call.settings,
     }
 
 
+def _skill_env_reserved(name: str) -> bool:
+    upper = name.upper()
+    return upper in _SKILL_ENV_FIXED or upper.startswith(_SKILL_ENV_RESERVED)
+
+
+def parse_skill_env(value: Any, *, where: str) -> dict[str, str]:
+    """``{NAME: value}`` of non-secret settings for the skills; ``ValueError`` names the misfit.
+
+    The names are upper-case environment variables; one that looks like a
+    credential (``*_TOKEN``, ``*_SECRET``, ``*_PASSWORD``, ``*_API_KEY``…) or
+    belongs to the host (``CONTROL_PLANE_*``, ``GIT_*``, ``PATH``, a proxy or a
+    CA bundle…) is refused.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be an object of NAME: value")
+    if len(value) > SKILL_ENV_MAX_ITEMS:
+        raise ValueError(f"{where} allows at most {SKILL_ENV_MAX_ITEMS} variables")
+    out: dict[str, str] = {}
+    for name, item in value.items():
+        if not isinstance(name, str) or not _SKILL_ENV_NAME.fullmatch(name):
+            raise ValueError(f"{where}: {str(name)[:100]!r} is not a variable name (A-Z, 0-9, _)")
+        if _SKILL_ENV_SECRET.search(name):
+            raise ValueError(
+                f"{where}.{name}: a secret is not a parameter; give it as a secret of the node"
+            )
+        if _skill_env_reserved(name):
+            raise ValueError(f"{where}.{name} belongs to the host")
+        if not isinstance(item, str) or len(item) > SKILL_ENV_MAX_VALUE:
+            raise ValueError(f"{where}.{name} must be a string of at most {SKILL_ENV_MAX_VALUE}")
+        out[name] = item
+    return out
+
+
 def _run_in_child(
-    entrypoint: str, inputs: dict[str, Any], connection: Any, meta: dict[str, Any] | None = None
+    entrypoint: str,
+    inputs: dict[str, Any],
+    connection: Any,
+    meta: dict[str, Any] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> None:
     """Child-process side of an isolated ``local`` call: one result, then exit."""
     try:
+        # The skills' settings: the child of a forkserver does not see what
+        # the daemon's environment got after the server started.
+        os.environ.update(environment or {})
         function = _resolve_entrypoint(entrypoint)
         outcome = _invoke_local(function, inputs, meta or {})
         message: tuple[str, Any] = ("ok", (outcome.output, outcome.cost))
@@ -343,11 +445,22 @@ class LocalProtocol:
 
     POLL_SECONDS = 0.02
 
-    def __init__(self, entrypoints: list[str], *, isolation: str = "process") -> None:
+    def __init__(
+        self,
+        entrypoints: list[str],
+        *,
+        isolation: str = "process",
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
         if isolation not in ("process", "thread"):
             raise ValueError(f"unknown local isolation {isolation!r}")
         self.entrypoints = list(entrypoints)
         self.isolation = isolation
+        # Settings of the skills (ENV_LOCAL_ENV): in the child's environment,
+        # or in this process's for ``thread``, which has no other.
+        self.environment = dict(environment or {})
+        if isolation == "thread":
+            os.environ.update(self.environment)
 
     def admits(self, implementation: dict[str, Any]) -> bool:
         return implementation.get("entrypoint") in self.entrypoints
@@ -383,7 +496,9 @@ class LocalProtocol:
         context = _process_context()
         receiver, sender = context.Pipe(duplex=False)
         process = context.Process(
-            target=_run_in_child, args=(entrypoint, inputs, sender, meta), daemon=True
+            target=_run_in_child,
+            args=(entrypoint, inputs, sender, meta, self.environment),
+            daemon=True,
         )
         process.start()
         sender.close()
@@ -653,6 +768,7 @@ class HttpProtocol:
         body = {
             "invocationId": call.invocation_id,
             "idempotencyKey": call.idempotency_key,
+            "settings": call.settings,
             "inputs": call.inputs,
         }
         # No redirects: following one would carry the token to another host.
@@ -852,6 +968,7 @@ class McpProtocol:
                         {
                             MCP_INVOCATION_META: call.invocation_id,
                             MCP_IDEMPOTENCY_META: call.idempotency_key,
+                            MCP_SETTINGS_META: call.settings,
                         },
                     ),
                 )
@@ -1028,6 +1145,7 @@ class SkillExecutor:
             skill=ref,
             implementation=dict(contract.get("implementation") or {}),
             timeout_seconds=float(contract.get("timeoutSeconds") or 60),
+            settings=_settings_of(claimed.get("settings")),
         )
         heartbeat = asyncio.create_task(self._keep_lease(lease, session_id))
         work = asyncio.create_task(self._attempt(call, contract))
@@ -1360,7 +1478,9 @@ def executor_from_environment(
     ``CONTROL_PLANE_SKILLS_MCP_SERVERS`` — JSON ``{name: {command, args,
     env}}`` for ``stdio:<name>`` endpoints;
     ``CONTROL_PLANE_SKILLS_CONCURRENCY`` — invocations run at once alongside
-    Work (default 1; 0 — only while there is no Work).
+    Work (default 1; 0 — only while there is no Work);
+    ``CONTROL_PLANE_SKILLS_LOCAL_ENV`` — JSON ``{NAME: value}``, non-secret
+    settings set in the environment of each ``local`` call.
     """
     values = os.environ if environ is None else environ
     packages = _split(values.get(ENV_LOCAL_PACKAGES, ""))
@@ -1386,7 +1506,15 @@ def executor_from_environment(
     if "local" in protocols:
         entrypoints = discover_local_entrypoints(packages)
         isolation = values.get(ENV_LOCAL_ISOLATION, "").strip() or "process"
-        handlers["local"] = LocalProtocol(entrypoints, isolation=isolation)
+        try:
+            settings = json.loads(values.get(ENV_LOCAL_ENV, "") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{ENV_LOCAL_ENV} must be a JSON object") from exc
+        handlers["local"] = LocalProtocol(
+            entrypoints,
+            isolation=isolation,
+            environment=parse_skill_env(settings, where=ENV_LOCAL_ENV),
+        )
     if "http" in protocols:
         origins = parse_origins(_split(values.get(ENV_HTTP_ORIGINS, "")), variable=ENV_HTTP_ORIGINS)
         if origins:
@@ -1443,5 +1571,6 @@ __all__ = [
     "map_inputs",
     "origin_of",
     "output_errors",
+    "parse_skill_env",
     "resolve_path",
 ]

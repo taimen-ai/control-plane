@@ -39,8 +39,9 @@ from control_plane.application.commands.workspaces import (
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_principals_key_share
-from control_plane.application.queries.approval_gates import pending_gate_approvals
+from control_plane.application.queries.approval_gates import require_open_gates
 from control_plane.application.queries.org import role_assignment_scope
+from control_plane.application.visibility import approval_visible, artifact_visible
 from control_plane.domain.enums import ApprovalStatus, Permission
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -137,7 +138,7 @@ async def request_approval(
         artifact = await session.scalar(
             select(Artifact).where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
         )
-        if artifact is None:
+        if artifact is None or not await artifact_visible(session, ctx, artifact):
             raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
     if workspace_id is not None:
         await get_tenant_workspace(session, ctx, workspace_id)
@@ -248,13 +249,7 @@ async def check_approval_gate(session: AsyncSession, ctx: AuthContext, task_id: 
     an uncommitted approval decision is invisible here, so the gate opens only
     after the decision has committed.
     """
-    pending = await pending_gate_approvals(session, ctx.tenant_id, task_id)
-    if pending:
-        raise ConflictError(
-            "approval_required",
-            "Task is waiting for a pending gate approval",
-            details={"taskId": str(task_id), "pendingApprovals": pending},
-        )
+    await require_open_gates(session, ctx, task_id)
 
 
 async def _get_locked_pending_approval(
@@ -266,7 +261,9 @@ async def _get_locked_pending_approval(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if approval is None:
+    # An invisible approval is a missing one: neither decided nor told apart
+    # by its state (CP-ADR-0082 §3.7, FR-007).
+    if approval is None or not await approval_visible(session, ctx, approval):
         raise NotFoundError("Approval not found", details={"approvalId": str(approval_id)})
     if approval.status != ApprovalStatus.PENDING:
         raise ConflictError(
@@ -367,7 +364,7 @@ async def decision_gate(
         found = await session.scalar(
             select(Approval).where(Approval.id == approval_id, Approval.tenant_id == ctx.tenant_id)
         )
-        if found is None:
+        if found is None or not await approval_visible(session, ctx, found):
             raise NotFoundError("Approval not found", details={"approvalId": str(approval_id)})
         approval = found
     await authorize(ctx, Permission.APPROVALS_DECIDE, resource=target)
@@ -451,7 +448,7 @@ async def cancel_approval(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if approval is None:
+    if approval is None or not await approval_visible(session, ctx, approval):
         raise NotFoundError("Approval not found", details={"approvalId": str(approval_id)})
     if approval.status == ApprovalStatus.CANCELLED:
         return approval  # idempotent

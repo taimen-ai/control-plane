@@ -7,7 +7,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.api.dependencies import AuthDep, DbDep, SessionFactoryDep, SettingsDep
+from control_plane.api.dependencies import (
+    AuthDep,
+    ContentStoreDep,
+    DbDep,
+    SessionFactoryDep,
+    SettingsDep,
+)
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     SkillExecutionOut,
@@ -22,6 +28,7 @@ from control_plane.api.v1.schemas import (
 )
 from control_plane.api.write_flow import as_no_content, execute_write
 from control_plane.application.commands import skill_invocations as commands
+from control_plane.application.queries.package_settings import object_settings
 from control_plane.infrastructure.db.models import Skill, SkillInvocation
 
 router = APIRouter(tags=["skills"])
@@ -100,8 +107,10 @@ async def claim_skill_invocation(
     The response carries what the executor needs to run the call — name,
     version, side effects and the full contract with its implementation — so
     no second read is needed. The catalog ``config`` is not part of it: it
-    stays behind ``org.read`` (ADR-0056 amendment). ``invocationId`` narrows
-    the claim to one call.
+    stays behind ``org.read`` (ADR-0056 amendment). ``settings`` — the
+    effective settings of the skill's package, ``null`` for a skill not
+    from a package (CP-ADR-0081 §8). ``invocationId`` narrows the claim to
+    one call.
     """
 
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
@@ -124,6 +133,8 @@ async def claim_skill_invocation(
         return 200, {
             "invocation": invocation_body(invocation, skill),
             "skill": dump(SkillExecutionOut, skill),
+            # Read at this claim: a retry of the attempt gets the values of its own.
+            "settings": await object_settings(db, ctx.tenant_id, "Skill", skill.name),
         }
 
     return as_no_content(
@@ -185,10 +196,12 @@ async def complete_skill_invocation(
     ctx: AuthDep,
     settings: SettingsDep,
     session_factory: SessionFactoryDep,
+    store: ContentStoreDep,
 ) -> JSONResponse:
     """Report a result. The core re-validates ``output``: a violation turns
     the invocation ``failed`` with ``output_contract_violation`` (still 200 —
-    the report was accepted, the verdict is in the body)."""
+    the report was accepted, the verdict is in the body). The execution call
+    of a task also hands in the task's typed outputs (CP-ADR-0072)."""
 
     async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
         invocation, skill = await commands.complete_skill_invocation(
@@ -199,6 +212,7 @@ async def complete_skill_invocation(
             output=payload.output,
             cost=payload.cost,
             session_id=payload.session_id,
+            store=store,
         )
         return 200, invocation_body(invocation, skill)
 

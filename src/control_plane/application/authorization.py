@@ -17,6 +17,12 @@ Two generations of the check live side by side (TAI-ADR-0025, CP-ADR-0055):
 
 The subject the PDP reasons about is the IAM principal id (``sub`` of the
 access token), never the local ``principals.id`` (design v0 §16).
+
+Visibility (CP-ADR-0082 §3) narrows both in every mode: a human whose binding
+is in ``members`` mode sees only the workspaces of their membership and below.
+``visible_objects(..., "workspace")`` returns that set (intersected with the
+PDP's answer in ``policy`` mode), and ``authorize`` on a workspace outside it
+answers ``404`` as for a workspace that does not exist.
 """
 
 from __future__ import annotations
@@ -41,12 +47,22 @@ from platform_auth import (
 
 from control_plane import observability, sandbox
 from control_plane.domain.enums import Permission
-from control_plane.domain.errors import AuthorizationError, DependencyUnavailableError
+from control_plane.domain.errors import (
+    AuthorizationError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 
 logger = logging.getLogger("control_plane.authz")
 
 AuthzMode = Literal["local", "shadow", "policy"]
 AUTHZ_MODES: tuple[AuthzMode, ...] = ("local", "shadow", "policy")
+
+# Visibility of an IAM binding (CP-ADR-0082 §2): the whole tenant, or the
+# workspaces of the principal's membership and their descendants.
+VISIBILITY_TENANT = "tenant"
+VISIBILITY_MEMBERS = "members"
+VISIBILITIES = (VISIBILITY_TENANT, VISIBILITY_MEMBERS)
 
 
 @dataclass(frozen=True)
@@ -73,6 +89,14 @@ class AuthContext:
     # (``approval:<id>``): such a credential decides that approval and
     # nothing else, whatever its permissions say (CP-ADR-0070).
     purpose_ref: str | None = None
+    # ``members`` when an active binding of the principal narrows a human to
+    # their workspaces (CP-ADR-0082 §3.2); resolved per request at entry.
+    visibility: str = VISIBILITY_TENANT
+    # The workspaces visible in ``members`` mode; ``None`` in ``tenant`` mode.
+    visible_workspaces: frozenset[str] | None = None
+    # Roots of the trees those workspaces belong to: their memory namespaces
+    # are the workspace namespaces such a caller may read (CP-ADR-0082 §3.4).
+    visible_roots: frozenset[str] = frozenset()
 
     def has(self, permission: Permission) -> bool:
         return Permission.ADMIN.value in self.permissions or permission.value in self.permissions
@@ -80,6 +104,67 @@ class AuthContext:
     @property
     def policy_subject(self) -> str | None:
         return str(self.iam_principal_id) if self.iam_principal_id is not None else None
+
+    def sees_workspace(self, workspace_id: uuid.UUID | str | None) -> bool:
+        """Is work of this workspace visible to the caller (CP-ADR-0082 §3.7)?
+
+        In ``members`` mode work outside any workspace is not: lists filter by
+        the set and a task without a workspace is not in it.
+        """
+        if self.visible_workspaces is None:
+            return True
+        return workspace_id is not None and str(workspace_id) in self.visible_workspaces
+
+
+class WorkspaceNotVisible(NotFoundError):
+    """A workspace outside the caller's visibility: the answer of a missing one.
+
+    A resolver of an object that lives in a workspace catches it and raises
+    its own ``not_found`` instead, so the body does not tell that the object
+    exists (CP-ADR-0082 §3.7).
+    """
+
+    def __init__(self, workspace_id: str) -> None:
+        super().__init__("Workspace not found", details={"workspaceId": workspace_id})
+
+
+def check_workspace_visible(ctx: AuthContext, workspace_id: uuid.UUID | str | None) -> None:
+    """Raise ``WorkspaceNotVisible`` unless work of ``workspace_id`` is visible."""
+    if not ctx.sees_workspace(workspace_id):
+        raise WorkspaceNotVisible(str(workspace_id))
+
+
+async def permits(
+    ctx: AuthContext, *any_of: Permission, resource: ResourceRef | None = None
+) -> bool:
+    """Whether ``authorize`` lets the call through, as a predicate.
+
+    A workspace outside the caller's visibility is "not allowed" too: a
+    predicate catching only ``AuthorizationError`` would let its ``404``
+    escape and tell that the workspace exists (CP-ADR-0082 §3.7).
+    """
+    try:
+        await authorize(ctx, *any_of, resource=resource)
+    except (AuthorizationError, WorkspaceNotVisible):
+        return False
+    return True
+
+
+class _InWorkspace(Protocol):
+    id: uuid.UUID
+    workspace_id: uuid.UUID | None
+
+
+async def permits_task(ctx: AuthContext, *any_of: Permission, task: _InWorkspace) -> bool:
+    """``permits`` on a task, its workspace in the caller's sight.
+
+    ``authorize`` with a task resource asks about permissions only: the
+    workspace of the task is a row the authorizer does not read. A predicate
+    over a task read from the database asks this instead (CP-ADR-0082 §3.7).
+    """
+    if not ctx.sees_workspace(task.workspace_id):
+        return False
+    return await permits(ctx, *any_of, resource=ResourceRef("task", str(task.id)))
 
 
 @dataclass(frozen=True)
@@ -173,6 +258,23 @@ class Authorizer:
     ) -> None:
         if not any_of:
             raise ValueError("authorize() needs at least one action")
+        await self._authorize(
+            ctx, any_of, resource=resource, contextual=contextual, consistency=consistency
+        )
+        # Permissions first: a missing right stays a 403, visibility does not
+        # mask it (CP-ADR-0082 §3.6).
+        if resource is not None and resource.type == "workspace":
+            check_workspace_visible(ctx, resource.id)
+
+    async def _authorize(
+        self,
+        ctx: AuthContext,
+        any_of: tuple[Permission, ...],
+        *,
+        resource: ResourceRef | None,
+        contextual: Sequence[ContextualTuple],
+        consistency: Literal["default", "strong"],
+    ) -> None:
         target = resource or tenant_resource(ctx)
 
         if ctx.purpose_ref is not None:
@@ -216,8 +318,20 @@ class Authorizer:
         """Objects of ``resource_type`` on which ``action`` is allowed.
 
         ``None`` means "no restriction beyond the flat permission": local and
-        shadow modes, and legacy credentials in policy mode.
+        shadow modes, and legacy credentials in policy mode — unless the
+        caller is in ``members`` mode, when workspaces are narrowed to the
+        visible set in every mode (CP-ADR-0082 §3.4).
         """
+        decided = await self._policy_objects(ctx, action, resource_type)
+        if resource_type != "workspace" or ctx.visible_workspaces is None:
+            return decided
+        if decided is None:
+            return set(ctx.visible_workspaces)
+        return decided & ctx.visible_workspaces
+
+    async def _policy_objects(
+        self, ctx: AuthContext, action: Permission | str, resource_type: str
+    ) -> set[str] | None:
         if self.mode != "policy" or self._client is None or ctx.policy_subject is None:
             return None
         name = action.value if isinstance(action, Permission) else action
@@ -374,14 +488,21 @@ async def visible_objects(
 
 __all__ = [
     "AUTHZ_MODES",
+    "VISIBILITIES",
+    "VISIBILITY_MEMBERS",
+    "VISIBILITY_TENANT",
     "AuthContext",
     "Authorizer",
     "AuthzMode",
     "ResourceRef",
     "SystemContext",
+    "WorkspaceNotVisible",
     "authorize",
+    "check_workspace_visible",
     "configure_authorizer",
     "get_authorizer",
+    "permits",
+    "permits_task",
     "require",
     "tenant_resource",
     "visible_objects",

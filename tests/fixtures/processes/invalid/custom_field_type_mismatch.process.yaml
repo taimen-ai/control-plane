@@ -1,0 +1,20 @@
+# expect: custom_field_type_mismatch /spec/stages/0/steps/0/human/customFields/decision
+apiVersion: taimen.ai/v1
+kind: Process
+key: sample
+spec:
+  version: 1
+  displayName: Sample
+  identity: {agent: sample-process}
+  owner: [{role: lead}]
+  data: {type: object, properties: {number: {type: string}, amount: {type: integer}, decision: {type: string}}}
+  start: {on: {observation: sample.opened}, key: event.payload.number, set: {number: "'1'"}}
+  stages:
+    - id: work
+      steps:
+        - id: decide
+          human:
+            taskType: review
+            assign: [{role: lead}]
+            customFields: {decision: data.amount}
+          output: {as: {decision: step.result.decision}}

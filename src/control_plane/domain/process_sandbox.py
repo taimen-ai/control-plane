@@ -25,6 +25,15 @@ what the engine asks for:
 - **nested processes** (``call: {process}``) run in the same sandbox;
 - **time** is virtual: ``advance: P3D`` fires the timers that fall due in
   order, each at its own moment;
+- **rules that close the task an observation is bound to** (``WorkRule``
+  with ``target: task``, CP-ADR-0063 amendment Zh5): ``emit: {observation,
+  task: <step>}`` binds the observation to the newest task of that step, as
+  the ``task`` of an observation binds it in the core; each such rule of the
+  package whose trigger matches is evaluated — its condition, ``taskTypes``,
+  the status of the task — and completes or cancels the task, which the
+  process then sees as it would see its executor finish it. The sandbox has
+  no verification stage, identities or claims: a completed task is done at
+  once. ``expect: {rules: [...]}`` reads the decisions since the last expect;
 - **the trial run on a stand** (``given.fromInstance``, P014) starts from a
   copy of a live instance's state, read by the caller into ``World.live``:
   the test goes on from where the instance is, nothing of it is written back.
@@ -56,7 +65,22 @@ from control_plane.domain import process_engine as engine
 from control_plane.domain import process_replay, process_sla, process_steps
 from control_plane.domain.calendar import Calendar
 from control_plane.domain.cel_profile import ExpressionError, environment, parse_iso_duration
+from control_plane.domain.package_settings import (
+    effective,
+    references,
+    validate,
+)
 from control_plane.domain.process_definition import SkillEntry, step_kind
+from control_plane.domain.project import secret_findings
+from control_plane.domain.work_rules import (
+    BASE_ROOTS,
+    ActionKind,
+    ConditionError,
+    VarPath,
+    evaluate,
+    trigger_matches,
+    walk,
+)
 
 JsonSchema = Mapping[str, Any]
 
@@ -105,7 +129,14 @@ class World:
     catalog's latest versions for nested calls; ``skills`` by
     ``name@version``; ``task_types`` — the ``fieldSchema`` by key; ``agents``
     and ``roles`` — keys that exist; ``calendars`` by key; ``live`` — the
-    instances the tests start from (``given.fromInstance``) by id.
+    instances the tests start from (``given.fromInstance``) by id; ``rules``
+    — the package's rules that close the task of an observation.
+
+    ``settings_schema`` — the settings schema the files of the package under
+    test declare (``None``: none declared, CP-ADR-0081 §6); ``known_refs`` —
+    the ``(x-ref kind, value)`` of the test values the organization has in
+    use; ``other_settings`` — the effective settings of the catalog's
+    processes the package calls, by key.
     """
 
     definitions: Mapping[str, engine.Definition]
@@ -116,6 +147,12 @@ class World:
     calendars: Mapping[str, Calendar] = field(default_factory=dict)
     live: Mapping[str, LiveInstance] = field(default_factory=dict)
     writes: Callable[[], int] = lambda: 0
+    settings_schema: JsonSchema | None = None
+    known_refs: frozenset[tuple[str, str]] = frozenset()
+    other_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Rules of the package the sandbox evaluates (``target: task``), normalized
+    # ``{trigger, condition, interpretation, action}`` by key.
+    rules: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -204,14 +241,19 @@ class _Task:
     assignee: str | None
     due: str | None
     status: str = "open"
+    # Filled from the case by the step (human.customFields).
+    custom_fields: dict[str, Any] = field(default_factory=dict)
 
     def out(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "step": self.element,
             "status": self.status,
             "assignee": self.assignee,
             "due": self.due,
         }
+        if self.custom_fields:
+            out["customFields"] = self.custom_fields
+        return out
 
 
 @dataclass
@@ -223,6 +265,14 @@ class _Approval:
     approver: str
     excluded: tuple[str, ...]
     status: str = "pending"
+
+
+# A task of the sandbox as a rule's ``task`` view reads it: (status, category).
+_TASK_STATES = {
+    "open": ("todo", "active"),
+    "completed": ("done", "terminal_success"),
+    "cancelled": ("cancelled", "terminal_cancelled"),
+}
 
 
 def _link(item: Mapping[str, Any]) -> str:
@@ -348,12 +398,20 @@ class Sandbox:
         self.events: list[dict[str, Any]] = []
         self.seen_events = 0
         self.remembered: list[dict[str, Any]] = []
+        self.rule_decisions: list[dict[str, Any]] = []
+        self.seen_rules = 0
         self.decisions: list[tuple[str, engine.Decision]] = []
         self.journals: dict[str, list[dict[str, Any]]] = {}
         self.queue: deque[tuple[str, str, dict[str, Any], str | None]] = deque()
         self.made = 0
         self.inputs = 0
         self.used: dict[tuple[str, str], int] = {}
+        # The settings of the package as the sandbox saves them: version 0 — nothing saved.
+        self.settings_version = 0
+        self.saved_settings: dict[str, Any] = {}
+        self.settings_history: dict[int, dict[str, Any]] = {}
+        if given.get("settings") is not None:
+            self.save_settings(given["settings"], "given.settings")
 
     # --- ids and inputs ---------------------------------------------------------------
 
@@ -375,10 +433,62 @@ class Sandbox:
                 raise _Abort(f"the test fed the engine more than {MAX_INPUTS} inputs")
             self.take(self.instances[instance_id], kind, body, actor)
 
+    # --- settings of the package (CP-ADR-0081 §6) ----------------------------------------
+
+    def save_settings(self, values: Any, where: str) -> None:
+        """A saving of the settings as ``PUT`` checks it: a new version in the temporary history."""
+        schema = self.world.settings_schema
+        if schema is None:
+            raise _Abort(
+                f"{where}: settings_not_declared — the package declares no settings",
+                expected="spec.settings in package.yaml",
+            )
+        if not isinstance(values, Mapping):
+            raise _Abort(f"{where}: settings_invalid — the values are an object", actual=values)
+        found = secret_findings(values)
+        if found:
+            raise _Abort(
+                f"{where}: secret_material_rejected — settings hold no secrets", actual=found
+            )
+        errors = validate(values, schema)
+        if errors:
+            raise _Abort(
+                f"{where}: settings_invalid — the values do not match the settings schema",
+                actual=errors,
+            )
+        missing = [
+            {"path": ref.path, "ref": ref.kind}
+            for ref in references(values, schema)
+            if (ref.kind, ref.value) not in self.world.known_refs
+        ]
+        if missing:
+            raise _Abort(
+                f"{where}: unknown_ref — a value references an object the organization"
+                " does not have in use",
+                actual=missing,
+            )
+        if json.dumps(values, sort_keys=True) == json.dumps(self.saved_settings, sort_keys=True):
+            return  # the same values: no new version
+        self.settings_version += 1
+        self.saved_settings = json.loads(json.dumps(values))
+        self.settings_history[self.settings_version] = self.saved_settings
+
+    def settings_of(
+        self, definition: engine.Definition
+    ) -> tuple[Mapping[str, Any] | None, int | None]:
+        """The effective settings a step of ``definition`` reads, and their version."""
+        if not definition.reads_settings:
+            return None, None
+        if definition.key in self.world.other_settings:
+            return self.world.other_settings[definition.key], None
+        schema = self.world.settings_schema or {}
+        return effective(self.saved_settings, schema), self.settings_version
+
     def take(
         self, instance: _Instance, kind: str, body: Mapping[str, Any], actor: str | None
     ) -> None:
-        given = engine.Input(kind, self.clock, body, actor, self.calendars)
+        settings, version = self.settings_of(instance.definition)
+        given = engine.Input(kind, self.clock, body, actor, self.calendars, settings=settings)
         before = instance.state
         state, decisions, intents = engine.step(instance.definition, before, given)
         # The state goes through JSON as a live one goes through jsonb.
@@ -399,6 +509,8 @@ class Sandbox:
             calendars={},
             decisions=[d.out() for d in decisions],
             intents=[i.out() for i in intents],
+            settings_version=version,
+            settings_schema_revision=None,
         )
         journal = self.journals.setdefault(instance.id, [])
         journal.extend(entries[: len(entries) - len(intents)])
@@ -491,6 +603,16 @@ class Sandbox:
 
     def do_create_task(self, instance: _Instance, body: dict[str, Any]) -> None:
         assignee = self.resolve(body.get("assign") or (), "assign")
+        prefill = dict(body.get("customFields") or {})
+        if prefill and body.get("taskType") is not None:
+            # As the core's create_task: the fields against the type's fieldSchema.
+            errors = _schema_errors(self.world.task_types.get(body["taskType"]), prefill)
+            if errors:
+                raise _Refused(
+                    "custom_fields_invalid",
+                    422,
+                    f"customFields of task type {body['taskType']}: {'; '.join(errors)}",
+                )
         task = _Task(
             id=self.new_id("task"),
             instance=instance.id,
@@ -499,6 +621,7 @@ class Sandbox:
             task_type=body.get("taskType"),
             assignee=assignee,
             due=body.get("due"),
+            custom_fields=prefill,
         )
         self.tasks.append(task)
         instance.refs[f"task:{task.id}"] = {"activity": task.activity, "element": task.element}
@@ -530,7 +653,8 @@ class Sandbox:
         record = {
             "id": task.id,
             "status": "done",
-            "customFields": output,
+            # The task keeps what the step filled in, as a task of the core does.
+            "customFields": {**task.custom_fields, **output},
             "assigneeId": by if by is not None else task.assignee,
         }
         self.queue.append(
@@ -837,12 +961,15 @@ class Sandbox:
         return instance
 
     def emit(self, spec: Mapping[str, Any]) -> None:
+        # ``by`` is the author of the event, as the journal's ``actor_id``: the
+        # core feeds it to the instances as the actor of their input too
+        actor = str(spec["by"]) if spec.get("by") is not None else None
         event: dict[str, Any] = {
             "id": self.new_id("event"),
             "time": _rfc3339(self.clock),
             "entityType": None,
             "entityId": None,
-            "actorId": None,
+            "actorId": actor,
             "correlationId": None,
             "payload": dict(spec.get("payload") or {}),
         }
@@ -851,9 +978,13 @@ class Sandbox:
             event["observation"] = spec["observation"]
             if spec.get("source") is not None:
                 event["source"] = spec["source"]
+            if spec.get("task") is not None:
+                event["payload"]["taskId"] = self.task_of(str(spec["task"])).id
         else:
+            if spec.get("task") is not None:
+                raise _Abort("emit.task binds an observation to a task; an event has its own")
             event["type"] = spec["event"]
-        started = engine.start_key(self.process, event)
+        started = engine.start_key(self.process, event, self.settings_of(self.process)[0])
         if started is not None:
             existing = next(
                 (
@@ -864,16 +995,100 @@ class Sandbox:
                 None,
             )
             target = existing or self.new_root()
-            self.queue.append((target.id, "start", {"instanceId": target.id, "event": event}, None))
+            self.queue.append(
+                (target.id, "start", {"instanceId": target.id, "event": event}, actor)
+            )
         for instance in list(self.instances.values()):
             state = instance.state
             if not state or state["status"] in engine.CLOSED:
                 continue
             if instance.definition is self.process and state["key"] == started:
                 continue  # the start input already correlated it
-            if state["key"] in engine.correlation_keys(instance.definition, event):
-                self.queue.append((instance.id, "event", {"event": event}, None))
+            reads = self.settings_of(instance.definition)[0]
+            if state["key"] in engine.correlation_keys(instance.definition, event, reads):
+                self.queue.append((instance.id, "event", {"event": event}, actor))
         self.drain()
+        if event.get("observation") is not None:
+            for key in sorted(self.world.rules):
+                self.apply_rule(key, self.world.rules[key], event)
+            self.drain()
+
+    # --- rules that close the task of an observation (CP-ADR-0063 Zh5) --------------
+
+    def task_of(self, element: str) -> _Task:
+        tasks = [t for t in self.tasks if t.element == element]
+        if not tasks:
+            raise _Abort(f"emit.task: step {element!r} has no task")
+        return tasks[-1]
+
+    def apply_rule(self, key: str, rule: Mapping[str, Any], event: Mapping[str, Any]) -> None:
+        """One rule on one observation, as the core decides it (Zh3), identities aside."""
+        payload = {**event["payload"], "kind": event["observation"]}
+        if event.get("source") is not None:
+            payload["source"] = event["source"]
+        if not trigger_matches(rule["trigger"], "observation.recorded", payload):
+            return
+        if rule.get("interpretation") is not None:
+            raise _Abort(
+                f"rule {key!r} interprets its facts with a skill: "
+                "the sandbox does not run the interpretation of a rule"
+            )
+        action = rule["action"]
+        decision: dict[str, Any] = {"rule": key, "action": action["kind"]}
+        self.rule_decisions.append(decision)
+        task = next((t for t in self.tasks if t.id == payload.get("taskId")), None)
+        view = None
+        if task is not None:
+            decision["step"] = task.element
+            status, category = _TASK_STATES[task.status]
+            view = {
+                "id": task.id,
+                "typeKey": task.task_type,
+                "status": status,
+                "systemStatusCategory": category,
+                "assigneeId": task.assignee,
+            }
+        documents = {
+            "trigger": {"kind": "observation", "type": event["observation"], "ref": event["id"]},
+            "payload": payload,
+            "goal": None,
+            "task": view,
+            # The effective settings of the package under test (CP-ADR-0081 §6).
+            "settings": effective(self.saved_settings, self.world.settings_schema or {}),
+        }
+
+        def resolve(path: VarPath) -> Any:
+            return walk(documents.get(path.root), path.segments)
+
+        try:
+            matched = evaluate(rule.get("condition", True), resolve, roots=BASE_ROOTS)
+        except ConditionError as exc:
+            decision.update(result="failed", reason="rule_condition_error", detail=str(exc))
+            return
+        if not matched:
+            decision["result"] = "not_matched"
+            return
+        if payload.get("taskId") is None:
+            decision.update(result="skipped", reason="no_bound_task")
+            return
+        if task is None:
+            decision.update(result="failed", reason="bound_task_not_found")
+            return
+        if task.task_type not in (action.get("taskTypes") or ()):
+            decision.update(result="skipped", reason="bound_task_type_not_listed")
+            return
+        if task.status != "open":
+            reason = "already_done" if task.status == "completed" else "already_closed"
+            decision.update(result="skipped", reason=reason)
+            return
+        decision["result"] = "matched"
+        if action["kind"] == ActionKind.COMPLETE_WORK:
+            self.finish_task(task, {}, None)
+        else:
+            task.status = "cancelled"
+            self.queue.append(
+                (task.instance, "task", {"activityId": task.activity, "status": "cancelled"}, None)
+            )
 
     def pending_timers(self) -> list[tuple[datetime, int, str, dict[str, Any]]]:
         found = []
@@ -931,7 +1146,8 @@ class Sandbox:
             task.status = "cancelled"
             self.feed(task.instance, "task", {"activityId": task.activity, "status": "cancelled"})
             return
-        output = dict(spec.get("output") or {})
+        # What the person enters goes over what the step filled in.
+        output = {**task.custom_fields, **dict(spec.get("output") or {})}
         if task.task_type is not None:
             errors = _schema_errors(self.world.task_types.get(task.task_type), output)
             if errors:
@@ -995,7 +1211,7 @@ class Sandbox:
         def fail(message: str, expected: Any, actual: Any) -> None:
             failures.append(Failure(index, message, expected, actual))
 
-        state = self.root() if set(spec) - {"events", "noSideEffects", "memory"} else None
+        state = self.root() if set(spec) - {"events", "noSideEffects", "memory", "rules"} else None
         if state is not None:
             self.expect_state(state, spec, fail)
         for key, wanted in (spec.get("sla") or {}).items():
@@ -1009,6 +1225,12 @@ class Sandbox:
                 else:
                     fail(f"no event {wanted} since the last expect", wanted, emitted)
         self.seen_events = len(self.events)
+        if "rules" in spec:
+            decided = self.rule_decisions[self.seen_rules :]
+            for wanted in spec["rules"]:
+                if not any(_contains(wanted, decision) for decision in decided):
+                    fail("no decision of a rule like this since the last expect", wanted, decided)
+        self.seen_rules = len(self.rule_decisions)
         memory = spec.get("memory") or {}
         if "recalled" in memory:
             recalled = sorted(
@@ -1129,7 +1351,14 @@ class Sandbox:
                 task.assignee is not None and self.holds(who, task.assignee)
             ):
                 return False
-        return "due" not in wanted or _same_time(wanted["due"], task.due)
+        if "due" in wanted and not _same_time(wanted["due"], task.due):
+            return False
+        # Only the fields named are compared.
+        fields = wanted.get("customFields") or {}
+        return all(
+            name in task.custom_fields and _same(value, task.custom_fields[name])
+            for name, value in fields.items()
+        )
 
 
 def run_test(world: World, file: str, test: Mapping[str, Any]) -> TestResult:
@@ -1179,7 +1408,9 @@ def run_test(world: World, file: str, test: Mapping[str, Any]) -> TestResult:
 
 
 def _run_step(sandbox: Sandbox, index: int, step: Mapping[str, Any]) -> list[Failure]:
-    if "emit" in step:
+    if "settings" in step:
+        sandbox.save_settings(step["settings"], f"steps[{index}].settings")
+    elif "emit" in step:
         sandbox.emit(step["emit"])
     elif "advance" in step:
         sandbox.advance(str(step["advance"]))

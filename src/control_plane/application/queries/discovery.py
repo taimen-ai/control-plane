@@ -18,7 +18,7 @@ from sqlalchemy.orm import aliased
 
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands.eligibility import explain_claim_eligibility
-from control_plane.application.commands.relations import resolve_task, unmet_prerequisites
+from control_plane.application.commands.relations import resolve_task, shown_prerequisites
 from control_plane.application.commands.task_inputs import missing_required_inputs
 from control_plane.application.commands.task_types import task_type_lifecycle, task_type_of
 from control_plane.application.commands.verification import OPEN_STATUSES, open_attempt
@@ -29,8 +29,9 @@ from control_plane.application.common import (
     utcnow,
 )
 from control_plane.application.queries import projects as project_queries
-from control_plane.application.queries.approval_gates import pending_gate_approvals
+from control_plane.application.queries.approval_gates import gate_reason, shown_gate_approvals
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.visibility import workspace_condition
 from control_plane.domain.enums import (
     ApprovalStatus,
     ClaimStatus,
@@ -49,6 +50,7 @@ from control_plane.infrastructure.db.models import (
     Task,
     TaskClaim,
     TaskRelation,
+    TaskType,
     TaskVerification,
 )
 
@@ -58,6 +60,9 @@ _PRIORITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 # available work may contain FEWER than `limit` items while still carrying a
 # nextCursor — clients keep paging until nextCursor is null.
 _SCAN_FACTOR = 3
+
+#: How many ``typeKey`` values one listing may carry.
+MAX_TYPE_KEYS = 50
 
 
 def _priority_rank_expr() -> Any:
@@ -153,6 +158,7 @@ async def list_available_work(
     project_id: uuid.UUID | None = None,
     include_subprojects: bool = False,
     assignee_id: uuid.UUID | None = None,
+    type_keys: list[str] | None = None,
 ) -> tuple[list[Task], str | None]:
     """Tasks the calling principal could claim now (advisory, priority-first).
 
@@ -165,15 +171,28 @@ async def list_available_work(
     and still be meant for one worker — so this is a filter and not part of
     eligibility. An autonomous runner uses it to take only what was handed to
     it, rather than whatever happens to be at the top of the queue.
+
+    ``type_keys`` narrows the queue to tasks of these types, any version: an
+    executor that runs only some types must not page through everyone else's
+    work to find its own (CP-ADR-0056, amendment 2026-10-03).
     """
     await authorize(ctx, Permission.TASKS_READ)
     effective_limit = clamp_limit(limit)
+    if type_keys is not None and (
+        len(type_keys) > MAX_TYPE_KEYS or any(not key.strip() for key in type_keys)
+    ):
+        raise ValidationError(
+            "invalid_type_key",
+            f"typeKey must be non-blank, at most {MAX_TYPE_KEYS} values",
+            details={"count": len(type_keys)},
+        )
 
     workspace_ids: list[uuid.UUID] | None = None
     if workspace_id is not None:
         if include_descendants:
             workspace_ids = await workspace_subtree_ids(session, ctx.tenant_id, workspace_id)
-            if not workspace_ids:
+            # An invisible workspace answers as a missing one (CP-ADR-0082 §3.7).
+            if not workspace_ids or not ctx.sees_workspace(workspace_id):
                 raise NotFoundError(
                     "Workspace not found", details={"workspaceId": str(workspace_id)}
                 )
@@ -193,9 +212,20 @@ async def list_available_work(
     if await project_queries.has_archived_projects(session, ctx.tenant_id):
         excluded = await project_queries.archived_project_workspace_ids(session, ctx.tenant_id)
 
-    stmt = _candidate_statement(ctx.tenant_id, workspace_ids, excluded)
+    # Work of the caller's visible workspaces only, as GET /tasks (CP-ADR-0082 §4).
+    stmt = _candidate_statement(ctx.tenant_id, workspace_ids, excluded).where(
+        workspace_condition(ctx, Task.workspace_id)
+    )
     if assignee_id is not None:
         stmt = stmt.where(Task.assignee_id == assignee_id)
+    if type_keys is not None:
+        stmt = stmt.where(
+            Task.type_id.in_(
+                select(TaskType.id).where(
+                    TaskType.tenant_id == ctx.tenant_id, TaskType.key.in_(sorted(set(type_keys)))
+                )
+            )
+        )
     rank = _priority_rank_expr()
     if cursor is not None:
         data = decode_cursor(cursor)
@@ -307,17 +337,22 @@ async def explain_task_claimability(
                     }
                 )
 
-    blocking = await unmet_prerequisites(session, ctx.tenant_id, task.id)
-    if blocking:
-        reasons.append({"code": "task_not_ready", "blockedBy": blocking})
+    blocking, hidden = await shown_prerequisites(session, ctx, task.id)
+    if blocking or hidden:
+        reason: dict[str, Any] = {"code": "task_not_ready", "blockedBy": blocking}
+        if hidden:
+            # Blockers outside the caller's visibility, counted, not named
+            # (CP-ADR-0082 V4).
+            reason["hiddenBlockers"] = hidden
+        reasons.append(reason)
 
     missing_inputs = await missing_required_inputs(session, ctx.tenant_id, task)
     if missing_inputs:
         reasons.append({"code": "input_missing", "missing": missing_inputs})
 
-    gates = await pending_gate_approvals(session, ctx.tenant_id, task.id)
-    if gates:
-        reasons.append({"code": "approval_required", "pendingApprovals": gates})
+    gates, hidden_gates = await shown_gate_approvals(session, ctx, task.id)
+    if gates or hidden_gates:
+        reasons.append({"code": "approval_required", **gate_reason(gates, hidden_gates)})
 
     verification = await open_attempt(session, task.id)
     if verification is not None:

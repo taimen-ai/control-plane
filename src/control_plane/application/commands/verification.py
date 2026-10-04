@@ -26,8 +26,8 @@ the checks in the order they are declared:
   such checks, run before its acceptance on every completion;
 * **evidence** — an ``external_state`` check, and a ``deterministic`` one
   without a skill, passes by evidence of the task tied to it (with ``event``,
-  an observation of that kind); none after ``external_timeout`` is
-  ``no_result``;
+  an observation of that kind) and not spent by an earlier attempt; none
+  after ``external_timeout`` is ``no_result``;
 * **human, llm_judge** — a person's decision on a gate approval of the task:
   the approval whose ``completeTask`` outcome handed the task in counts at
   once, as does a gate approved after the attempt opened; otherwise the
@@ -48,6 +48,7 @@ Core knows tasks, checks, skills, evidence and approvals here — never what
 is checked or what a tenant does with it.
 """
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -72,6 +73,11 @@ from control_plane.application.commands.approval_outcomes import (
 )
 from control_plane.application.commands.artifact_types import latest_artifact_type
 from control_plane.application.commands.principals import ensure_core_principal
+from control_plane.application.commands.role_references import (
+    is_role_reference,
+    require_declared_role,
+    role_for_task,
+)
 from control_plane.application.commands.skill_invocations import (
     CANCELLED_BY_SYSTEM,
     LIVE_STATUSES,
@@ -85,6 +91,7 @@ from control_plane.application.commands.tasks import mark_task_completed
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_principal_key_share
+from control_plane.application.visibility import with_visibility
 from control_plane.domain.approval_outcomes import Path, expressions_in, render
 from control_plane.domain.artifact_schema import CONTENT_REQUIRED
 from control_plane.domain.artifact_type import media_type_allowed
@@ -181,6 +188,47 @@ async def open_attempt(session: AsyncSession, task_id: uuid.UUID) -> TaskVerific
     return row
 
 
+def _fact_identity(item: dict[str, Any]) -> str:
+    """One fact tied to one check, whatever its note says."""
+    return json.dumps({k: v for k, v in item.items() if k != "note"}, sort_keys=True)
+
+
+def _spend(task: Task, row: TaskVerification) -> None:
+    """A closing attempt spends the facts tied to checks the task has now."""
+    row.spent_evidence = [
+        {k: v for k, v in item.items() if k != "note"}
+        for item in task.evidence or []
+        if item.get("check") is not None
+    ]
+
+
+async def current_evidence(
+    session: AsyncSession, task: Task, row: TaskVerification
+) -> list[dict[str, Any]]:
+    """The task's evidence the attempt ``row`` may count (CP-ADR-0063 Zh7).
+
+    A fact tied to a check that was on the task when an earlier attempt
+    closed is spent: work handed in anew after a failed attempt needs a new
+    fact, not the one the rejected work was checked on. Facts without a
+    check are not spent — no check reads them.
+    """
+    documents = (
+        await session.scalars(
+            select(TaskVerification.spent_evidence).where(
+                TaskVerification.task_id == task.id,
+                TaskVerification.attempt < row.attempt,
+                TaskVerification.spent_evidence.is_not(None),
+            )
+        )
+    ).all()
+    spent = {_fact_identity(item) for document in documents for item in document or []}
+    return [
+        item
+        for item in task.evidence or []
+        if item.get("check") is None or _fact_identity(item) not in spent
+    ]
+
+
 async def latest_attempts(
     session: AsyncSession, tenant_id: uuid.UUID, task_ids: list[uuid.UUID]
 ) -> dict[uuid.UUID, TaskVerification]:
@@ -248,6 +296,13 @@ async def check_acceptance_skills(
     """
     ahead = list(before or [])
     for index, check in enumerate(checks):
+        role = (check.get("spec") or {}).get("approverRole")
+        if is_role_reference(role):
+            # A role of the package by slug (CP-ADR-0061, amendment
+            # 2026-10-01): the tenant has it, or nobody could be asked.
+            await require_declared_role(
+                session, ctx.tenant_id, role, field=f"{field}[{index}].spec.approverRole"
+            )
         if check["kind"] != CheckKind.DETERMINISTIC:
             continue
         spec = check.get("spec") or {}
@@ -369,6 +424,7 @@ async def cancel_open_attempt(session: AsyncSession, ctx: AuthContext, task: Tas
     # cancelled the task.
     await _stop_call(session, _authority_context(locked, ctx.trace_run_id), locked, ATTEMPT_CLOSED)
     now = utcnow()
+    _spend(task, locked)
     locked.status = CANCELLED
     locked.next_check_at = None
     locked.finished_at = now
@@ -464,7 +520,8 @@ async def execute_verification(
     row = await _lock_row(session, verification_id)
     if row is None or row.status not in OPEN_STATUSES:
         return row
-    ctx = _authority_context(row, trace_run_id)
+    # The completer acts within their visibility as it stands now (CP-ADR-0082 V2).
+    ctx = await with_visibility(session, _authority_context(row, trace_run_id))
     if task.system_status_category in TERMINAL_CATEGORIES:
         # Closed under the attempt by a path that did not cancel it.
         await cancel_open_attempt(session, ctx, task)
@@ -714,7 +771,7 @@ async def _decision_basis(
         correlation_id=row.correlation_id,
         trace_run_id=trace_run_id,
     )
-    return caller, approval.id
+    return await with_visibility(session, caller), approval.id
 
 
 async def _render_inputs(
@@ -843,8 +900,15 @@ async def _evidence_check(
     spec: dict[str, Any],
     timing: Timing,
 ) -> _Outcome:
-    """Evidence of the task tied to the check — read fresh, it may arrive late."""
-    tied = [item for item in task.evidence or [] if item.get("check") == check["key"]]
+    """Evidence of the task tied to the check — read fresh, it may arrive late.
+
+    Only facts not spent by an earlier attempt count (:func:`current_evidence`).
+    """
+    tied = [
+        item
+        for item in await current_evidence(session, task, row)
+        if item.get("check") == check["key"]
+    ]
     wanted = spec.get("event")
     if wanted:
         tied = [item for item in tied if await _observation_of_kind(session, task, item, wanted)]
@@ -1028,11 +1092,24 @@ async def _request_decision(
         await _core_context(session, task, ctx, Permission.APPROVALS_MANAGE),
         task_ref=str(task.id),
         workspace_id=task.workspace_id,
-        required_role_id=uuid.UUID(str(role)) if role else None,
+        required_role_id=await _approver_role(session, ctx, task, role),
         assigned_principal_id=uuid.UUID(str(principal)) if principal else None,
         comment="\n".join(lines)[:MAX_APPROVAL_COMMENT],
         gate=True,
     )
+
+
+async def _approver_role(
+    session: AsyncSession, ctx: AuthContext, task: Task, role: Any
+) -> uuid.UUID | None:
+    """``approverRole``: a role id, or ``role:<slug>`` seen from the task's workspace."""
+    if not role:
+        return None
+    if is_role_reference(role):
+        return await role_for_task(
+            session, ctx, str(role), workspace_id=task.workspace_id, field="spec.approverRole"
+        )
+    return uuid.UUID(str(role))
 
 
 async def _person_to_ask(session: AsyncSession, task: Task) -> uuid.UUID | None:
@@ -1150,6 +1227,7 @@ async def _pass(
 ) -> TaskVerification:
     """Every check passed: the task is done — in this transaction, with its events."""
     now = utcnow()
+    _spend(task, row)
     row.status = PASSED
     row.next_check_at = None
     row.finished_at = now
@@ -1189,6 +1267,7 @@ async def _fail(
             check, FAILED, evidence=outcome.evidence, reason=outcome.reason, message=outcome.message
         ),
     ]
+    _spend(task, row)
     row.status = FAILED
     row.next_check_at = None
     row.finished_at = now

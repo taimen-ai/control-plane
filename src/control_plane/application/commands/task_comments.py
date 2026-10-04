@@ -21,6 +21,7 @@ from control_plane.application.commands._child_ceiling import enforce_run_ceilin
 from control_plane.application.commands.relations import resolve_task
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.visibility import artifact_visible, task_visible
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -191,7 +192,9 @@ async def _check_provenance(
         run = await session.scalar(
             select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
         )
-        if run is None:
+        # Of invisible work, a run is a missing one, not a mismatch that tells
+        # it exists (CP-ADR-0082 §3.7).
+        if run is None or not await task_visible(session, ctx, run.task_id):
             raise NotFoundError("Run not found", details={"runId": str(run_id)})
         await enforce_run_ceiling(session, ctx, run=run, permission=Permission.TASKS_WRITE)
         if run.task_id != task.id:
@@ -205,7 +208,7 @@ async def _check_provenance(
         artifact = await session.scalar(
             select(Artifact).where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
         )
-        if artifact is None:
+        if artifact is None or not await artifact_visible(session, ctx, artifact):
             raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
         if artifact.task_id != task.id:
             raise ValidationError(

@@ -11,7 +11,12 @@ TASK-000456) — `fields.customFields` у заводящих действий; �
 на элемент, связи у `ensure_work`, `typeKey`/`typeVersion` задачи в фактах
 (Г1–Г6, реализация — C005); амендмент 2026-09-27 (process-packages, P012 —
 TASK-000728) — `fields.workspaceId` и назначение на роль `role:<slug>` у
-заводящих действий (Д1–Д3)
+заводящих действий (Д1–Д3); амендмент 2026-09-29 (integrations-connections,
+I001 — TASK-000988) — `complete_work` / `cancel_work` с `target: task`:
+работа, привязанная наблюдением (Ж1–Ж5, реализация — I013); амендмент
+2026-09-30 (TASK-001205, исправление Ж по ревью I013) — фильтр автора в
+триггере, права автора на задачу, факты текущей попытки (Ж6–Ж7); амендмент
+2026-10-04 (TASK-001373) — каноническая форма `action` без пустого `fields` (З1)
 
 Контекст: TAI-ADR-0036; ADR-0057 (внешние наблюдения — вход правил);
 ADR-0062 (origin `rule` + `ruleId` + evidence — выход правил); ADR-0056
@@ -119,7 +124,9 @@ JSON-равенство (`true ≠ 1`); сравнение порядка — т
 ### 3. Триггеры и чтение журнала
 
 - `observation` — `{"kind": "observation", "type": "<kind наблюдения>",
-  "source"?}`: событие `observation.recorded` с этим `kind` (и `source`).
+  "source"?, "agent"?, "actorId"?}`: событие `observation.recorded` с этим
+  `kind` (и `source`), записанное этим автором (`agent`, `actorId` —
+  амендмент Ж6). `source` — слово самого автора, автор — запись журнала.
 - `event` — `{"kind": "event", "type": "<тип события журнала>"}`. Типы
   `rule.*`, `work.*` и `skill.invocation_*` запрещены
   (`422 invalid_rule_trigger`), `observation.recorded` — через вид
@@ -992,6 +999,311 @@ role}`), это ошибка команды, а не отказ элемента
 - `api/v1/rules.py`: маршрут `GET /rule-evaluations/{evaluation_id}`.
 - Тесты: `tests/integration/test_rule_evaluation_read.py`.
 
+## Амендмент 2026-09-29 (integrations-connections, I001): закрытие работы по задаче, привязанной наблюдением
+
+Основание: фича `integrations-connections` (spec/plan в суперпроекте, дизайн
+TASK-000915, ворота одобрены владельцем 2026-09-29; plan, Р6; FR-013, SC-003).
+Решение записано в I001 (TASK-000988), реализуется в I013. Буквы `А`…`Е` уже
+заняты, поэтому пункты нумеруются `Ж`. Существующие правила работают без
+изменений: новое поле необязательно, а без него поведение прежнее.
+
+**Проблема.** `complete_work` и `cancel_work` находят работу только по ключу
+дедупликации через журнал `rule_work_items` (п.5). Закрыть можно лишь ту
+работу, которую завело правило с тем же ключом. Задачу, заведённую процессом,
+человеком или правилом другого пакета, закрыть нельзя, хотя наблюдение прямо
+называет её. Так устроена проекция работы во внешнюю систему (TAI-ADR-0061
+п.9): коннектор знает id задачи ядра по своей внешней ссылке и пишет
+наблюдение о закрытии с полем `task` (ADR-0057). Общий ключ дедупликации между
+правилом, которое заводит работу, и правилом, которое её закрывает,
+отвергнут: он не закрывает задачи процессов и ломается при любой правке шаблона
+ключа.
+
+### Ж1. Поле `target`
+
+У `complete_work` и `cancel_work` появляется необязательное поле **`target`**:
+`dedup` (по умолчанию, поведение п.5 и А1) или **`task`**. При `target: task`
+работа — **задача, к которой привязано наблюдение-триггер**: `payload.taskId`
+события `observation.recorded`. Наблюдение получает его из поля `task` (id или
+`publicId`) или из задачи своего `runId` при записи (ADR-0057). Это та же
+задача, что правило уже видит в корне `task` (п.2).
+
+```yaml
+action:
+  kind: complete_work
+  target: task
+  taskTypes: [crm-deal-review]
+  check: closed-in-crm
+```
+
+### Ж2. Проверки при записи правила
+
+`422 invalid_rule_action`, `details.field` — путь, если не сказано иначе:
+
+- `target` — `dedup` или `task`, только у `complete_work` и `cancel_work`
+  (`action.target`);
+- при `target: task`:
+  - триггер правила — `observation` (`action.target`). У события ядра и у
+    расписания нет наблюдения, которое привязало бы задачу. Задачу события
+    ядра правило видит в `task`, но закрывать её по чужому событию — другое
+    решение, в этот амендмент оно не входит;
+  - **`taskTypes`** обязателен (1…20 ключей без повторов, форма Г2). Каждый
+    ключ существует с активной версией (`422 unknown_task_type`,
+    `details.field = action.taskTypes[i]`). Это граница того, что правило
+    вправе закрывать: наблюдение называет задачу само, и без списка типов
+    правило закрыло бы любую задачу, которую факт назвал;
+  - `dedupKeyTemplate`, `forEach` и `where` не допускаются: работа одна, и её
+    называет факт, а не ключ. Ключ дедупликации для закрытия не нужен;
+  - `check` (`complete_work`) — как в А1.
+- `taskTypes` у `complete_work` и `cancel_work` без `target: task` — `422
+  invalid_rule_action` (`action.taskTypes`), как и раньше (Г2).
+
+### Ж3. Исполнение
+
+Оценка проверяет по порядку. Первая непрошедшая проверка даёт итог:
+
+1. У наблюдения нет `payload.taskId` — `skipped: no_bound_task`.
+2. Задачи нет или полномочия правила (п.6, Г1) не могут её читать —
+   `failed: bound_task_not_found` (`details.taskId`). Невидимое не отличается
+   от отсутствующего, как у `_open_work`.
+3. Ключ типа задачи (`task.typeKey`, Г4) вне `taskTypes` —
+   `skipped: bound_task_type_not_listed` (`details: {taskId, typeKey}`). Это
+   не сбой правила: наблюдатель пишет факты о задачах разных типов, и к этому
+   правилу факт не относится. Код отдельный, а не `task_type_not_allowed`:
+   тот уже занят отказом элемента `forEach` у заводящих действий (Г2, Г5) и
+   означает сбой элемента, а здесь итог — пропуск. Отсечь их заранее автор может условием
+   `{in: [{var: task.typeKey}, [...]]}`.
+4. У полномочий правила нет `tasks.write` на задаче (её workspace, authorizer
+   API) — `failed: bound_task_forbidden` (`details: {taskId, workspaceId,
+   permission: tasks.write}`). Правило workspace A закрывает задачу в B, только
+   если его личность вправе писать задачи в B, как у заведения работы в чужой
+   workspace (Д1). Отдельного права «правило закрывает чужое» нет. Для
+   ожидания claim (А4) нужно ещё `claims.manage`, как и раньше.
+5. Задача уже в `terminal_success` — `skipped: already_done`, в
+   `terminal_cancelled` — `skipped: already_closed` (коды А4). Повторное
+   наблюдение не даёт ни второй попытки, ни дублей evidence.
+6. `complete_work`: у задачи открыта попытка проверки, и в evidence задачи
+   уже есть факт с тем же `check` **этой попытки** (Ж7) —
+   `skipped: verification_pending`.
+   Наблюдатель может прислать второй факт о той же задаче с другим ключом
+   дедупликации источника (досверка, переоткрытие и повторное закрытие во
+   внешней системе); в открытую попытку он не добавляется. Задача, сданная
+   исполнителем без этого факта, получает его, и попытка просыпается (А1).
+
+«Пропуск» (`skipped`) — итог оценки: `rule_evaluations.status = skipped`,
+`result.skipped = {reason, taskId?, typeKey?}`, ошибки нет; evidence не
+пишется, попытка проверки не открывается. Отказ (`failed`) — итог `failed`
+с кодом в `error.code`. Проверки 2–6 делаются под блокировкой строки задачи,
+поэтому два наблюдения об одной задаче в одном проходе закрывают её один раз:
+второе видит либо открытую попытку с фактом, либо завершённую задачу.
+
+Дальше всё как у `target: dedup`:
+
+- задача блокируется `FOR UPDATE` до записи (п.5). Advisory-lock ключа
+  дедупликации не берётся: ключа нет, а сериализует строка задачи;
+- `complete_work` дописывает evidence оценки (наблюдение-триггер, артефакт
+  скилла) с `check` и запускает завершение **через стадию проверки**
+  (ADR-0067): попытка с `trigger = rule`, `triggerRef =
+  rule_evaluation:<id>`, неявный критерий `rule-evidence`, если своих
+  критериев нет. Работа уже сдана — только evidence и `wake_on_evidence` (А1,
+  реализация T004). Открытый gate — `approval_required` (амендмент
+  TASK-000444);
+- `cancel_work` — первый достижимый статус `terminal_cancelled`, evidence без
+  `check` (А3); сданная на проверку за время ожидания —
+  `skipped: verification_pending`;
+- живой claim — запрос отмены run, ожидание и применение ровно один раз (А4).
+  На возобновлении задача берётся заново по `taskId` из элемента `work[]`, и
+  проверки 2–6 повторяются: за время ожидания могли смениться права или
+  статус. Пропуск после ожидания — тоже итог `skipped` оценки.
+
+Evidence закрытия — наблюдение (ст. VII): задача, закрытая по факту во внешней
+системе, отвечает «на каком факте» без чтения журнала.
+
+### Ж4. След
+
+- Элемент `work[]` оценки, `rule.evaluated` и `work.reconciled` несут
+  `target: task`. Их `dedupKey` — псевдоключ `task:<taskId>`, а не `null`: в
+  схеме `work.reconciled` это обязательная строка, и тип поля не меняется.
+  Payload только расширяется необязательным полем `target` (ADR-0068: версии
+  лишь добавляют поля).
+- `rule_work_items` не пишется: правило работу не заводило, и псевдоключ в
+  журнал ключей не попадает. `dependsOn` другого правила на него не
+  разрешается.
+
+### Ж5. Пакеты и песочница
+
+Вид `WorkRule` несёт тело API без перевода (п.11), поэтому `target` —
+поле `action` в схеме пакетов `v1` (I018). Тесты пакетов (`POST
+/packages:test`, CP-ADR-0074) позволяют наблюдению сослаться на
+задачу, заведённую раньше в том же тесте: шаг `emit: {observation, task:
+<id шага>}` привязывает наблюдение к последней задаче этого шага процесса
+(как поле `task` наблюдения в ядре). Правила пакета с `target: task`
+проверяются как `POST /rules` (находка — с файлом и строкой) и исполняются в
+песочнице на каждом наблюдении теста: триггер, условие (`trigger`,
+`payload`, `task`), проверки 1, 3, 5 из Ж3 — и задача шага завершается или
+отменяется, а процесс видит это как завершение исполнителем. Решения
+читаются шагом `expect: {rules: [{rule, result, reason, step}]}` — с
+прошлого `expect`. В песочнице нет личностей, claim и стадии проверки:
+проверки 2 и 4 и ожидание claim в ней не делаются, завершённая задача сразу
+`done`. Правило с `interpretation` песочница не исполняет — тест падает с
+объяснением. Остальные правила пакета (заведение и сверка по ключу) в
+песочнице по-прежнему не исполняются. Поля `emit.task` и `expect.rules` —
+в схеме тестов пакетов `v1` (копия ядра `package_test.schema.json` равна
+схеме суперпроекта). Проверяемый сценарий — «задача,
+заведённая правилом другого пакета или процессом, закрыта наблюдением»
+(I013). Первый потребитель — правило `crm-review-closed` пакета `crm`:
+наблюдение `crm.task_completed` → `complete_work target: task`, `taskTypes:
+[crm-deal-review]`, `check: closed-in-crm`.
+
+Ядро по-прежнему не знает, какие системы и типы бывают: кто привязывает
+наблюдение к задаче, какие типы закрываются и каким критерием — данные пакета.
+
+## Амендмент 2026-09-30 (TASK-001205): чьи факты закрывают работу и какой попытке они служат
+
+Основание: ревью I013 (TASK-001000, `feature/integrations-connections`).
+Это исправление принятого решения Ж, а не новая возможность: без него
+`target: task` — дыра. Пункты продолжают букву `Ж`.
+
+**Проблема 1.** Наблюдение с `task` привязывалось к любой задаче tenant'а
+(ADR-0057), и права автора на неё не проверялись. Правило отбирало
+наблюдения по `type` и `source`, а `source` автор задаёт сам. Поэтому
+поддельный факт от любого раннера или харнесса с `observations.write`
+закрывал любую задачу из `taskTypes` правила, а evidence закрытия ссылалось
+на подделку.
+
+**Проблема 2.** Проверка 6 из Ж3 искала факт с тем же `check` во всём
+evidence задачи. Если попытку проверки отклонили и работу сдали заново, новое
+закрытие во внешней системе пропускалось как `verification_pending`, а новую
+попытку удовлетворял старый факт — тот, на котором уже проверяли отклонённую
+работу.
+
+### Ж6. Автор факта
+
+1. **Права автора на задачу.** Наблюдение, привязанное к задаче (поле `task`
+   или задача `runId`), требует у автора `tasks.read` на этой задаче — тот же
+   вопрос authorizer'у (PDP в режиме `policy`), что и чтение задачи
+   (`GET /tasks/{id}`); отказ — `403`, как у чтения, до записи события и до
+   занятия ключа дедупликации. Подробности — амендмент ADR-0057.
+2. **Фильтр автора в триггере `observation`:**
+   - `agent` — ключ агента реестра (ADR-0073; форма
+     `^[a-z0-9][a-z0-9-]{0,62}$`). Наблюдение подходит, если его автор
+     (`events.actor_id`) — principal этого агента. Агент без principal (не
+     связан), выведенный из оборота или неизвестный не пишет ничего: правило
+     не срабатывает. При записи правила агент должен существовать и быть
+     активным (`422 unknown_agent`, `details.field = trigger.agent`);
+   - `actorId` — id principal'а-автора (UUID, хранится в канонической форме);
+   - оба поля вместе — должны выполниться оба; неверная форма — `422
+     invalid_rule_trigger` (`trigger.agent` / `trigger.actorId`). У триггеров
+     `event` и `schedule` этих полей нет (`422 invalid_rule_trigger`, как для
+     любого лишнего ключа).
+
+   Фильтр проверяется при отборе событий, как `type` и `source`: чужое
+   наблюдение не порождает оценку вовсе. Автора называет журнал
+   (аутентифицированный контекст, ADR-0057), клиент подделать его не может.
+3. **`actorId` в факте.** Корень `trigger` факта события (п.2) несёт
+   `actorId` — автора события из журнала или `null`, если его нет (события
+   системы). Условие может читать его: `{eq: [{var: trigger.actorId},
+   {const: …}]}`. Для прочих правил это только новое поле факта.
+4. **`target: task` требует фильтр автора.** Правило с `target: task` без
+   `trigger.agent` и без `trigger.actorId` отвергается при записи (`POST`,
+   `PATCH`, пакет): `422 invalid_rule_trigger`, `details.field =
+   trigger.agent`. Правило, сохранённое до этого амендмента без фильтра,
+   ничего не закрывает: каждая его оценка — `skipped:
+   trigger_author_unfiltered`, evidence не пишется. Это касается и оценки,
+   начатой до амендмента и ждавшей снятия claim (Ж3): когда она дождалась,
+   фильтр правила проверяется снова, и без него итог тот же — пропуск
+   (TASK-001215). Правила `target: dedup`
+   фильтр не требуют: они закрывают только ту работу, что завело правило с
+   тем же ключом.
+5. **Песочница пакетов (Ж5).** В ней нет личностей, поэтому фильтр автора
+   там не проверяется (как проверки 2 и 4 из Ж3), но правило пакета без него
+   отвергается при проверке, как в `POST /rules`. Парная правка пакета `crm`
+   (I022, TASK-001009): правило `crm-review-closed` получает `trigger.agent`
+   — агента-наблюдателя пакета.
+
+### Ж7. Факты текущей попытки
+
+Факт, привязанный к критерию (`check`), служит одной попытке проверки.
+Закрываясь (`passed`, `failed`, `cancelled`), попытка **расходует** факты,
+которые в этот момент привязаны к критериям в evidence задачи: их
+указатели без `note` сохраняются в `task_verifications.spent_evidence`
+(миграция `d7e3a9c5b2f1`). Следующая попытка той же задачи их не считает:
+
+- проверка критерия по evidence (ADR-0067, `external_state` и
+  `deterministic` без скилла) видит только нерасходованные факты. Работа,
+  сданная заново после отклонения, ждёт нового факта (или истечения
+  `external_timeout` — `no_result`);
+- проверка 6 из Ж3 (`verification_pending`) тоже смотрит только на
+  нерасходованные факты: новое закрытие во внешней системе после повторной
+  сдачи дописывается в evidence и будит попытку, а не пропускается.
+
+Факт, записанный до открытия попытки, но после закрытия предыдущей, —
+факт этой попытки: правило пишет evidence и затем открывает попытку в одной
+транзакции (Ж3). Evidence без `check` не расходуется — его не читает ни один
+критерий. Сами записи evidence задачи не меняются: история «на каком факте»
+остаётся в задаче, а попытка, прошедшая по факту, цитирует его в своих
+`results`. Попытки, закрытые до миграции (`spent_evidence = NULL`), ничего не
+расходуют.
+
+Проверки: `tests/integration/test_rules_bound_task.py` —
+`test_a_fact_of_another_author_does_not_close_the_task`,
+`test_the_agent_filter_takes_the_facts_of_that_agent_only`,
+`test_a_rule_stored_without_an_author_closes_nothing`,
+`test_a_bound_rule_must_name_the_author_it_trusts`,
+`test_an_author_binds_a_fact_only_to_a_task_it_may_read`,
+`test_a_local_author_without_tasks_read_binds_no_fact`,
+`test_work_handed_in_anew_after_a_failed_attempt_needs_a_new_fact`;
+`tests/unit/test_work_rules_domain.py` — форма фильтра и его сопоставление.
+
+## Амендмент 2026-10-04 (TASK-001373): каноническая форма `action` без пустого `fields`
+
+Основание: staging, 3 октября 2026. План установщика пакетов (package-sdk)
+после каждого применения пакета selfdev показывал
+`~ WorkRule/oss-check-resolved (selfdev): will change action` и то же для
+`submodule-lag-resolved`. Это единственные правила пакета с закрывающим
+действием (`complete_work`).
+
+**Причина.** Ядро сохраняло и отдавало `action` с членом `"fields": {}`,
+даже если в документе правила его нет. У `cancel_work` и `complete_work`
+`fields` запрещены, поэтому член там был всегда, и всегда пустой. Установщик,
+запущенный без кода ядра (`PYTHONPATH=package-sdk/src`, без extra `sandbox`,
+как в runbook staging), сравнивает `action` из файла с ответом
+`GET /rules/{id}` как есть. Разница не исчезала. `PATCH` с тем же
+действием версию не поднимал: нормализованный документ совпадал с
+сохранённым. Поэтому следующий план снова видел ту же разницу.
+
+### З1. Пустой `fields` — не член формы
+
+1. `normalize_action` оставляет `fields` только непустым объектом. Действие
+   без полей (закрывающее — всегда; `update_work` — если полей нет), как и
+   действие с явным `fields: {}`, сохраняется, отдаётся (`GET /rules`,
+   `POST /rules`, `PATCH /rules/{id}`) и сравнивается без этого члена.
+   Значение `fields`, которое не является объектом, по-прежнему отвергается:
+   `invalid_rule_action`, `details.field = action.fields`.
+2. Каноническая форма — то, что пишет автор. Документ правила, прочитанный
+   обратно, равен файлу пакета, а нормализация идемпотентна: повторный
+   `PATCH` сохранённой формы ничего не меняет. Это верно и для
+   `packages:plan` ядра, и для установщика — с кодом ядра или без него.
+3. Миграция `822493698a3a` убирает `"fields": {}` из `work_rules.action`.
+   Версия правила не меняется: поведение правила то же. Откат возвращает
+   пустой член во все действия, где его нет, — форму прежнего кода.
+   Читатели `action` (оценка правил, песочница, проверки ссылок) и раньше
+   принимали отсутствие `fields` как `{}`.
+4. Контракт API: в OpenAPI `action` — свободный объект, схема не меняется.
+   Меняется только форма ответа: клиент не должен ждать `fields` у действия
+   без полей.
+
+Не входит: установщик без кода ядра сравнивает документы, не приводя их к
+канонической форме. Любое будущее значение по умолчанию в форме ядра снова
+даст ложную разницу. Это задача package-sdk (сравнивать формы,
+нормализованные одинаково), а не ядра.
+
+Проверки: `tests/integration/test_package_rule_action_form.py` — повторный
+план после применения не меняет закрывающих правил
+(`test_a_repeated_plan_after_the_apply_changes_no_closing_rule`), путь
+установщика сходится за одно применение, явный `fields: {}`, миграция туда и
+обратно; `tests/unit/test_work_rules_domain.py` — форма действия как
+написано и идемпотентность нормализации.
+
 ## Conformance
 
 Пробы для `adr.conformance_check` (пилот «саморазработка»):
@@ -1027,4 +1339,16 @@ role}`), это ошибка команды, а не отказ элемента
 - grep: {path: tests/integration/test_rules_target_workspace.py, pattern: 'test_work_goes_to_the_workspace_and_the_role_the_item_names'}
 - grep: {path: src/control_plane/api/v1/rules.py, pattern: '"/rule-evaluations/\{evaluation_id\}"'}
 - grep: {path: tests/integration/test_rule_evaluation_read.py, pattern: 'test_the_evaluation_that_filed_a_task_reads_in_one_call'}
+- grep: {path: src/control_plane/domain/work_rules.py, pattern: 'TASK = "task"'}
+- grep: {path: src/control_plane/application/commands/rule_evaluations.py, pattern: 'async def _act_on_bound_task\('}
+- grep: {path: tests/integration/test_rules_bound_task.py, pattern: 'test_an_observation_closes_the_task_a_process_filed'}
+- grep: {path: tests/integration/test_rules_bound_task.py, pattern: 'test_a_second_observation_adds_no_fact_to_the_open_attempt'}
+- grep: {path: src/control_plane/domain/process_sandbox.py, pattern: 'def apply_rule\('}
+- grep: {path: src/control_plane/domain/work_rules.py, pattern: 'def author_matches\('}
+- grep: {path: src/control_plane/application/commands/rule_evaluations.py, pattern: 'TRIGGER_AUTHOR_UNFILTERED = "trigger_author_unfiltered"'}
+- grep: {path: src/control_plane/application/commands/verification.py, pattern: 'async def current_evidence\('}
+- grep: {path: tests/integration/test_rules_bound_task.py, pattern: 'test_a_fact_of_another_author_does_not_close_the_task'}
+- grep: {path: tests/integration/test_rules_bound_task.py, pattern: 'test_work_handed_in_anew_after_a_failed_attempt_needs_a_new_fact'}
+- grep: {path: tests/integration/test_package_rule_action_form.py, pattern: 'test_a_repeated_plan_after_the_apply_changes_no_closing_rule'}
+- grep: {path: tests/integration/test_rules_bound_task.py, pattern: 'test_a_decision_waiting_under_an_unfiltered_rule_closes_nothing'}
 ```

@@ -51,7 +51,7 @@
 только на коммите `main` без фичи и меняют коммит здесь и в `recordedWith`.
 
 ```sh
-git worktree add /tmp/cp-main <коммит main>   # рядом должны лежать ../platform-auth-sdk и ../memory-service
+git worktree add /tmp/cp-main <коммит main>   # рядом должны лежать ../../sdk/platform-auth-sdk и ../memory-service
 cp tests/fixtures/process_journals/recorder.py /tmp/cp-main/tests/integration/test_record_process_journals.py
 cd /tmp/cp-main && uv sync --frozen
 PROCESS_JOURNALS_OUT=<каталог> PROCESS_JOURNALS_COMMIT=<коммит main> \

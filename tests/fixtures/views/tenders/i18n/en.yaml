@@ -1,0 +1,9 @@
+tenders.board.title: Tenders
+tenders.board.inProgress: In progress
+tenders.board.totalPrice: Total starting price
+tenders.card.title: Tender
+tenders.card.procurement: Procurement
+tenders.fields.procurement.number: Number
+tenders.fields.procurement.law: Law
+tenders.fields.procurement.maxPrice: Starting price
+tenders.fields.procurement.customer: Customer

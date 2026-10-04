@@ -54,6 +54,7 @@ from control_plane import observability
 from control_plane.application.authorization import AuthContext, ResourceRef, authorize
 from control_plane.application.common import utcnow
 from control_plane.application.queries.org import role_assignment_scope
+from control_plane.application.visibility import approval_condition, workspace_condition
 from control_plane.domain.enums import ApprovalStatus, Permission, RunStatus
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -212,7 +213,11 @@ def failing_score(*, failures: int, priority: str) -> int:
 
 
 def _task_scope(scope: Scope) -> list[ColumnElement[bool]]:
-    conditions: list[ColumnElement[bool]] = [Task.tenant_id == scope.ctx.tenant_id]
+    conditions: list[ColumnElement[bool]] = [
+        Task.tenant_id == scope.ctx.tenant_id,
+        # Work of the caller's visible workspaces only (CP-ADR-0082 §4).
+        workspace_condition(scope.ctx, Task.workspace_id),
+    ]
     if scope.workspaces is not None:
         conditions.append(Task.workspace_id.in_(scope.workspaces))
     if scope.entity_id is not None:
@@ -272,6 +277,7 @@ def _approval_fetch(*, gate: bool) -> RuleFetch:
                 Approval.status == ApprovalStatus.PENDING,
                 Approval.gate.is_(gate),
                 await _eligible_approvals(session, scope),
+                approval_condition(scope.ctx),
             )
             .order_by(Approval.created_at, Approval.id)
             .limit(limit)
@@ -393,6 +399,7 @@ async def _undecidable(
         Approval.status == ApprovalStatus.PENDING,
         Approval.required_role_id.is_not(None),
         func.jsonb_array_length(Approval.excluded_principals) > 0,
+        approval_condition(scope.ctx),
     ]
     if scope.workspaces is not None:
         candidates.append(Approval.workspace_id.in_(scope.workspaces))
@@ -715,7 +722,8 @@ async def _workspace_scope(
     from control_plane.application.commands.workspaces import workspace_subtree_ids
 
     subtree = await workspace_subtree_ids(session, ctx.tenant_id, workspace_id)
-    if not subtree:
+    # An invisible workspace answers as a missing one (CP-ADR-0082 §3.6).
+    if not subtree or not ctx.sees_workspace(workspace_id):
         raise NotFoundError("Workspace not found", details={"workspaceId": str(workspace_id)})
     return subtree if include_descendants else [workspace_id]
 

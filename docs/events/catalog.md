@@ -37,6 +37,8 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`agent.identity_replaced`](#agentidentity_replaced) | `agent` | 1 | A service agent moved to a new IAM identity; its principal stayed (CP-ADR-0073). |
 | [`agent.retired`](#agentretired) | `agent` | 1 | An agent was retired: stopped, binding revoked, history kept. |
 | [`agent.revision_published`](#agentrevision_published) | `agent` | 1 | A new immutable revision of an agent spec was published (CP-ADR-0073 §2). |
+| [`agent.secret_deleted`](#agentsecret_deleted) | `agent` | 1 | A secret of an agent was deleted with every version from the secret store (CP-ADR-0079 §11). |
+| [`agent.secret_set`](#agentsecret_set) | `agent` | 1 | A secret of an agent was set by name (CP-ADR-0079 §11): the value went to the secret store in transit; the event carries the name only. |
 | [`agent.state_changed`](#agentstate_changed) | `agent` | 1 | The desired state or replica count of an agent changed; no new revision. |
 | [`agent.status_changed`](#agentstatus_changed) | `agent` | 1 | The observed state of an agent changed: phase, reason, node or revision. |
 | [`api_key.break_glass_issued`](#api_keybreak_glass_issued) | `api_key` | 1 | A short-lived break-glass key was issued from the host shell (CP-ADR-0065). |
@@ -62,26 +64,37 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`capability.revoked`](#capabilityrevoked) | `principal` | 1 | A capability was revoked from the principal. |
 | [`claim.expired`](#claimexpired) | `claim` | 1 | The lease of a claim ran out. |
 | [`claim.released`](#claimreleased) | `claim` | 1 | The claim on a task ended: completed, released, cancelled or superseded. |
+| [`connection.authorization_failed`](#connectionauthorization_failed) | `connection` | 1 | An OAuth callback of a live state did not connect: consent denied, a provider error, an invalid account, the initiator no longer authorized or a failed exchange. The status of the connection did not change. |
+| [`connection.authorized`](#connectionauthorized) | `connection` | 1 | A connection became active: the OAuth code was exchanged in the secret store or a key of the connection was entered. No value, no account, no provider text. |
+| [`connection.created`](#connectioncreated) | `connection` | 1 | A connection was created (CP-ADR-0079 §3); it waits for authorization. |
+| [`connection.revoked`](#connectionrevoked) | `connection` | 1 | A connection was revoked (CP-ADR-0079 §10): its material is deleted from the secret store and no agent's policy names it any more. A repeated revocation records nothing. |
+| [`connection.status_changed`](#connectionstatus_changed) | `connection` | 1 | The status of a connection moved without a new authorization — the connector reported that access is lost. Codes only, no text of the provider. |
+| [`connection.updated`](#connectionupdated) | `connection` | 1 | The display name, settings or type version of a connection changed; only the names of the changed fields, never their values. |
+| [`connection_type.oauth_app_set`](#connection_typeoauth_app_set) | `connection_type` | 1 | The OAuth application of a connection type was written to the secret store; neither the client id nor the secret is in the event. |
+| [`connection_type.published`](#connection_typepublished) | `connection_type` | 1 | A version of a connection type was published (CP-ADR-0079 §2); a repeat of the same spec records nothing. |
 | [`context_adapter.rebuilt`](#context_adapterrebuilt) | `event_consumer` | 1 | The memory context adapter was rewound to rebuild its projection. |
 | [`context_adapter.redriven`](#context_adapterredriven) | `event_consumer` | 1 | The memory context adapter was redriven past a parked event. |
 | [`delegation.created`](#delegationcreated) | `delegation` | 1 | A human delegated permissions to an agent. |
 | [`delegation.revoked`](#delegationrevoked) | `delegation` | 2 | A delegation was revoked. |
 | [`event_journal.archived`](#event_journalarchived) | `event_journal` | 1 | Journal events were moved to the archive (ADR-0038). |
+| [`event_journal.exported`](#event_journalexported) | `event_journal` | 1 | The journal was exported for a period (CP-ADR-0068, export amendment): the filters of the export and the number of events, never the events themselves. Written before the body is streamed. |
 | [`event_journal.pruned`](#event_journalpruned) | `event_journal` | 1 | Archived journal events were deleted. |
 | [`goal.created`](#goalcreated) | `goal` | 1 | A goal was created (CP-ADR-0062). |
 | [`goal.updated`](#goalupdated) | `goal` | 1 | Goal attributes or its status changed. |
-| [`iam_binding.created`](#iam_bindingcreated) | `iam_binding` | 1 | An IAM identity was bound to a local principal (CP-ADR-0053). |
+| [`iam_binding.created`](#iam_bindingcreated) | `iam_binding` | 2 | An IAM identity was bound to a local principal (CP-ADR-0053). |
 | [`iam_binding.revoked`](#iam_bindingrevoked) | `iam_binding` | 1 | An IAM binding was revoked; the identity no longer enters. |
-| [`iam_binding.updated`](#iam_bindingupdated) | `iam_binding` | 1 | The permissions of an IAM binding changed. |
+| [`iam_binding.updated`](#iam_bindingupdated) | `iam_binding` | 2 | The permissions or the visibility of an IAM binding changed. |
 | [`knowledge.changed`](#knowledgechanged) | `workspace` | 1 | A knowledge snapshot opened, changed or closed documents in memory (CP-ADR-0076 §6); an empty reconciliation writes no event. |
 | [`knowledge.document_stored`](#knowledgedocument_stored) | `workspace` | 1 | A knowledge base document was stored in the memory service (CP-ADR-0060, amendment 2026-09-28); its text stays out of the journal. |
 | [`knowledge.pack_registered`](#knowledgepack_registered) | `knowledge_pack` | 2 | A domain knowledge pack version was registered. |
 | [`knowledge.packs_configured`](#knowledgepacks_configured) | `workspace` | 1 | The knowledge packs of a workspace tree were configured. |
 | [`knowledge.snapshot_reconciled`](#knowledgesnapshot_reconciled) | `workspace` | 1 | A knowledge snapshot was reconciled into the memory service (CP-ADR-0060). |
 | [`observation.recorded`](#observationrecorded) | `observation` | 1 | An observation was recorded (ADR-0057). |
+| [`package.settings_changed`](#packagesettings_changed) | `package` | 1 | The settings of a package have a new version: a PUT /packages/{key}/settings saved other values. No value is in the event — neither the old, the new nor the defaults; who may read them reads GET /packages/{key}/settings/versions (CP-ADR-0081 §5). |
 | [`principal.created`](#principalcreated) | `principal` | 1 | A principal (human, agent or service) was created. |
 | [`principal.disabled`](#principaldisabled) | `principal` | 1 | A human or agent principal was disabled: bindings and delegations revoked, sessions closed, claims freed, runs failed. |
 | [`principal.enabled`](#principalenabled) | `principal` | 1 | A disabled (or paused) human or agent principal was enabled. Only the status comes back: bindings, delegations, sessions and claims closed by :disable stay closed, IAM entry needs a new binding. |
+| [`principal.updated`](#principalupdated) | `principal` | 1 | The display name or the profile of a principal changed (CP-ADR-0082). Names of the changed fields only, never their values: read them via GET /principals/{id}. |
 | [`process.cancelled`](#processcancelled) | `process_instance` | 1 | An operator cancelled the instance. |
 | [`process.compensated`](#processcompensated) | `process_instance` | 1 | Compensations of completed steps ran in reverse order. |
 | [`process.completed`](#processcompleted) | `process_instance` | 1 | The instance completed with an outcome. |
@@ -157,7 +170,7 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`skill.invocation_failed`](#skillinvocation_failed) | `skill_invocation` | 1 | The invocation failed for good. |
 | [`skill.invocation_requested`](#skillinvocation_requested) | `skill_invocation` | 1 | The core was asked to invoke a skill (CP-ADR-0056). |
 | [`skill.invocation_retry_scheduled`](#skillinvocation_retry_scheduled) | `skill_invocation` | 1 | The attempt failed with a retryable error; another one is scheduled. |
-| [`skill.invocation_succeeded`](#skillinvocation_succeeded) | `skill_invocation` | 1 | The invocation finished; its result is an artifact. |
+| [`skill.invocation_succeeded`](#skillinvocation_succeeded) | `skill_invocation` | 2 | The invocation finished; its result is an artifact. |
 | [`skill.registered`](#skillregistered) | `skill` | 1 | A skill version was registered. |
 | [`skill.revoked`](#skillrevoked) | `principal` | 1 | A skill was revoked. |
 | [`skill.updated`](#skillupdated) | `skill` | 1 | The description, status or implementation endpoint of a skill version changed. |
@@ -178,17 +191,19 @@ N+1 без изменений и игнорирует незнакомые по�
 | [`task.verification_failed`](#taskverification_failed) | `task` | 1 | An acceptance check failed; the task went back to its executor or got blocked. |
 | [`task.verification_started`](#taskverification_started) | `task` | 1 | A verification attempt of the task's acceptance checks opened (CP-ADR-0067). |
 | [`task.verified`](#taskverified) | `task` | 1 | Every acceptance check passed; the task is complete. |
-| [`task_type.created`](#task_typecreated) | `task_type` | 2 | A task type version was created (ADR-0048). |
+| [`task_type.created`](#task_typecreated) | `task_type` | 3 | A task type version was created (ADR-0048). |
 | [`task_type.deprecated`](#task_typedeprecated) | `task_type` | 1 | A task type version was deprecated. |
 | [`tenant.bootstrapped`](#tenantbootstrapped) | `tenant` | 1 | The tenant was created with its first administrator. |
+| [`view.published`](#viewpublished) | `view` | 1 | A view of a package is in use at a revision: published by a package apply, or brought back as it was; a console drops what it cached of the key (CP-ADR-0080). |
+| [`view.retired`](#viewretired) | `view` | 1 | A view of a package is out of use: the package that installed it no longer brings it (CP-ADR-0080). |
 | [`work.derived`](#workderived) | `task` | 1 | A rule derived new work. |
-| [`work.reconciled`](#workreconciled) | `task` | 1 | A rule updated, cancelled or completed the work it derived earlier. |
+| [`work.reconciled`](#workreconciled) | `task` | 1 | A rule updated, cancelled or completed work: the work it derived earlier, or the task an observation is bound to. |
 | [`workspace.archived`](#workspacearchived) | `workspace` | 1 | A workspace was archived. |
 | [`workspace.created`](#workspacecreated) | `workspace` | 1 | A workspace was created. |
 | [`workspace.member_added`](#workspacemember_added) | `workspace` | 1 | A principal became a member of the workspace. |
 | [`workspace.member_removed`](#workspacemember_removed) | `workspace` | 1 | A principal stopped being a member of the workspace. |
 | [`workspace.moved`](#workspacemoved) | `workspace` | 1 | A workspace moved under another parent. |
-| [`workspace.updated`](#workspaceupdated) | `workspace` | 1 | Workspace attributes changed. |
+| [`workspace.updated`](#workspaceupdated) | `workspace` | 2 | Workspace attributes changed. |
 | [`workspace_type.archived`](#workspace_typearchived) | `workspace_type` | 1 | A workspace type was archived. |
 | [`workspace_type.created`](#workspace_typecreated) | `workspace_type` | 1 | A workspace type was created. |
 | [`workspace_type.updated`](#workspace_typeupdated) | `workspace_type` | 1 | A workspace type changed. |
@@ -247,6 +262,33 @@ A new immutable revision of an agent spec was published (CP-ADR-0073 §2).
 | `executorKind` | string \| null | да | Null for an identity without placement |
 | `placed` | boolean | да | False for placement none |
 | `permissionsChanged` | boolean | да | Identity (roles, permissions, capabilities) differs from the previous one |
+
+### agent.secret_deleted
+
+A secret of an agent was deleted with every version from the secret store (CP-ADR-0079 §11).
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `agentKey` | string | да |  |
+| `name` | string | да |  |
+
+### agent.secret_set
+
+A secret of an agent was set by name (CP-ADR-0079 §11): the value went to the secret store in transit; the event carries the name only.
+
+Сущность: `agent`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `agentKey` | string | да |  |
+| `name` | string | да |  |
+| `created` | boolean | да | The first value under the name, not a replacement |
 
 ### agent.state_changed
 
@@ -715,6 +757,124 @@ The claim on a task ended: completed, released, cancelled or superseded.
 | `taskStatus` | string | нет |  |
 | `taskSystemStatusCategory` | string | нет |  |
 
+### connection.authorization_failed
+
+An OAuth callback of a live state did not connect: consent denied, a provider error, an invalid account, the initiator no longer authorized or a failed exchange. The status of the connection did not change.
+
+Сущность: `connection`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `type` | string | да |  |
+| `reason` | string | да | A code, e.g. consent_denied, oauth_exchange_failed |
+| `initiatedBy` | string (uuid) | да | The principal that started :authorize |
+
+### connection.authorized
+
+A connection became active: the OAuth code was exchanged in the secret store or a key of the connection was entered. No value, no account, no provider text.
+
+Сущность: `connection`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `type` | string | да |  |
+| `auth` | string | да |  |
+| `previousStatus` | string | да |  |
+| `connectedBy` | string (uuid) | да | The principal that connected it |
+
+### connection.created
+
+A connection was created (CP-ADR-0079 §3); it waits for authorization.
+
+Сущность: `connection`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `type` | string | да |  |
+| `typeVersion` | integer | да |  |
+| `status` | string | да |  |
+
+### connection.revoked
+
+A connection was revoked (CP-ADR-0079 §10): its material is deleted from the secret store and no agent's policy names it any more. A repeated revocation records nothing.
+
+Сущность: `connection`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `type` | string | да |  |
+| `previousStatus` | string | да | pending, active or expired: the status before the revocation |
+
+### connection.status_changed
+
+The status of a connection moved without a new authorization — the connector reported that access is lost. Codes only, no text of the provider.
+
+Сущность: `connection`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `type` | string | да |  |
+| `from` | string | да |  |
+| `to` | string | да |  |
+| `reason` | string \| null | да | A code, e.g. refresh_rejected |
+| `connectedBy` | string \| null (uuid) | да | Who connected it last; null if nobody has |
+
+### connection.updated
+
+The display name, settings or type version of a connection changed; only the names of the changed fields, never their values.
+
+Сущность: `connection`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `changes` | array | да | Names of the changed fields: displayName, settings, typeVersion |
+
+### connection_type.oauth_app_set
+
+The OAuth application of a connection type was written to the secret store; neither the client id nor the secret is in the event.
+
+Сущность: `connection_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `type` | string | да |  |
+| `created` | boolean | да | The first write, not a replacement |
+
+### connection_type.published
+
+A version of a connection type was published (CP-ADR-0079 §2); a repeat of the same spec records nothing.
+
+Сущность: `connection_type`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `auth` | array | да |  |
+
 ### context_adapter.rebuilt
 
 The memory context adapter was rewound to rebuild its projection.
@@ -791,6 +951,28 @@ Journal events were moved to the archive (ADR-0038).
 | `throughCursor` | string | да |  |
 | `minAgeSeconds` | integer | да |  |
 
+### event_journal.exported
+
+The journal was exported for a period (CP-ADR-0068, export amendment): the filters of the export and the number of events, never the events themselves. Written before the body is streamed.
+
+Сущность: `event_journal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `format` | string | да | jsonl or csv |
+| `types` | array | да | Event type prefixes of the filter; empty - every type |
+| `entityType` | string \| null | да |  |
+| `entityId` | string \| null (uuid) | да |  |
+| `actorId` | string \| null (uuid) | да | Author filter of the export, not its author |
+| `occurredFrom` | string (date-time) | да |  |
+| `occurredTo` | string (date-time) | да |  |
+| `workspaceId` | string \| null (uuid) | да |  |
+| `includeDescendants` | boolean \| null | да |  |
+| `events` | integer | да | Events the export holds |
+| `throughCursor` | string | да | Journal position the export reads up to |
+
 ### event_journal.pruned
 
 Archived journal events were deleted.
@@ -846,6 +1028,17 @@ An IAM identity was bound to a local principal (CP-ADR-0053).
 
 Сущность: `iam_binding`.
 
+Версия 2 (добавлено: visibility):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `issuer` | string | да |  |
+| `iamTenantId` | any | да |  |
+| `iamPrincipalId` | any | да |  |
+| `permissions` | array | да |  |
+| `visibility` | string | да | Visibility of the binding: the whole tenant or the workspaces of membership (CP-ADR-0082) |
+
 Версия 1:
 
 | Поле | Тип | Всегда | Описание |
@@ -872,9 +1065,21 @@ An IAM binding was revoked; the identity no longer enters.
 
 ### iam_binding.updated
 
-The permissions of an IAM binding changed.
+The permissions or the visibility of an IAM binding changed.
 
 Сущность: `iam_binding`.
+
+Версия 2 (добавлено: visibility):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `issuer` | string | да |  |
+| `iamTenantId` | any | да |  |
+| `iamPrincipalId` | any | да |  |
+| `permissions` | array | да |  |
+| `visibility` | string | да | Visibility of the binding: the whole tenant or the workspaces of membership (CP-ADR-0082) |
+| `previousPrincipalId` | string (uuid) | нет | Only when the identity moved from another principal |
 
 Версия 1:
 
@@ -1010,6 +1215,23 @@ An observation was recorded (ADR-0057).
 | `workspaceId` | string (uuid) | нет |  |
 | `supersedes` | string (uuid) | нет |  |
 
+### package.settings_changed
+
+The settings of a package have a new version: a PUT /packages/{key}/settings saved other values. No value is in the event — neither the old, the new nor the defaults; who may read them reads GET /packages/{key}/settings/versions (CP-ADR-0081 §5).
+
+Сущность: `package`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `package` | string | да | The key of the package |
+| `version` | integer | да | The new version of the values |
+| `previousVersion` | integer | да | The version before; 0 for the first saving |
+| `schemaRevision` | integer | да | The schema revision the values were checked by |
+| `changedPaths` | array | да | JSON Pointers of the members whose saved value changed |
+| `actorId` | string (uuid) | да |  |
+
 ### principal.created
 
 A principal (human, agent or service) was created.
@@ -1057,6 +1279,20 @@ A disabled (or paused) human or agent principal was enabled. Only the status com
 | `previousStatus` | string | да | disabled or paused |
 | `reason` | string \| null | да | Reason given; credential-shaped material redacted, cut to the limit |
 | `liveApiKeys` | integer | да | Unrevoked, unexpired API keys of it, which authenticate again |
+
+### principal.updated
+
+The display name or the profile of a principal changed (CP-ADR-0082). Names of the changed fields only, never their values: read them via GET /principals/{id}.
+
+Сущность: `principal`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `principalId` | string (uuid) | да |  |
+| `version` | integer | да | Version of the principal after the change |
+| `changes` | array | да | Changed fields: displayName, profile.<field> |
 
 ### process.cancelled
 
@@ -2420,6 +2656,20 @@ The invocation finished; its result is an artifact.
 
 Сущность: `skill_invocation`.
 
+Версия 2 (добавлено: outputs (CP-ADR-0072 amendment 2026-10-01)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `skillId` | string (uuid) | да |  |
+| `skill` | string | да |  |
+| `version` | any | да |  |
+| `attempt` | integer | да |  |
+| `taskId` | string \| null (uuid) | да |  |
+| `runId` | string \| null (uuid) | да |  |
+| `artifactId` | string \| null (uuid) | да |  |
+| `cost` | any | да |  |
+| `outputs` | array | да | Typed outputs of the executed task: {key, type, status (created | absent | missing | rejected), artifactId?, reason?}; empty unless this is the task's execution call |
+
 Версия 1:
 
 | Поле | Тип | Всегда | Описание |
@@ -2784,6 +3034,25 @@ A task type version was created (ADR-0048).
 
 Сущность: `task_type`.
 
+Версия 3 (добавлено: executorRoles (CP-ADR-0048, amendment 2026-10-03 A1)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `version` | integer | да |  |
+| `displayName` | string | да |  |
+| `initialStatus` | any | да |  |
+| `completionStatus` | any | да |  |
+| `execution` | any | да |  |
+| `declaresApprovalOutcomes` | boolean | да |  |
+| `declaresContextProfile` | boolean | да |  |
+| `declaresInstructions` | boolean | да |  |
+| `declaresCompletionWork` | boolean | да |  |
+| `declaresArtifactSchema` | boolean | да |  |
+| `inputs` | integer | да | Number of declared artifact inputs |
+| `outputs` | integer | да | Number of declared artifact outputs |
+| `executorRoles` | array | да | Slugs of the roles a person needs to take work of the version |
+
 Версия 2 (добавлено: declaresArtifactSchema, inputs, outputs (CP-ADR-0072)):
 
 | Поле | Тип | Всегда | Описание |
@@ -2847,6 +3116,39 @@ The tenant was created with its first administrator.
 | `iamBindingId` | string \| null (uuid) | да |  |
 | `iamPrincipalId` | any | да |  |
 
+### view.published
+
+A view of a package is in use at a revision: published by a package apply, or brought back as it was; a console drops what it cached of the key (CP-ADR-0080).
+
+Сущность: `view`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `revision` | integer | да |  |
+| `hash` | string | да | sha256 of the revision, as GET /views/{key} returns it |
+| `previousRevision` | integer \| null | да | The revision before; null for a new view |
+| `packageKey` | string \| null | да |  |
+| `packageVersion` | string \| null | да |  |
+
+### view.retired
+
+A view of a package is out of use: the package that installed it no longer brings it (CP-ADR-0080).
+
+Сущность: `view`.
+
+Версия 1:
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `key` | string | да |  |
+| `revision` | integer | да | The last revision of the view |
+| `reason` | string | да |  |
+| `packageKey` | string \| null | да |  |
+| `packageVersion` | string \| null | да |  |
+
 ### work.derived
 
 A rule derived new work.
@@ -2871,7 +3173,7 @@ A rule derived new work.
 
 ### work.reconciled
 
-A rule updated, cancelled or completed the work it derived earlier.
+A rule updated, cancelled or completed work: the work it derived earlier, or the task an observation is bound to.
 
 Сущность: `task`.
 
@@ -2891,6 +3193,7 @@ A rule updated, cancelled or completed the work it derived earlier.
 | `changes` | array | да |  |
 | `verificationId` | string (uuid) | нет |  |
 | `check` | any | нет |  |
+| `target` | string | нет |  |
 
 ### workspace.archived
 
@@ -2961,6 +3264,14 @@ A workspace moved under another parent.
 Workspace attributes changed.
 
 Сущность: `workspace`.
+
+Версия 2 (добавлено: taskTypes (CP-ADR-0008, amendment 2026-10-03 A2)):
+
+| Поле | Тип | Всегда | Описание |
+|---|---|---|---|
+| `changes` | any | да |  |
+| `version` | integer | да |  |
+| `taskTypes` | array \| null | нет | New own setting of the allowed task types, when it changed; null inherits from the ancestors |
 
 Версия 1:
 

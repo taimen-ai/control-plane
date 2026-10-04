@@ -1092,3 +1092,113 @@ async def test_without_an_owner_the_starter_hears_that_nobody_may_decide(
         await _attention(client, key)
     )
     assert all(entry[2] != approval_id for entry in await _attention(client, other_key))
+
+
+# --- human.customFields: the task filled from the case (amendment 2026-10-01) -------------
+
+PURCHASE_FIELDS = {
+    "type": "object",
+    "properties": {
+        "supplier": {"type": "string"},
+        "amount": {"type": "integer", "maximum": 1000},
+        "note": {"type": "string"},
+    },
+    "required": ["supplier", "amount"],
+}
+
+
+def _purchase(admin: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "displayName": "Sample purchase",
+        "identity": {"agent": AGENT},
+        "owner": [{"role": "lead"}],
+        "data": {
+            "type": "object",
+            "properties": {
+                "supplier": {"type": "string"},
+                "amount": {"type": "integer"},
+                "note": {"type": "string"},
+            },
+        },
+        "start": {"on": {"observation": "sample.purchase"}, "key": "event.payload.data.number"},
+        "stages": [
+            {
+                "id": "s",
+                "steps": [
+                    {
+                        "id": "check",
+                        "human": {
+                            "taskType": "purchase",
+                            "assign": [{"principal": admin}],
+                            "customFields": {
+                                "supplier": "data.supplier",
+                                "amount": "data.amount",
+                            },
+                        },
+                        "output": {
+                            "as": {"note": "step.result.note", "amount": "step.result.amount"}
+                        },
+                    },
+                    {"id": "done", "complete": {"outcome": "checked"}},
+                ],
+            }
+        ],
+    }
+
+
+async def test_a_human_step_fills_the_task_from_the_case(
+    client: httpx.AsyncClient, worker: Worker
+) -> None:
+    s = await _setup(client)
+    key = s["key"]
+    created = await client.post(
+        "/api/v1/task-types",
+        json={"key": "purchase", "displayName": "Purchase", "fieldSchema": PURCHASE_FIELDS},
+        headers=auth(key),
+    )
+    assert created.status_code == 201, created.text
+    await _publish(client, key, "sample-purchase", _purchase(s["admin"]))
+
+    instance = await _start(client, key, "sample-purchase", {"supplier": "Acme", "amount": 300})
+    assert instance["status"] == "running", instance
+    check = _open(instance, "check")
+    task = await _task(client, key, check["taskId"])
+    # The person does not retype what the case already knows.
+    assert task["customFields"] == {"supplier": "Acme", "amount": 300}
+
+    # What the person enters is added to what the step filled in.
+    await _complete(client, key, task["id"], {**task["customFields"], "note": "fine"})
+    await worker.run_once()
+    instance = await _instance(client, key, instance["id"])
+    assert instance["status"] == "completed"
+    assert (instance["data"]["note"], instance["data"]["amount"]) == ("fine", 300)
+
+
+async def test_fields_the_type_refuses_fail_the_step_and_file_nothing(
+    client: httpx.AsyncClient,
+) -> None:
+    s = await _setup(client)
+    key = s["key"]
+    created = await client.post(
+        "/api/v1/task-types",
+        json={"key": "purchase", "displayName": "Purchase", "fieldSchema": PURCHASE_FIELDS},
+        headers=auth(key),
+    )
+    assert created.status_code == 201, created.text
+    # Over the maximum of the type, and a required field the case does not know:
+    # a null leaves the field out, and the type requires it.
+    cases = {
+        "over-maximum": {"supplier": "Acme", "amount": 5000},
+        "unknown-supplier": {"amount": 10},
+    }
+    for process, data in cases.items():
+        await _publish(client, key, process, _purchase(s["admin"]))
+        instance = await _start(client, key, process, data)
+        assert instance["status"] == "failed", data
+        intents = await _journal(client, key, instance["id"], kind="intent")
+        [create] = [e for e in intents if e["data"]["intent"] == "create_task"]
+        assert create["data"]["executed"]["code"] == "custom_fields_invalid", create
+    tasks = await client.get("/api/v1/tasks", params={"typeKey": "purchase"}, headers=auth(key))
+    assert tasks.status_code == 200, tasks.text
+    assert tasks.json()["items"] == []

@@ -11,6 +11,7 @@ a separate, explicit action (``task_type_migration``, ADR-0048 amendment
 """
 
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,10 +19,17 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.commands.role_references import (
+    ROLE_REFERENCE_PREFIX,
+    is_role_reference,
+    normalize_executor_roles,
+    require_declared_role,
+)
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.domain.agent_instructions import validate_instructions
 from control_plane.domain.approval_outcomes import (
+    REQUEST_APPROVAL,
     ApprovalSchema,
     parse_approval_schema,
     skill_calls,
@@ -238,6 +246,31 @@ async def _check_artifact_types(
     check_against_artifact_types(schema, {key: list(media) for key, media in rows})
 
 
+def _gate_role_references(document: Any, path: str) -> Iterator[tuple[str, str]]:
+    """``(field, role:<slug>)`` of each literal ``requestApproval.assignee`` in ``document``."""
+    if isinstance(document, dict):
+        gate = document.get(REQUEST_APPROVAL)
+        if isinstance(gate, dict):
+            assignee = gate.get("assignee")
+            # A template is only known when it renders: the action checks it then.
+            if is_role_reference(assignee) and "$." not in assignee:
+                yield f"{path}.{REQUEST_APPROVAL}.assignee", assignee
+        for key, value in document.items():
+            yield from _gate_role_references(value, f"{path}.{key}")
+    elif isinstance(document, list):
+        for index, value in enumerate(document):
+            yield from _gate_role_references(value, f"{path}[{index}]")
+
+
+async def _check_gate_roles(
+    session: AsyncSession, ctx: AuthContext, documents: dict[str, dict[str, Any]]
+) -> None:
+    """A gate addressed to ``role:<slug>`` names a role the tenant has (``unknown_role``)."""
+    for name, document in documents.items():
+        for field, reference in _gate_role_references(document, name):
+            await require_declared_role(session, ctx.tenant_id, reference, field=field)
+
+
 async def _type_checks(
     session: AsyncSession, ctx: AuthContext, acceptance: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -246,6 +279,20 @@ async def _type_checks(
     checks = normalize_checks(acceptance, field="acceptance")
     await check_acceptance_skills(session, ctx, checks)
     return checks
+
+
+async def _executor_roles(session: AsyncSession, ctx: AuthContext, slugs: list[str]) -> list[str]:
+    """Roles a person needs to take work of the version: each one the tenant has
+    (CP-ADR-0048, amendment 2026-10-03 A1), like a ``role:<slug>`` gate."""
+    slugs = normalize_executor_roles(slugs)
+    for index, slug in enumerate(slugs):
+        await require_declared_role(
+            session,
+            ctx.tenant_id,
+            f"{ROLE_REFERENCE_PREFIX}{slug}",
+            field=f"executorRoles[{index}]",
+        )
+    return list(slugs)
 
 
 @dataclass(frozen=True)
@@ -343,6 +390,7 @@ async def create_task_type_version(
     completion_schema: dict[str, Any] | None = None,
     artifact_schema: dict[str, Any] | None = None,
     acceptance: list[dict[str, Any]] | None = None,
+    executor_roles: list[str] | None = None,
 ) -> TaskType:
     """Create the next version of ``key`` — never an in-place edit."""
     await authorize(ctx, Permission.TASK_TYPES_MANAGE)
@@ -368,11 +416,17 @@ async def create_task_type_version(
         checked.artifact_io,
     )
     await _check_outcome_skills(session, ctx, checked.outcomes)
+    await _check_gate_roles(
+        session,
+        ctx,
+        {"approvalSchema": outcomes, "completionSchema": after_completion},
+    )
     await _check_artifact_types(session, ctx, io)
     # Default checks of every task of the version (CP-ADR-0067, amendment
     # 2026-09-27): the grammar and registries of a task's acceptance, now —
     # the version is immutable, and its tasks would carry a check nobody can run.
     checks = await _type_checks(session, ctx, acceptance or [])
+    roles = await _executor_roles(session, ctx, executor_roles or [])
 
     current_max = await session.scalar(
         select(func.max(TaskType.version)).where(
@@ -398,6 +452,7 @@ async def create_task_type_version(
         completion_schema=after_completion,
         artifact_schema=handoff,
         acceptance=checks,
+        executor_roles=roles,
         status=TaskTypeStatus.ACTIVE,
         created_by=ctx.principal_id,
         created_at=now,
@@ -430,6 +485,7 @@ async def create_task_type_version(
             "declaresArtifactSchema": not io.empty,
             "inputs": len(io.inputs),
             "outputs": len(io.outputs),
+            "executorRoles": roles,
         },
     )
     return task_type

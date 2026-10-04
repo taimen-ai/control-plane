@@ -32,6 +32,7 @@ from control_plane.application.queries.tool_policy import (
     resolve_effective_tool_policy,
     resolve_tool_decision,
 )
+from control_plane.application.visibility import task_visible
 from control_plane.domain.enums import (
     Permission,
     RunActionStatus,
@@ -71,7 +72,8 @@ async def _locked_owned_running_run(
     run_probe = await session.scalar(
         select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
     )
-    if run_probe is None:
+    # A run of invisible work is a missing run (CP-ADR-0082 §3.7).
+    if run_probe is None or not await task_visible(session, ctx, run_probe.task_id):
         raise NotFoundError("Run not found", details={"runId": str(run_id)})
     await lock_session_key_share(session, ctx.tenant_id, run_probe.session_id)
     task = await session.scalar(select(Task).where(Task.id == run_probe.task_id).with_for_update())

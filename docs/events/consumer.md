@@ -107,4 +107,6 @@ CloudEvents — расширения `tenantid`, `workspaceid`, `entitytype`, `e
 `schemaversion`, `actorid`, `correlationid`, `causationid` (пустые опускаются).
 `source` — URI установки (`https://cp.example.com/tenants/<id>`), по умолчанию
 `/control-plane/tenants/<tenantId>`. Схема `data` — версия `schemaversion` типа в
-[каталоге](catalog.md).
+[каталоге](catalog.md). Тот же каталог работающее ядро отдаёт по `GET /api/v1/event-types`
+(право `events.read`, ETag; CP-ADR-0068, амендмент А) — с группой типа, всеми его
+версиями и ключом подписи `event.<type>`.

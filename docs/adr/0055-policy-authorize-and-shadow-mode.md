@@ -26,7 +26,8 @@ sync-вызов (`_require_session_access`) остаётся на `require`.
 type)` → `list_objects` policy-service; `list_tasks` ограничивает выдачу
 воркспейсами, где разрешено `tasks.read`, плюс задачами, которыми principal
 владеет, которые ему назначены или которые он создал — зеркало правила
-`task` в модели PDP. В `local` и `shadow` фильтра нет.
+`task` в модели PDP. В `local` и `shadow` фильтра нет (кроме режима
+видимости `members` — амендмент 2026-10-03 ниже, ADR-0082 п.3.4).
 
 ## Identity субъекта
 
@@ -172,6 +173,18 @@ TASK-000905). `reject` условий не имеет и контекста не
 `spawnedBy`); незнакомый глагол или тип — `400`;
 `tests/unit/test_authz_check_contract.py` — схема, реестр и openapi
 совпадают, токен решения отсекается `decision_purpose`.
+
+## Амендмент 2026-10-03 (TASK-001333): видимость по пространствам в `local` и `shadow`
+
+Абзац «В `local` и `shadow` фильтра нет» раздела «Решение» заменён
+[ADR-0082](0082-principal-profile-and-workspace-visibility.md) п.3.4: для
+контекста человека, у которого хотя бы одна активная связка в режиме
+`members`, `visible_objects(ctx, action, "workspace")` в `local` и `shadow`
+отдаёт множество видимых пространств (участие и потомки), а в `policy` —
+пересечение ответа PDP с этим множеством; `authorize(…,
+resource=ResourceRef("workspace", id))` вне множества — `404`, не `403`
+(ADR-0082 п.3.6–3.7). В режиме `tenant` прежний абзац действует как был:
+фильтра нет, ответ `None`.
 
 ## Conformance
 

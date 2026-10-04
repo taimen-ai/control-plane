@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.queries.lists import Page, clamp_limit
+from control_plane.application.visibility import workspace_condition
 from control_plane.domain.enums import Permission, ProjectStatus
 from control_plane.domain.errors import NotFoundError, ValidationError
 from control_plane.domain.project import (
@@ -46,7 +47,9 @@ async def get_tenant_project(
     if for_update:
         stmt = stmt.with_for_update()
     project = await session.scalar(stmt)
-    if project is None:
+    # A project of an invisible workspace answers as a missing one, for
+    # everything under it too (CP-ADR-0082 §3.7).
+    if project is None or not ctx.sees_workspace(project.workspace_id):
         raise NotFoundError("Project not found", details={"projectId": str(project_id)})
     return project
 
@@ -435,7 +438,10 @@ async def list_projects(
     await authorize(ctx, Permission.PROJECTS_READ)
     from control_plane.application.common import make_created_cursor, parse_created_cursor
 
-    stmt = select(ProjectProfile).where(ProjectProfile.tenant_id == ctx.tenant_id)
+    stmt = select(ProjectProfile).where(
+        ProjectProfile.tenant_id == ctx.tenant_id,
+        workspace_condition(ctx, ProjectProfile.workspace_id),
+    )
     if workspace_id is not None:
         stmt = stmt.where(ProjectProfile.workspace_id == workspace_id)
     if status is not None:
@@ -515,7 +521,7 @@ async def workspace_tree(
                 Workspace.id == root_id, Workspace.tenant_id == ctx.tenant_id
             )
         )
-        if exists is None:
+        if exists is None or not ctx.sees_workspace(root_id):
             raise NotFoundError("Workspace not found", details={"workspaceId": str(root_id)})
 
     rows: list[Row[Any]] = list(
@@ -529,13 +535,19 @@ async def workspace_tree(
                        AND (
                            (NOT :has_root AND w.parent_id IS NULL)
                            OR (:has_root AND w.id = :root)
+                           -- members: a visible workspace under an invisible
+                           -- parent is a root to the caller (CP-ADR-0082 3.9)
+                           OR (NOT :has_root AND :members
+                               AND w.parent_id <> ALL(CAST(:visible AS uuid[])))
                        )
+                       AND (NOT :members OR w.id = ANY(CAST(:visible AS uuid[])))
                        AND (:include_archived OR w.status = 'active')
                     UNION ALL
                     SELECT c.id, c.parent_id, t.depth + 1,
                            t.path || (c.slug || '/' || CAST(c.id AS text))
                       FROM workspaces c JOIN tree t ON c.parent_id = t.id
                      WHERE t.depth < :max_depth
+                       AND (NOT :members OR c.id = ANY(CAST(:visible AS uuid[])))
                        AND (:include_archived OR c.status = 'active')
                 )
                 SELECT t.id, t.parent_id, t.depth,
@@ -558,6 +570,8 @@ async def workspace_tree(
                 "root": root_id or uuid.UUID(int=0),
                 "max_depth": max_depth,
                 "include_archived": include_archived,
+                "members": ctx.visible_workspaces is not None,
+                "visible": [uuid.UUID(w) for w in ctx.visible_workspaces or ()],
             },
         )
     )
@@ -567,7 +581,11 @@ async def workspace_tree(
     for row in rows:
         node: dict[str, Any] = {
             "id": str(row.id),
-            "parentId": str(row.parent_id) if row.parent_id else None,
+            # The parent of a root the caller sees is not named when it is
+            # not visible itself (CP-ADR-0082 3.9).
+            "parentId": (
+                str(row.parent_id) if row.parent_id and ctx.sees_workspace(row.parent_id) else None
+            ),
             "depth": row.depth,
             "slug": row.slug,
             "name": row.name,

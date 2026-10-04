@@ -22,6 +22,7 @@ from control_plane.application.queries import lists as queries
 router = APIRouter(tags=["delegations"])
 
 
+# visibility: tenant — a delegation links two principals and has no workspace (CP-ADR-0082 4)
 @router.post(
     "/delegations",
     response_model=DelegationOut,
@@ -57,6 +58,7 @@ async def create_delegation(
     )
 
 
+# visibility: tenant — a delegation links two principals and has no workspace (CP-ADR-0082 4)
 @router.get("/delegations", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_delegations(
     ctx: AuthDep,
@@ -68,6 +70,7 @@ async def list_delegations(
     return JSONResponse(page_body([dump(DelegationOut, d) for d in page.items], page.next_cursor))
 
 
+# visibility: tenant — a delegation links two principals and has no workspace (CP-ADR-0082 4)
 @router.post(
     "/delegations/{delegation_id}:revoke",
     response_model=DelegationOut,

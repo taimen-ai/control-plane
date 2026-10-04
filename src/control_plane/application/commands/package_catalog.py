@@ -4,7 +4,7 @@ CP-ADR-0074 §11, amendment 2026-09-29. ``packages:plan`` compares each object
 of these kinds as the fields of its **form** — what the catalog holds of it,
 in the names of the package — and ``packages:apply`` publishes the form by the
 ordinary command of its kind, under that kind's right. The forms follow what
-``cp_packages apply --install`` compares, so a key the installer applied plans
+the package installer (package-sdk) compares, so a key the installer applied plans
 ``unchanged`` for the same file:
 
 - ``TaskType`` — the fields of ``POST /task-types``; a version is immutable,
@@ -12,9 +12,10 @@ ordinary command of its kind, under that kind's right. The forms follow what
   deprecated (``deprecates``), as the installer does. The latest is the
   highest *active* version. A field the installer compares only when the file
   sets it (``lifecycleSchema``, ``contextSchema``, ``instructions``,
-  ``completionSchema``, ``artifactSchema``, ``acceptance``) takes the latest
-  value when the file leaves it out — in the comparison and in the version
-  published (the installer lets the core default them in a new version).
+  ``completionSchema``, ``artifactSchema``, ``acceptance``, ``executorRoles``)
+  takes the latest value when the file leaves it out — in the comparison and
+  in the version published (the installer lets the core default them in a new
+  version).
 - ``Agent`` — the revision body (canonical, CP-ADR-0073 §2) with the desired
   state: ``state`` and ``placement.replicas``. A change of the body is a new
   revision, of the state alone — none (``version`` is the revision). A retired
@@ -45,17 +46,20 @@ from control_plane.application.authorization import AuthContext
 from control_plane.application.commands import agents as agent_commands
 from control_plane.application.commands import task_types as task_type_commands
 from control_plane.application.commands import work_rules as rule_commands
+from control_plane.application.commands.role_references import normalize_executor_roles
 from control_plane.domain.agent_instructions import validate_instructions
 from control_plane.domain.enums import AgentStatus, TaskTypeStatus
 from control_plane.domain.errors import DomainError
 from control_plane.domain.package_plan import PLANNED_KINDS, canonical_hash
 from control_plane.domain.package_source import PackageObject
 from control_plane.domain.process_definition import Problem
+from control_plane.domain.settings_refs import SettingsScope
 from control_plane.domain.task_execution import normalize_execution
 from control_plane.domain.work_graph import normalize_checks
 from control_plane.domain.work_item import SYSTEM_TASK_LIFECYCLE
 from control_plane.domain.work_rules import (
     RuleStatus,
+    check_settings_refs,
     normalize_description,
     normalize_rule_spec,
 )
@@ -80,6 +84,7 @@ TASK_TYPE_DEFAULTS: dict[str, Any] = {
     "completionSchema": {},
     "artifactSchema": {},
     "acceptance": [],
+    "executorRoles": [],
 }
 # Compared only when the file sets them (the installer's SERVER_DEFAULTED).
 TASK_TYPE_KEPT_WHEN_ABSENT = frozenset(
@@ -90,6 +95,7 @@ TASK_TYPE_KEPT_WHEN_ABSENT = frozenset(
         "completionSchema",
         "artifactSchema",
         "acceptance",
+        "executorRoles",
     }
 )
 RULE_MUTABLE = ("description", "trigger", "condition", "interpretation", "action", "identity")
@@ -124,6 +130,7 @@ def task_type_form(row: TaskType) -> dict[str, Any]:
         "completionSchema": row.completion_schema or {},
         "artifactSchema": row.artifact_schema or {},
         "acceptance": row.acceptance or [],
+        "executorRoles": row.executor_roles or [],
     }
 
 
@@ -252,8 +259,17 @@ async def latest_of(db: AsyncSession, tenant_id: uuid.UUID, kind: str, key: str)
 # --- what the package wants ------------------------------------------------------------------
 
 
-def wanted_form(kind: str, sent: Mapping[str, Any], latest: Latest | None) -> dict[str, Any]:
-    """The form of what the package sends; a document the command would refuse raises."""
+def wanted_form(
+    kind: str,
+    sent: Mapping[str, Any],
+    latest: Latest | None,
+    settings: SettingsScope | None = None,
+) -> dict[str, Any]:
+    """The form of what the package sends; a document the command would refuse raises.
+
+    ``settings`` — the settings the package declares: the reads of ``settings``
+    of a rule are checked against them (CP-ADR-0081 §6); ``None`` — not checked.
+    """
     if kind == "TaskType":
         form: dict[str, Any] = {}
         for name, default in TASK_TYPE_DEFAULTS.items():
@@ -269,6 +285,8 @@ def wanted_form(kind: str, sent: Mapping[str, Any], latest: Latest | None) -> di
             form["instructions"] = validate_instructions(form["instructions"], field="instructions")
         if "acceptance" in sent:
             form["acceptance"] = normalize_checks(form["acceptance"], field="acceptance")
+        if "executorRoles" in sent:
+            form["executorRoles"] = normalize_executor_roles(form["executorRoles"])
         return form
     if kind == "Agent":
         body, state, replicas = agent_commands.split_desired_state(dict(sent))
@@ -280,6 +298,8 @@ def wanted_form(kind: str, sent: Mapping[str, Any], latest: Latest | None) -> di
         interpretation=sent.get("interpretation"),
         action=sent.get("action"),
     )
+    if settings is not None:
+        check_settings_refs(spec, settings)
     return {
         "description": normalize_description(sent.get("description", "")),
         "trigger": spec.trigger,
@@ -397,8 +417,13 @@ async def publish(
     action: str,
     deprecates: list[int],
     package: tuple[str, str] | None,
+    settings: SettingsScope | None = None,
 ) -> Published:
-    """Apply one object by the command of its kind; every command checks its own right."""
+    """Apply one object by the command of its kind; every command checks its own right.
+
+    ``settings`` — the settings of the package a rule's reads are checked
+    against: those the apply records, not the active revision before it.
+    """
     if kind == "TaskType":
         version = latest.version if latest is not None else 0
         if action != "unchanged":
@@ -417,6 +442,7 @@ async def publish(
                 completion_schema=spec["completionSchema"],
                 artifact_schema=spec["artifactSchema"],
                 acceptance=spec["acceptance"],
+                executor_roles=spec["executorRoles"],
             )
             version = row.version
         for number in deprecates:
@@ -443,6 +469,7 @@ async def publish(
             workspace_id=uuid.UUID(workspace) if workspace else None,
             status=spec["status"],
             identity=identity,
+            settings=settings,
         )
         return Published(rule.version)
     rule = latest.row
@@ -451,7 +478,7 @@ async def publish(
     }
     if changed:
         rule = await rule_commands.update_rule(
-            db, ctx, rule_id=rule.id, expected_version=rule.version, **changed
+            db, ctx, rule_id=rule.id, expected_version=rule.version, settings=settings, **changed
         )
     if spec["status"] != rule.status:
         rule = await rule_commands.set_rule_status(db, ctx, rule_id=rule.id, status=spec["status"])

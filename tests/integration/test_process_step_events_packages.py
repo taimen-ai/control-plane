@@ -30,9 +30,10 @@ import pytest
 
 from control_plane.domain import process_sandbox, process_steps
 from tests.helpers import auth, do_bootstrap
+from tests.package_sdk import UMBRELLA
 
-ROOT = Path(__file__).resolve().parents[2]
-SUPERPROJECT = Path(os.environ.get("CP_SUPERPROJECT") or ROOT.parent)
+# The superproject by the layout control-plane lies in (TAI-ADR-0064), unless named.
+SUPERPROJECT = Path(os.environ.get("CP_SUPERPROJECT") or UMBRELLA)
 PACKAGES = SUPERPROJECT / "packages"
 # What the two packages require: its objects are added to the package under test.
 REQUIRED = ("platform-calendars", "notify", "process-knowledge")

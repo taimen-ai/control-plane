@@ -77,12 +77,18 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import event as orm_event
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane import sandbox as trial_hooks
-from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.authorization import (
+    AuthContext,
+    ResourceRef,
+    authorize,
+    permits,
+)
 from control_plane.application.commands import agents as agent_commands
 from control_plane.application.commands import artifact_types as artifact_type_commands
 from control_plane.application.commands import org as org_commands
@@ -93,6 +99,7 @@ from control_plane.application.commands.approvals import decide_approval, reques
 from control_plane.application.commands.artifacts import content_ref, create_artifact
 from control_plane.application.commands.observations import record_observation
 from control_plane.application.commands.package_catalog import CATALOG_KINDS, SpecShape
+from control_plane.application.commands.package_settings import unknown_refs
 from control_plane.application.commands.process_definitions import process_scope
 from control_plane.application.commands.skill_invocations import (
     LIVE_STATUSES,
@@ -132,7 +139,13 @@ from control_plane.domain.enums import (
     SkillInvocationStatus,
     WorkspaceStatus,
 )
-from control_plane.domain.errors import AuthorizationError, DomainError
+from control_plane.domain.errors import AuthorizationError, DomainError, NotFoundError
+from control_plane.domain.package_plan import canonical_hash
+from control_plane.domain.package_settings import (
+    check_declaration,
+    references,
+    validate,
+)
 from control_plane.domain.package_source import (
     SUBJECT_RULE,
     SUBJECT_TASK_TYPE,
@@ -141,14 +154,13 @@ from control_plane.domain.package_source import (
     ParsedPackage,
 )
 from control_plane.domain.process_definition import Problem
+from control_plane.domain.project import secret_findings
+from control_plane.domain.settings_refs import SettingsScope
 from control_plane.domain.work_graph import CheckKind, EvidenceKind
 from control_plane.domain.work_rules import (
-    ROOT_GOAL,
+    BASE_ROOTS,
     ROOT_ITEM,
-    ROOT_PAYLOAD,
     ROOT_SKILL,
-    ROOT_TASK,
-    ROOT_TRIGGER,
     EvaluationStatus,
     RuleStatus,
     TriggerKind,
@@ -164,6 +176,9 @@ from control_plane.infrastructure.db.models import (
     ArtifactContent,
     ArtifactType,
     Event,
+    PackageSettings,
+    PackageSettingsSchema,
+    PackageSettingsVersion,
     Principal,
     PrincipalRole,
     Role,
@@ -180,6 +195,7 @@ from control_plane.infrastructure.db.models import (
     WorkRule,
     Workspace,
 )
+from control_plane.infrastructure.db.models import PackageObject as PackageRecord
 
 # The kinds published before the catalog kinds, when the tenant lacks them:
 # what a type, an agent or a rule of the package names.
@@ -393,12 +409,22 @@ def finding(obj: PackageObject, exc: DomainError, severity: str = "error") -> Pr
     return obj.place(package_catalog.finding(exc, severity))
 
 
+def settings_scope(package: ParsedPackage) -> SettingsScope:
+    """What ``settings`` of the package's objects is: the schema its files declare (§6)."""
+    manifest = package.manifest_object
+    declared = check_declaration(package).declared
+    return SettingsScope(
+        manifest.key if manifest is not None else None,
+        declared.schema if declared is not None else None,
+    )
+
+
 def static_problems(
     package: ParsedPackage,
     shapes: Mapping[str, SpecShape],
     workspace_id: uuid.UUID | None,
 ) -> list[Problem]:
-    """The form and vocabulary of the rules and task types, by the domain's pure functions.
+    """The form and vocabulary of the rules and task types, and the shape of the agents.
 
     ``invalid_rule`` / ``invalid_task_type`` with file and line (Z4). An
     object with an installation variable that has no default is checked when
@@ -406,6 +432,7 @@ def static_problems(
     """
     problems: list[Problem] = []
     variables = manifest_variables(package)
+    scope = settings_scope(package)
     for kind in ("TaskType", "WorkRule"):
         for obj in sorted(package.of_kind(kind), key=lambda o: o.key):
             prepared = _prepared(obj, variables, workspace_id)
@@ -416,7 +443,7 @@ def static_problems(
             if sent is None:
                 continue
             try:
-                form = package_catalog.wanted_form(kind, sent, None)
+                form = package_catalog.wanted_form(kind, sent, None, scope)
                 if kind == "TaskType":
                     check_type_documents(
                         field_schema=form["fieldSchema"],
@@ -429,6 +456,15 @@ def static_problems(
                     )
             except DomainError as exc:
                 problems.append(finding(obj, exc))
+    # An agent is checked by its shape, as ``POST /agents`` takes it: a fractional
+    # ``cpus`` is a finding here, not a refusal of the apply (CP-ADR-0073,
+    # amendment 2026-10-03).
+    for obj in sorted(package.of_kind("Agent"), key=lambda o: o.key):
+        prepared = _prepared(obj, variables, workspace_id)
+        if _unresolved(prepared.spec):
+            continue
+        _, found = shapes["Agent"](prepared)
+        problems.extend(obj.place(p) for p in found)
     return problems
 
 
@@ -745,6 +781,7 @@ class _Run:
         self.supporting = supporting
         given = self.data.get("given") or {}
         self.given: dict[str, Any] = given
+        self.settings_scope = settings_scope(package)
         self.variables = {**manifest_variables(package), **(given.get("variables") or {})}
         self.mocks: dict[str, Any] = self.data.get("mocks") or {}
         self.used: dict[str, int] = {}
@@ -801,6 +838,7 @@ class _Run:
                 await self._workspace()
                 await self._stand_variables()
                 await self._publish()
+                await self._stand_settings()
                 if self.test.subject == SUBJECT_RULE:
                     await self._rule()
                 else:
@@ -886,7 +924,7 @@ class _Run:
             return
         try:
             if "approve" in spec:
-                await self._approve(spec["approve"])
+                self.failures.extend(await self._approve(index, spec["approve"]))
             elif "verify" in spec:
                 await self._verify(spec["verify"])
             elif "complete" in spec:
@@ -1013,13 +1051,9 @@ class _Run:
 
         Asked in the trial: the PDP decides it in ``policy`` mode (Z7).
         """
-        try:
-            await authorize(
-                self.ctx, Permission.PROCESSES_READ, resource=process_scope(workspace_id)
-            )
-        except AuthorizationError:
-            return False
-        return True
+        return await permits(
+            self.ctx, Permission.PROCESSES_READ, resource=process_scope(workspace_id)
+        )
 
     async def _of_tenant(self, model: Any, row_id: uuid.UUID | None) -> bool:
         if row_id is None:
@@ -1181,7 +1215,7 @@ class _Run:
             raise _Shape(problems)
         kind, key = obj.kind, obj.key
         latest = await package_catalog.latest_of(self.db, ctx.tenant_id, kind, key)
-        form = package_catalog.wanted_form(kind, sent, latest)
+        form = package_catalog.wanted_form(kind, sent, latest, self.settings_scope)
         if kind == "WorkRule":
             # Evaluated whatever the package says of its status (Z2).
             form["status"] = RuleStatus.ENABLED
@@ -1201,11 +1235,148 @@ class _Run:
             action=action,
             deprecates=[],
             package=None,
+            settings=self.settings_scope,
         )
         if kind == "WorkRule":
             await self._take_rule(ctx, key)
         elif kind == "Agent":
             await self._link_agent(key)
+
+    async def _stand_settings(self) -> None:
+        """The settings of the package on the stand, as an apply and a saving would leave them.
+
+        CP-ADR-0081 §6: the rules of the package are linked to it, the schema
+        its files declare is the active revision and ``given.settings`` —
+        checked as ``PUT`` checks them — the saved values of a new version
+        (none given: the defaults). All of it is rolled back with the test.
+        """
+        scope = self.settings_scope
+        values = self.given.get("settings")
+        if scope.package is None or scope.schema is None:
+            if values is not None:
+                raise _Abort(
+                    "given.settings: settings_not_declared — the package declares no settings",
+                    error=True,
+                )
+            return
+        rules = self.package.of_kind("WorkRule")
+        if values is None and not any("settings" in json.dumps(o.spec) for o in rules):
+            return  # nothing reads them: the stand is left as it is
+        values = dict(values or {})
+        await self._check_settings(values, scope.schema)
+        ctx, now, tenant = self.ctx, utcnow(), self.ctx.tenant_id
+        for obj in rules:
+            await self.db.execute(
+                insert(PackageRecord)
+                .values(
+                    id=new_uuid(),
+                    tenant_id=tenant,
+                    kind="WorkRule",
+                    key=obj.key,
+                    package_key=scope.package,
+                    applied_by=ctx.principal_id,
+                    applied_at=now,
+                )
+                .on_conflict_do_update(
+                    constraint="uq_package_objects_tenant_kind_key",
+                    set_={"package_key": scope.package},
+                )
+            )
+        await self.db.execute(
+            update(PackageSettingsSchema)
+            .where(
+                PackageSettingsSchema.tenant_id == tenant,
+                PackageSettingsSchema.package_key == scope.package,
+                PackageSettingsSchema.active.is_(True),
+            )
+            .values(active=False)
+        )
+        latest = await self.db.scalar(
+            select(func.max(PackageSettingsSchema.revision)).where(
+                PackageSettingsSchema.tenant_id == tenant,
+                PackageSettingsSchema.package_key == scope.package,
+            )
+        )
+        revision = int(latest or 0) + 1
+        self.db.add(
+            PackageSettingsSchema(
+                id=new_uuid(),
+                tenant_id=tenant,
+                package_key=scope.package,
+                revision=revision,
+                package_version=None,
+                schema=dict(scope.schema),
+                uischema=None,
+                schema_hash=canonical_hash(scope.schema),
+                active=True,
+                plan_hash=self.trace,
+                applied_by=ctx.principal_id,
+                applied_at=now,
+            )
+        )
+        row = await self.db.scalar(
+            select(PackageSettings).where(
+                PackageSettings.tenant_id == tenant,
+                PackageSettings.package_key == scope.package,
+            )
+        )
+        if row is None and not values:
+            await self.db.flush()
+            return  # version 0: the defaults
+        version = (row.version if row is not None else 0) + 1
+        if row is None:
+            self.db.add(
+                PackageSettings(
+                    tenant_id=tenant,
+                    package_key=scope.package,
+                    values=values,
+                    version=version,
+                    schema_revision=revision,
+                    updated_by=ctx.principal_id,
+                    updated_at=now,
+                )
+            )
+        else:
+            row.values, row.version, row.schema_revision = values, version, revision
+            row.updated_by, row.updated_at = ctx.principal_id, now
+        self.db.add(
+            PackageSettingsVersion(
+                tenant_id=tenant,
+                package_key=scope.package,
+                version=version,
+                values=values,
+                schema_revision=revision,
+                changed_paths=[],
+                updated_by=ctx.principal_id,
+                updated_at=now,
+            )
+        )
+        await self.db.flush()
+
+    async def _check_settings(self, values: dict[str, Any], schema: Mapping[str, Any]) -> None:
+        """``given.settings`` as ``PUT`` checks them: the same codes, no value in the answer."""
+        found = secret_findings(values)
+        if found:
+            raise _Abort(
+                "given.settings: secret_material_rejected — settings hold no secrets",
+                actual=found,
+                error=True,
+            )
+        errors = validate(values, schema)
+        if errors:
+            raise _Abort(
+                "given.settings: settings_invalid — the values do not match the settings schema",
+                actual=errors,
+                error=True,
+            )
+        missing = await unknown_refs(self.db, self.ctx.tenant_id, references(values, schema))
+        if missing:
+            raise _Abort(
+                "given.settings: unknown_ref — a value references an object the organization"
+                " does not have in use",
+                actual=missing,
+                error=True,
+            )
 
     async def _take_rule(self, ctx: AuthContext, key: str) -> None:
         """A rule without an identity acts as the caller of the test, as for who enabled it.
@@ -1357,18 +1528,13 @@ class _Run:
         assert self.rule is not None
         if where == "condition":
             self.seen.rule_branches |= branch_outcomes(
-                self.rule.condition,
-                facts.resolve,
-                roots=frozenset({ROOT_TRIGGER, ROOT_PAYLOAD, ROOT_GOAL, ROOT_TASK}),
-                at="/condition",
+                self.rule.condition, facts.resolve, roots=BASE_ROOTS, at="/condition"
             )
         else:
             self.seen.rule_branches |= branch_outcomes(
                 self.rule.action.get("where"),
                 lambda path: facts.resolve(path, item),
-                roots=frozenset(
-                    {ROOT_TRIGGER, ROOT_PAYLOAD, ROOT_GOAL, ROOT_TASK, ROOT_SKILL, ROOT_ITEM}
-                ),
+                roots=frozenset({*BASE_ROOTS, ROOT_SKILL, ROOT_ITEM}),
                 at="/action/where",
             )
 
@@ -1433,6 +1599,9 @@ class _Run:
         agent of the test reads with the local check (Z2), so without this the
         test would read, in the caller's name, a task the caller could not.
         Asked of an id, not of a row: the answer does not tell whether it exists.
+        A caller in ``members`` mode is asked of the row too, as
+        ``permits_task`` asks (CP-ADR-0082 V6): a task outside their sight
+        and a missing one are the same "Task not found".
         """
         names = ["taskId"]
         if event_type.split(".", 1)[0] == "task":
@@ -1446,6 +1615,16 @@ class _Run:
                 await authorize(
                     self.ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task_id))
                 )
+                if self.ctx.visible_workspaces is not None:
+                    found = (
+                        await self.db.execute(
+                            select(Task.workspace_id).where(
+                                Task.id == task_id, Task.tenant_id == self.ctx.tenant_id
+                            )
+                        )
+                    ).first()
+                    if found is None or not self.ctx.sees_workspace(found.workspace_id):
+                        raise NotFoundError("Task not found", details={"taskId": str(task_id)})
 
     async def _rule_outcome(self) -> None:
         """The result of the evaluation and the outcomes it reached, for the coverage."""
@@ -1502,7 +1681,14 @@ class _Run:
         assert task_type is not None
         return task_type
 
-    async def _approve(self, spec: Mapping[str, Any]) -> None:
+    async def _approve(self, index: int, spec: Mapping[str, Any]) -> list[process_trial.Failure]:
+        """Decide the pending gate; ``expectRefused`` — the core must refuse the decider.
+
+        Whoever decides needs the right to (CP-ADR-0061, amendment 2026-10-01):
+        a gate addressed to a role is decided by a holder of it, so a test
+        states the refusal of somebody else as ``expectRefused: not_eligible``.
+        A refusal expected is not decided, and the test goes on.
+        """
         gate = str(spec.get("gate") or DEFAULT_GATE)
         if gate != DEFAULT_GATE:
             raise _Abort(
@@ -1523,6 +1709,14 @@ class _Run:
             .limit(1)
         )
         by = spec.get("by")
+        wanted = spec.get("expectRefused")
+        if approval is None and wanted:
+            # The trial would open a gate for the decider: nobody to refuse.
+            return [
+                process_trial.Failure(
+                    index, "no gate is pending: a refusal cannot be checked", wanted, None
+                )
+            ]
         if approval is None:
             decider = await self.people.named(str(by or "approver"))
             approval = await request_approval(
@@ -1536,22 +1730,42 @@ class _Run:
             )
         else:
             decider = await self._decider(approval, by)
-        if approve:
+        if approve and not wanted:
             await self._preconditions(approval, decider)
         try:
-            decided = await decide_approval(
-                self.db,
-                decider,
-                approval_id=approval.id,
-                approve=approve,
-                comment=spec.get("comment"),
-            )
+            async with self.db.begin_nested():
+                decided = await decide_approval(
+                    self.db,
+                    decider,
+                    approval_id=approval.id,
+                    approve=approve,
+                    comment=spec.get("comment"),
+                )
         except DomainError as exc:
+            if wanted == exc.code:
+                return []
+            if wanted:
+                return [
+                    process_trial.Failure(
+                        index,
+                        f"the core refused the decision: {exc.code}",
+                        wanted,
+                        exc.code,
+                    )
+                ]
             raise _Abort(
                 f"the core refused the decision: {exc.code}",
                 expected=spec["decision"],
                 actual={"code": exc.code, "message": exc.message},
             ) from exc
+        failures: list[process_trial.Failure] = []
+        if wanted:
+            who = f" of {by}" if by else ""
+            failures.append(
+                process_trial.Failure(
+                    index, f"the decision{who} was taken, a refusal was expected", wanted, None
+                )
+            )
         self.seen.outcomes.add(f"{gate}/{spec['decision']}")
         if decided.outcome_status in OUTCOME_LIVE:
             await execute_outcome(
@@ -1560,6 +1774,7 @@ class _Run:
                 approval_id=decided.id,
                 trace_run_id=self.trace,
             )
+        return failures
 
     async def _decider(self, approval: Approval, by: Any) -> AuthContext:
         """Who decides a gate the type or the verification opened.

@@ -34,7 +34,7 @@ V03_HEAD = "b3d47a1c9e05"
 V04_HEAD = "2cb05920015d"
 V05_HEAD = "1adf50721f1e"
 V06_HEAD = "72ef8bc31a06"
-CURRENT_HEAD = "c3e8f1a6d2b4"
+CURRENT_HEAD = "b7e3d9a1c4f2"
 
 
 @pytest.fixture

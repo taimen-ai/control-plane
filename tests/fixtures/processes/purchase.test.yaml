@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../../../../package-sdk/schema/v1/test.schema.json
+# yaml-language-server: $schema=../../../../sdk/package-sdk/schema/v1/test.schema.json
 process: purchase-example
 name: отказ от участия после прошлого проигрыша
 given:

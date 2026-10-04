@@ -36,13 +36,17 @@ from control_plane.domain.process_definition import Problem, pointer
 # The kinds the core plans and applies, in the order it applies them (the
 # installer's order): an agent names task types, a process names task types,
 # an agent and calendars (CP-ADR-0074 §9), a rule names task types and acts
-# as an agent (amendment 2026-09-29).
-PLANNED_KINDS = ("TaskType", "Agent", "Calendar", "Process", "WorkRule")
+# as an agent (amendment 2026-09-29), a view names processes and task types
+# (CP-ADR-0080).
+PLANNED_KINDS = ("TaskType", "Agent", "Calendar", "Process", "WorkRule", "View")
+# Kinds the core reads from a package and holds inside another: a component is
+# inlined into the views that name it (CP-ADR-0080).
+INLINED_KINDS = ("Component",)
 # The kinds whose keys ``renames`` moves: their versions carry over to the new key.
 RENAMED_KINDS = ("Calendar", "Process")
 # Who applies the kinds of a package the core does not plan: rules of
 # notifications live in the notification service, the rest the installer
-# applies (``cp_packages apply``).
+# applies (package-sdk).
 OUTSIDE = {"NotificationRule": "notification-service"}
 INSTALLER = "installer"
 OWNER_PACKAGE = "package"
@@ -248,7 +252,9 @@ def outside(package: ParsedPackage) -> list[dict[str, str]]:
     return [
         {"kind": obj.kind, "key": obj.key, "appliedBy": OUTSIDE.get(obj.kind, INSTALLER)}
         for obj in sorted(package.objects, key=lambda o: (o.kind, o.key))
-        if obj.kind not in PLANNED_KINDS and obj.kind not in ("Package", "Installation")
+        if obj.kind not in PLANNED_KINDS
+        and obj.kind not in INLINED_KINDS
+        and obj.kind not in ("Package", "Installation")
     ]
 
 
@@ -259,14 +265,20 @@ def plan_hash(
     processes: Sequence[Mapping[str, Any]],
     *,
     overwrite: bool = False,
+    settings: Mapping[str, Any] | None = None,
 ) -> str:
-    """``planHash``: the package, the catalog etag, the changes and the fate of instances."""
-    return canonical_hash(
-        {
-            "package": package,
-            "catalogEtag": etag,
-            "changes": list(changes),
-            "processes": plan_body(processes),
-            "overwriteConsole": overwrite,
-        }
-    )
+    """``planHash``: the package, the catalog etag, the changes and the fate of instances.
+
+    ``settings`` — the ``settings`` section of the plan (CP-ADR-0081 §7), when
+    the package declares or declared settings; a plan without one hashes as before.
+    """
+    body: dict[str, Any] = {
+        "package": package,
+        "catalogEtag": etag,
+        "changes": list(changes),
+        "processes": plan_body(processes),
+        "overwriteConsole": overwrite,
+    }
+    if settings is not None:
+        body["settings"] = dict(settings)
+    return canonical_hash(body)

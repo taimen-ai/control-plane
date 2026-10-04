@@ -1,0 +1,47 @@
+{
+  "$comment": "Pinned answers of the Memory Service pack registry for a pack whose kinds declare the JSON Schema of their attributes (MEM-ADR-020): what a view of knowledge is checked against by the plan (CP-ADR-0080, amendment B). Produced by memory-service code at b4dea91 (the revision the superproject pins): package = parse_pack(spec).to_payload() (KindSpec.to_payload writes `attributes` as given), namespaceKinds.catalog = KindCatalog.build([pack]).to_payload(); settings as memory_namespace_kinds answers them (GET /api/memory/namespaces/{namespace}/kinds). Regenerate when memory-service changes these payloads.",
+  "memoryService": {"repository": "monthu56/taimen-memory-service", "branch": "master", "commit": "b4dea91"},
+  "package": {
+    "name": "deals-kb",
+    "version": "1",
+    "kinds": [
+      {
+        "kind": "legal_entity",
+        "attributes": {
+          "type": "object",
+          "properties": {
+            "inn": {"type": "string"},
+            "city": {"type": "string"},
+            "revenue": {"type": "number"}
+          }
+        }
+      },
+      {
+        "kind": "contract",
+        "attributes": {
+          "type": "object",
+          "properties": {
+            "amount": {"type": "string"},
+            "signedOn": {"type": "string", "format": "date"}
+          }
+        }
+      }
+    ],
+    "relations": [
+      {"relation": "party_to", "fromKinds": ["legal_entity"], "toKinds": ["contract"], "temporal": true}
+    ]
+  },
+  "namespaceKinds": {
+    "settings": {"namespace": "tenant:<tenant>:ws:<root>", "strict": false, "packages": ["deals-kb@1"], "updated_at": "", "updated_by": ""},
+    "catalog": {
+      "strict": false,
+      "packages": ["deals-kb@1"],
+      "base_kinds": ["document", "entity", "fact"],
+      "kinds": ["contract", "legal_entity"],
+      "kindAliases": {},
+      "relations": ["party_to"],
+      "searchable": {},
+      "conflicts": []
+    }
+  }
+}

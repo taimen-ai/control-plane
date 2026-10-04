@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.common import decode_cursor, encode_cursor, utcnow
 from control_plane.application.queries.lists import clamp_limit
+from control_plane.application.visibility import task_condition, task_visible
 from control_plane.domain.child_handle import (
     looks_like_token,
     parse_token,
@@ -165,6 +166,13 @@ async def _load_views(
     ]
 
 
+async def handle_visible(session: AsyncSession, ctx: AuthContext, handle: RunChildHandle) -> bool:
+    """Both ends of a child handle are visible work."""
+    return await task_visible(session, ctx, handle.parent_task_id) and await task_visible(
+        session, ctx, handle.child_task_id
+    )
+
+
 async def get_child_handle_view(
     session: AsyncSession, ctx: AuthContext, handle: RunChildHandle
 ) -> ChildHandleView:
@@ -199,7 +207,9 @@ async def resolve_child_handle(
             RunChildHandle.tenant_id == ctx.tenant_id,
         )
     )
-    if handle is None:
+    # A handle between works the caller does not both see is a missing one
+    # (CP-ADR-0082 §3.7).
+    if handle is None or not await handle_visible(session, ctx, handle):
         raise NotFoundError("Child handle not found", details={"childHandleId": str(handle_id)})
     if secret is not None and not token_secret_matches(secret, handle.secret_hash):
         # Same shape as an unknown id: a valid id with a wrong secret must not
@@ -245,6 +255,8 @@ async def list_child_handles(
     statement = select(RunChildHandle).where(
         RunChildHandle.tenant_id == ctx.tenant_id,
         RunChildHandle.parent_run_id == parent_run_id,
+        # A child filed in an invisible workspace is not listed (CP-ADR-0082 §3.7).
+        task_condition(ctx, RunChildHandle.child_task_id),
     )
     if cursor:
         created_at, handle_id = _parse_child_cursor(cursor, parent_run_id)

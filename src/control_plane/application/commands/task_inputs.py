@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from control_plane.application.authorization import AuthContext
+from control_plane.application.visibility import workspace_condition
 from control_plane.domain.artifact_schema import ArtifactInput, ArtifactSchema, schema_of
 from control_plane.domain.errors import ConflictError
 from control_plane.infrastructure.db.models import Artifact, Task, TaskRelation, TaskType
@@ -69,6 +70,7 @@ async def _resolve(
     declared: tuple[ArtifactInput, ...],
     *,
     artifact_id: uuid.UUID | None = None,
+    visible_to: AuthContext | None = None,
 ) -> list[ResolvedInput]:
     """Head revisions matching ``declared``, in declaration then creation order."""
     if not declared:
@@ -95,6 +97,10 @@ async def _resolve(
     )
     if artifact_id is not None:
         stmt = stmt.where(Artifact.id == artifact_id)
+    if visible_to is not None:
+        # Shown to a caller: a source of an invisible workspace is not named
+        # (CP-ADR-0082 §3.7). Claimability reads every input, as before.
+        stmt = stmt.where(workspace_condition(visible_to, Task.workspace_id))
     rows = (await session.execute(stmt)).all()
     resolved: list[ResolvedInput] = []
     for entry in declared:
@@ -112,11 +118,11 @@ async def _resolve(
 
 
 async def resolve_task_inputs(
-    session: AsyncSession, tenant_id: uuid.UUID, task: Task
+    session: AsyncSession, ctx: AuthContext, task: Task
 ) -> list[dict[str, Any]]:
     """``inputs`` of the run context and of ``operational.focus``; ``[]`` without a schema."""
     schema = await artifact_schema_of(session, task)
-    resolved = await _resolve(session, tenant_id, task.id, schema.inputs)
+    resolved = await _resolve(session, ctx.tenant_id, task.id, schema.inputs, visible_to=ctx)
     return [item.body() for item in resolved]
 
 

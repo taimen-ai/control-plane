@@ -36,6 +36,7 @@ from control_plane.infrastructure.db.models import ArtifactType
 router = APIRouter(tags=["artifact-types"])
 
 
+# visibility: tenant — artifact types are objects of the tenant
 @router.post(
     "/artifact-types",
     response_model=ArtifactTypeOut,
@@ -76,6 +77,7 @@ async def create_artifact_type(
     )
 
 
+# visibility: tenant — artifact types are objects of the tenant
 @router.get("/artifact-types", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_artifact_types(
     ctx: AuthDep,
@@ -116,6 +118,7 @@ async def list_artifact_types(
     return JSONResponse(page_body(items, next_cursor))
 
 
+# visibility: tenant — artifact types are objects of the tenant
 @router.get("/artifact-types/{ref}", response_model=ArtifactTypeOut, responses=ERROR_RESPONSES)
 async def get_artifact_type(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     """``key`` — the latest version; ``key@version`` — that version."""

@@ -49,6 +49,7 @@ from control_plane.application.locking import (
     lock_session_key_share,
 )
 from control_plane.application.queries.instructions import instructions_for_task
+from control_plane.application.visibility import task_visible
 from control_plane.domain.agent_instructions import instruction_refs
 from control_plane.domain.enums import (
     Permission,
@@ -229,7 +230,9 @@ async def start_run(
 
 async def _get_tenant_run(session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID) -> Run:
     run = await session.scalar(select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id))
-    if run is None:
+    # A run of invisible work is a missing run, for every command over it
+    # (CP-ADR-0082 §3.7, FR-007).
+    if run is None or not await task_visible(session, ctx, run.task_id):
         raise NotFoundError("Run not found", details={"runId": str(run_id)})
     return run
 

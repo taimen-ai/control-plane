@@ -181,6 +181,7 @@ SUPPORTING: dict[str, SupportingShape] = {
 }
 
 
+# visibility: tenant — packages are objects of the tenant
 @router.post(
     "/packages:test",
     response_model=PackageTestOut,
@@ -216,6 +217,7 @@ async def package_tests(
     return JSONResponse(body)
 
 
+# visibility: tenant — packages are objects of the tenant
 @router.post(
     "/packages:plan",
     response_model=PackagePlanOut,
@@ -246,6 +248,7 @@ async def plan_package(
     return JSONResponse(body)
 
 
+# visibility: tenant — packages are objects of the tenant
 @router.post(
     "/packages:apply",
     response_model=PackageApplyOut,
@@ -291,6 +294,7 @@ async def apply_package(
     return response
 
 
+# visibility: tenant — packages are objects of the tenant
 @router.post(
     "/packages:record",
     response_model=PackageRecordOut,

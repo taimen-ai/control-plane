@@ -47,6 +47,11 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     ),
     "Role": ("RoleOut", "/api/v1/roles", "/api/v1/roles/{role_id}"),
     "Capability": ("CapabilityOut", "/api/v1/capabilities", "/api/v1/capabilities/{capability_id}"),
+    "ConnectionType": (
+        "ConnectionTypeOut",
+        "/api/v1/connection-types",
+        "/api/v1/connection-types/{ref}",
+    ),
     "Skill": ("SkillOut", "/api/v1/skills", "/api/v1/skills/{skill_ref}"),
     "WorkRule": ("RuleOut", "/api/v1/rules", "/api/v1/rules/{rule_id}"),
     "Agent": ("AgentOut", "/api/v1/agents", "/api/v1/agents/{ref}"),
@@ -56,6 +61,7 @@ CATALOG: dict[str, tuple[str, str, str]] = {
         "/api/v1/process-definitions/{ref}",
     ),
     "Calendar": ("CalendarOut", "/api/v1/calendars", "/api/v1/calendars/{ref}"),
+    "View": ("ViewOut", "/api/v1/views", "/api/v1/views/{view_key}"),
 }
 
 

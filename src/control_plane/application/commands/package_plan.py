@@ -3,7 +3,9 @@
 CP-ADR-0074 §11, process-packages P015, amendment 2026-09-29. The body is
 the package as its files, as for ``packages:test``; the core plans every kind
 of the catalog it holds — ``TaskType``, ``Agent``, ``Calendar``, ``Process``,
-``WorkRule`` (:data:`package_plan.PLANNED_KINDS`, in that order); the objects
+``WorkRule``, ``View`` (:data:`package_plan.PLANNED_KINDS`, in that order; a
+view as its checked form, its components inlined — CP-ADR-0080,
+:mod:`control_plane.application.commands.views`); the objects
 of other kinds are listed in ``outside`` with who applies them (the installer,
 the notification service).
 
@@ -68,6 +70,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands import package_catalog, package_links
+from control_plane.application.commands import package_settings as settings_commands
+from control_plane.application.commands import views as view_commands
 from control_plane.application.commands.calendars import check_calendar_spec, publish_calendar
 from control_plane.application.commands.catalog_retirements import (
     CALENDAR,
@@ -137,6 +141,7 @@ from control_plane.domain.package_plan import (
     plan_hash,
     renames,
 )
+from control_plane.domain.package_settings import check_declaration
 from control_plane.domain.package_source import PackageObject, ParsedPackage, parse_package
 from control_plane.domain.process_definition import (
     GOVERNED_BY_UNCHECKED,
@@ -163,6 +168,8 @@ from control_plane.domain.process_migration import (
     renamer,
     uncovered,
 )
+from control_plane.domain.settings_refs import NONE, SettingsScope
+from control_plane.domain.views import knowledge_names
 from control_plane.infrastructure.context_provider import ContextProviderError, GraphProvider
 from control_plane.infrastructure.db.models import (
     CalendarVersion,
@@ -187,6 +194,9 @@ UNPUBLISHED = ("unchanged", "restore")
 # A retired key a package installs as it is comes back into use (Zh3).
 RESTORED_EVENTS = {"Process": "process.definition_restored", "Calendar": "calendar.restored"}
 _ENTITY_TYPES = {"Process": "process_definition", "Calendar": "calendar"}
+VIEW = "View"
+# Why a view the package no longer brings is retired.
+VIEW_GONE = "no longer in package "
 
 
 # --- the plan --------------------------------------------------------------------------------
@@ -315,6 +325,12 @@ class PackagePlan:
     # (kind, key) of the objects out of use (catalog_retirements, CP-ADR-0074 Zh1).
     retired: set[tuple[str, str]] = field(default_factory=set)
     created_at: datetime = field(default_factory=utcnow)
+    # The package as parsed: its dictionaries are kept by the apply (CP-ADR-0080).
+    source: ParsedPackage | None = None
+    # The settings of the package against its active revision (CP-ADR-0081 §7).
+    settings: settings_commands.SettingsPlan | None = None
+    # What ``settings`` of its processes, rules and views is: the declared schema (§6).
+    settings_scope: SettingsScope = NONE
 
     @property
     def catalog_etag(self) -> str:
@@ -356,6 +372,7 @@ class PackagePlan:
             self.changes(),
             self.processes(),
             overwrite=self.overwrite,
+            settings=self.settings.out() if self.settings is not None else None,
         )
 
     def out(self) -> dict[str, Any]:
@@ -367,6 +384,7 @@ class PackagePlan:
             "outside": self.outside,
             "processes": self.processes(),
             "regulationCoverage": self.coverage,
+            "settings": self.settings.out() if self.settings is not None else None,
             "problems": [p.out() for p in _sorted(self.problems)],
             "createdAt": self.created_at.isoformat(),
         }
@@ -382,6 +400,8 @@ def _sorted(problems: Sequence[Problem]) -> list[Problem]:
 async def _latest(db: AsyncSession, tenant_id: uuid.UUID, kind: str, key: str) -> Latest | None:
     if kind in CATALOG_KINDS:
         return await package_catalog.latest_of(db, tenant_id, kind, key)
+    if kind == VIEW:
+        return await view_commands.latest_view(db, tenant_id, key)
     if kind == "Process":
         row = await db.scalar(
             select(ProcessDefinition)
@@ -422,11 +442,16 @@ async def _records(
 async def retired_pairs(
     db: AsyncSession, tenant_id: uuid.UUID, pairs: set[tuple[str, str]]
 ) -> set[tuple[str, str]]:
-    """The processes and calendars of ``pairs`` that are retired."""
+    """The processes, calendars and views of ``pairs`` that are retired."""
     out: set[tuple[str, str]] = set()
     for kind in RENAMED_KINDS:
         keys = [key for k, key in pairs if k == kind]
         out |= {(kind, key) for key in await retired_keys(db, tenant_id, kind, keys)}
+    for kind, key in pairs:
+        if kind == VIEW:
+            latest = await view_commands.latest_view(db, tenant_id, key)
+            if latest is not None and latest.retired:
+                out.add((kind, key))
     return out
 
 
@@ -477,6 +502,7 @@ async def build_plan(
         package_version=str(manifest.spec.get("version")) if manifest else None,
         package_hash=package_hash(files),
         overwrite=overwrite,
+        source=package,
     )
     plan.problems.extend(package.problems)
     plan.outside = outside(package)
@@ -498,8 +524,30 @@ async def build_plan(
     listed, found = renames(package)
     plan.problems.extend(found)
     by_target = {(r.kind, r.target): r for r in listed}
+    # The settings it declares (CP-ADR-0081 §1, §2): their labels are keys of its dictionaries.
+    declaration = check_declaration(package)
+    plan.problems.extend(declaration.problems)
+    plan.settings_scope = SettingsScope(
+        plan.package_key, declaration.declared.schema if declaration.declared else None
+    )
+    # The screens of the package, checked against it and the catalog (CP-ADR-0080).
+    screens = await view_commands.check_package(
+        db, ctx.tenant_id, package, shown=declaration.messages, settings=plan.settings_scope
+    )
+    plan.problems.extend(screens.problems)
+    brought = {obj.key for obj in package.of_kind(VIEW)}
+    gone = (
+        [
+            key
+            for key in await view_commands.linked_views(db, ctx.tenant_id, plan.package_key)
+            if key not in brought
+        ]
+        if plan.package_key is not None
+        else []
+    )
     pairs = {(o.kind, o.key) for o in package.objects if o.kind in PLANNED_KINDS}
     pairs |= {(r.kind, r.source) for r in listed}
+    pairs |= {(VIEW, key) for key in gone}
     plan.lock_pairs = pairs
     if lock:
         await package_catalog.lock_keys(db, ctx.tenant_id, pairs)
@@ -510,6 +558,15 @@ async def build_plan(
     records = await _records(db, ctx.tenant_id, pairs, lock=lock)
     plan.retired = await retired_pairs(db, ctx.tenant_id, pairs)
     plan.etag_entries = await catalog_entries(db, ctx.tenant_id, pairs)
+    # The active revision and the saved values, locked as a PUT locks them.
+    plan.settings, found = await settings_commands.plan_settings(
+        db, ctx.tenant_id, manifest, declaration, lock=lock
+    )
+    plan.problems.extend(found)
+    if manifest is not None:
+        entry = await settings_commands.etag_entry(db, ctx.tenant_id, manifest.key)
+        if entry is not None:
+            plan.etag_entries.append(entry)
 
     calendars = frozenset(o.key for o in package.of_kind("Calendar"))
     for kind in PLANNED_KINDS:
@@ -521,6 +578,11 @@ async def build_plan(
                     continue
                 body, body_hash, _ = check_calendar_spec(sent)
                 item = _Planned(kind, obj.key, obj, body, body_hash)
+            elif kind == VIEW:
+                checked = screens.checks.get(obj.key)
+                if checked is None or checked.form is None:
+                    continue
+                item = _Planned(kind, obj.key, obj, checked.form, canonical_hash(checked.form))
             elif kind == "Process":
                 try:
                     body = normalized_spec(obj.spec)
@@ -543,6 +605,23 @@ async def build_plan(
             plan.planned.append(item)
             if kind == "Process" and item.action in ("update", "rename"):
                 await _instances(db, ctx, plan, item, lock=lock)
+    for key in gone:
+        assert manifest is not None
+        latest = await _latest(db, ctx.tenant_id, VIEW, key)
+        assert latest is not None
+        plan.planned.append(
+            _Planned(
+                VIEW,
+                key,
+                manifest,
+                {},
+                "",
+                latest=latest,
+                record=records.get((VIEW, key)),
+                action="retire",
+                version=latest.version,
+            )
+        )
     return plan
 
 
@@ -577,7 +656,7 @@ async def _catalog_item(
         return None
     latest = await _latest(db, ctx.tenant_id, obj.kind, obj.key)
     try:
-        form = package_catalog.wanted_form(obj.kind, sent, latest)
+        form = package_catalog.wanted_form(obj.kind, sent, latest, plan.settings_scope)
     except DomainError as exc:
         plan.problems.append(obj.place(_finding(exc)))
         return None
@@ -673,6 +752,12 @@ async def _place(
         found = package_catalog.static_problems(item.kind, item.key, latest, item.published)
         plan.problems.extend(item.obj.place(p) for p in found)
         return
+    if item.kind == VIEW:
+        if latest is None:
+            item.version = 1
+        else:
+            item.version = latest.version if item.action in UNPUBLISHED else latest.version + 1
+        return
     if item.kind == "Calendar":
         if item.action in UNPUBLISHED and latest is not None:
             item.version = latest.version
@@ -727,6 +812,7 @@ async def _check(
             item.published,
             previous,
             history_key=item.renamed_from,
+            settings=plan.settings_scope,
         ),
         package,
         calendars,
@@ -1045,6 +1131,7 @@ async def plan_package(
     if workspace_id is not None:
         await authorize(ctx, Permission.PROCESSES_READ, resource=process_scope(workspace_id))
     scoped: list[tuple[_Planned, GraphScope]] = []
+    namespace: str | None = None
     async with session_factory() as db:
         tx = await db.begin()
         try:
@@ -1072,11 +1159,24 @@ async def plan_package(
                         scoped.append((item, await regulation_scope(db, ctx, settings, spec)))
                     except ValueError:
                         continue  # a workspace id that is no UUID: the check has said so
+            if any(i.kind == VIEW and knowledge_names(i.wanted) for i in plan.planned):
+                namespace = await view_commands.knowledge_namespace(db, ctx, settings, workspace_id)
             await _trial(db, ctx, settings, plan, supporting)
         finally:
             await tx.rollback()
     plan.coverage, found = await _coverage(provider, scoped, settings, ctx.trace_run_id)
     plan.problems.extend(found)
+    # The views of knowledge against the ontology of the tree (CP-ADR-0080, amendment Б3).
+    plan.problems.extend(
+        await view_commands.knowledge_problems(
+            provider,
+            namespace,
+            [(i.obj, i.wanted) for i in plan.planned if i.kind == VIEW],
+            settings,
+            asked_workspace=workspace_id is not None,
+            trace_run_id=ctx.trace_run_id,
+        )
+    )
     return plan
 
 
@@ -1149,6 +1249,7 @@ async def _trial(
                     action=item.action,
                     deprecates=item.deprecates,
                     package=plan.package,
+                    settings=plan.settings_scope,
                 )
         except AuthorizationError as exc:
             plan.problems.append(_unchecked(item.obj, exc))
@@ -1259,10 +1360,14 @@ async def apply_package(
                 action=item.action,
                 deprecates=item.deprecates,
                 package=plan.package,
+                settings=plan.settings_scope,
             )
             item.version = done.version
             if touched is not None:
                 touched.extend(done.touched)
+            continue
+        if item.kind == VIEW:
+            await _apply_view(db, ctx, plan, item)
             continue
         if item.action == "unchanged":
             continue
@@ -1274,7 +1379,12 @@ async def apply_package(
             item.version = calendar.row.version
         else:
             process = await publish_process_definition(
-                db, ctx, key=item.key, spec=item.published, renamed_from=item.renamed_from
+                db,
+                ctx,
+                key=item.key,
+                spec=item.published,
+                renamed_from=item.renamed_from,
+                settings=plan.settings_scope,
             )
             item.version = process.row.version
             published[item.key] = process.row
@@ -1304,6 +1414,8 @@ async def apply_package(
             at=now,
         )
     for item in plan.planned:
+        if item.action == "retire":
+            continue  # the link stays: which package the retired view was in
         record = item.record or _new_record(ctx, plan, item.kind, item.key, item.wanted, current)
         db.add(record)
         record.package_key = plan.package_key or record.package_key
@@ -1311,16 +1423,56 @@ async def apply_package(
         record.version = int(item.version or 0)
         record.spec, record.spec_hash = item.wanted, item.wanted_hash
         _stamp(record, ctx, current, now)
-    pairs = {(e["kind"], e["key"]) for e in plan.etag_entries}
+    if plan.package_key is not None and plan.source is not None:
+        await view_commands.record_dictionaries(
+            db, ctx, plan.source, plan.package_key, plan.package_version
+        )
+    if plan.settings is not None:
+        await settings_commands.record_revision(
+            db, ctx, plan.settings, package_version=plan.package_version, plan_hash=current
+        )
+    pairs = {
+        (e["kind"], e["key"]) for e in plan.etag_entries if e["kind"] != settings_commands.ETAG_KIND
+    }
     await db.flush()
+    entries = await catalog_entries(db, ctx.tenant_id, pairs)
+    if plan.package_key is not None:
+        entry = await settings_commands.etag_entry(db, ctx.tenant_id, plan.package_key)
+        if entry is not None:
+            entries.append(entry)
     return {
         "planHash": current,
-        "catalogEtag": catalog_etag(await catalog_entries(db, ctx.tenant_id, pairs)),
+        "catalogEtag": catalog_etag(entries),
         "applied": [
             {"kind": item.kind, "key": item.key, "action": item.action, "version": item.version}
             for item in plan.planned
         ],
     }
+
+
+async def _apply_view(
+    db: AsyncSession, ctx: AuthContext, plan: PackagePlan, item: _Planned
+) -> None:
+    """Publish, restore or retire a view (CP-ADR-0080); the plan checked it."""
+    if item.action == "unchanged":
+        return
+    if item.action == "retire":
+        assert item.latest is not None
+        await view_commands.retire_view(
+            db,
+            ctx,
+            latest=item.latest,
+            package=plan.package,
+            reason=f"{VIEW_GONE}{plan.package_key or ''}",
+        )
+        return
+    if item.action == "restore":
+        assert item.latest is not None
+        await view_commands.restore_view(db, ctx, latest=item.latest, package=plan.package)
+        return
+    item.version = await view_commands.publish_view(
+        db, ctx, key=item.key, form=item.published, latest=item.latest, package=plan.package
+    )
 
 
 async def _restore(db: AsyncSession, ctx: AuthContext, plan: PackagePlan, item: _Planned) -> None:

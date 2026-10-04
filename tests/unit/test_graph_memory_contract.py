@@ -408,6 +408,20 @@ ENTITIES_PAGE = {
             "source_path": "licenses.xlsx#A2",
             "valid_from": "2026-09-01T00:00:00+00:00",
             "valid_to": None,
+            "sources": [
+                {
+                    "source": "sheet:licenses",
+                    "scope": "licenses",
+                    "snapshot_id": "snap-1",
+                    "source_path": "licenses.xlsx#A2",
+                },
+                {
+                    "source": "registry:fsb",
+                    "scope": "licenses",
+                    "snapshot_id": "snap-7",
+                    "source_path": "https://registry.example/licenses/1",
+                },
+            ],
         }
     ],
     "nextCursor": "opaque",
@@ -497,11 +511,56 @@ async def test_a_page_of_memory_is_the_answer_items_and_cursor() -> None:
         )
     finally:
         await provider.aclose()
+    [memory_item] = ENTITIES_PAGE["items"]
+    transitional = {
+        name: memory_item[name]
+        for name in (
+            "source",
+            "source_path",
+            "snapshot_id",
+            "valid_from",
+            "valid_to",
+            "namespace",
+            "scope",
+        )
+    }
     assert page == {
-        "items": ENTITIES_PAGE["items"],
+        "items": [
+            {
+                "kind": "license",
+                "key": "license:1",
+                "title": "License No. 1",
+                "attributes": {"validUntil": "2026-12-01", "okpd2": ["62.01.11"]},
+                # The contract (CP-ADR-0060, amendment 2026-10-03).
+                "validFrom": "2026-09-01T00:00:00+00:00",
+                "validTo": None,
+                "sources": [
+                    {
+                        "source": "sheet:licenses",
+                        "sourcePath": "licenses.xlsx#A2",
+                        "snapshotId": "snap-1",
+                        "source_path": "licenses.xlsx#A2",
+                        "snapshot_id": "snap-1",
+                        "scope": "licenses",
+                    },
+                    {
+                        "source": "registry:fsb",
+                        "sourcePath": "https://registry.example/licenses/1",
+                        "snapshotId": "snap-7",
+                        "source_path": "https://registry.example/licenses/1",
+                        "snapshot_id": "snap-7",
+                        "scope": "licenses",
+                    },
+                ],
+                # Memory's fields as they were, for the transition.
+                **transitional,
+            }
+        ],
         "nextCursor": "opaque",
         "asOf": "2026-09-28T00:00:00+00:00",
     }
+    # No relations unless include asked for them.
+    assert "relations" not in page["items"][0]
     KnowledgeEntitiesPageOut.model_validate(page)
 
 

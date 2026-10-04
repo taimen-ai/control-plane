@@ -9,7 +9,8 @@ anchors by key or alias, as written or with ``{name}`` normalized
 sections by kind, ``used`` with entities, facts and snapshot ids. The pack
 registry answers are memory-service's own (``packages``/``namespaceKinds``).
 The entity list (``entities:query``, K030) pages the nodes of the kinds in
-``(kind, key)`` order with a keyset cursor, as ``context/entities`` does.
+``(kind, key)`` order with a keyset cursor, as ``context/entities`` does, each
+with its merged ``sources`` (MEM-ADR-022).
 """
 
 from __future__ import annotations
@@ -477,6 +478,14 @@ class FakeGraphMemory:
                 "source_path": self.nodes[key].source_path,
                 "valid_from": "2026-01-01T00:00:00+00:00",
                 "valid_to": None,
+                "sources": [
+                    {
+                        "source": "git:control-plane",
+                        "scope": "",
+                        "snapshot_id": "s1",
+                        "source_path": self.nodes[key].source_path,
+                    }
+                ],
             }
             for kind, key in page
         ]

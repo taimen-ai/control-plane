@@ -16,9 +16,27 @@ from typing import Any
 from control_plane.domain.errors import ValidationError
 
 SENSITIVE_KEY_PATTERN = re.compile(
-    r"(?:api[_-]?key|access[_-]?token|bearer|password|secret|credential|"
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|bearer|password|secret|credential|"
     r"transcript|chat[_-]?history|raw[_-]?prompt|chain[_-]?of[_-]?thought|reasoning)",
     re.IGNORECASE,
+)
+# Keys whose values the JSON logger replaces, compared whole and lower-cased
+# (CP-ADR-0079 §14). ``code`` is an OAuth authorization code: a log extra that
+# carries an error code names it ``error_code``. Unlike the pattern above it is
+# no substring match — ``reasonCode`` and ``key_hash_prefix`` stay readable.
+LOG_SENSITIVE_KEYS = frozenset(
+    {
+        "authorization",
+        "api_key",
+        "apikey",
+        "key_hash",
+        "password",
+        "token",
+        "code",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+    }
 )
 ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?:^|\s)(?:/(?:Users|home|private|tmp|var|opt|Volumes)/|[A-Za-z]:[\\/])"

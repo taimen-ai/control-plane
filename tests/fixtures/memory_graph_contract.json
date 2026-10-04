@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes. paths /api/memory/entities:query, schemas.EntitiesQueryIn (WhereClause in $defs, refs rewritten to #/$defs/) and entitiesQuery.EntitiesQueryResult (EntityItem in $defs) are copied from memory-service feature/company-knowledge 7492f04 app.openapi() (K030, MEM-ADR-020 amendment: the entity list); the value rules of its where conditions are those of typedRequest.properties.where (the same context/where.parse_where). The namespace parameter of GET /api/memory/packages/{name} (a tenant pack, tenant:<name>, is found only with ?namespace= of a namespace that sees it) is copied from memory-service master e33aafc server/memory_api.py memory_package_get (K007, amendment 2026-09-28; 7f43a8c has no such parameter), recorded in that path's memoryService.",
+  "$comment": "Pinned contract of the Memory Service graph reads the core makes (CP-ADR-0064). paths/schemas are copied from memory-service app.openapi(); typedRequest is hand-extracted from context/typed.py; packages/namespaceKinds are answers produced by memory-service code (parse_pack(...).to_payload(), KindCatalog.build(...).to_payload()) for the superproject's integrations/selfdev software-delivery pack. Regenerate when memory-service changes these endpoints or the pack changes. paths /api/memory/entities:query, schemas.EntitiesQueryIn (WhereClause in $defs, refs rewritten to #/$defs/) and entitiesQuery.EntitiesQueryResult (EntityItem in $defs) are copied from memory-service feature/company-knowledge 7492f04 app.openapi() (K030, MEM-ADR-020 amendment: the entity list); the value rules of its where conditions are those of typedRequest.properties.where (the same context/where.parse_where). The namespace parameter of GET /api/memory/packages/{name} (a tenant pack, tenant:<name>, is found only with ?namespace= of a namespace that sees it) is copied from memory-service master e33aafc server/memory_api.py memory_package_get (K007, amendment 2026-09-28; 7f43a8c has no such parameter), recorded in that path's memoryService. entitiesQuery.EntitiesQueryResult was re-pinned from memory-service master 372a52a server/domain_schemas.EntitiesQueryResult.model_json_schema(by_alias=True, mode='serialization') (EntityItem.sources of EntitySource, MEM-ADR-022; CP-ADR-0060 amendment 2026-10-03). typedRelations is hand-extracted from the same commit, context/typed.py: the fields of a fact (_Compiler._record_fact) and of a section item (entity_state) the core reads, and relationName from server/domain_schemas.RelationSpecIn.relation, for include.relations of the entity list.",
   "memoryService": {
     "repository": "monthu56/taimen-memory-service",
     "branch": "master",
@@ -643,17 +643,144 @@
   },
   "entitiesQuery": {
     "memoryService": {
-      "branch": "feature/company-knowledge",
-      "commit": "7492f04"
+      "branch": "master",
+      "commit": "372a52a"
     },
     "EntitiesQueryResult": {
+      "$defs": {
+        "EntityItem": {
+          "additionalProperties": true,
+          "description": "Сущность перечня — сведение версий источников, действующих на as_of (MEM-ADR-022).",
+          "properties": {
+            "kind": {
+              "title": "Kind",
+              "type": "string"
+            },
+            "key": {
+              "title": "Key",
+              "type": "string"
+            },
+            "namespace": {
+              "title": "Namespace",
+              "type": "string"
+            },
+            "title": {
+              "title": "Title",
+              "type": "string"
+            },
+            "attributes": {
+              "additionalProperties": true,
+              "description": "Сведённые атрибуты: атрибут одного источника не пропадает от снимка другого; конфликт — sourcePriority вида, затем последний писавший атрибут.",
+              "title": "Attributes",
+              "type": "object"
+            },
+            "source": {
+              "description": "Источник старшей из сведённых версий.",
+              "title": "Source",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Scope источника снимка.",
+              "title": "Scope",
+              "type": "string"
+            },
+            "snapshot_id": {
+              "title": "Snapshot Id",
+              "type": "string"
+            },
+            "source_path": {
+              "description": "Цитата: путь/ссылка на источник старшей версии.",
+              "title": "Source Path",
+              "type": "string"
+            },
+            "valid_from": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Valid From"
+            },
+            "valid_to": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Valid To"
+            },
+            "sources": {
+              "description": "Все источники, из версий которых сведена сущность, по старшинству.",
+              "items": {
+                "$ref": "#/$defs/EntitySource"
+              },
+              "title": "Sources",
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "key",
+            "namespace",
+            "title",
+            "attributes",
+            "source",
+            "scope",
+            "snapshot_id",
+            "source_path"
+          ],
+          "title": "EntityItem",
+          "type": "object"
+        },
+        "EntitySource": {
+          "additionalProperties": true,
+          "description": "Источник, из версии которого сведена сущность (MEM-ADR-022).",
+          "properties": {
+            "source": {
+              "title": "Source",
+              "type": "string"
+            },
+            "scope": {
+              "title": "Scope",
+              "type": "string"
+            },
+            "snapshot_id": {
+              "title": "Snapshot Id",
+              "type": "string"
+            },
+            "source_path": {
+              "description": "Цитата: путь/ссылка на источник версии.",
+              "title": "Source Path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "scope",
+            "snapshot_id",
+            "source_path"
+          ],
+          "title": "EntitySource",
+          "type": "object"
+        }
+      },
+      "additionalProperties": true,
+      "description": "Страница перечня в порядке (kind, key, namespace); конец — nextCursor: null.",
       "properties": {
         "items": {
           "items": {
             "$ref": "#/$defs/EntityItem"
           },
-          "type": "array",
-          "title": "Items"
+          "title": "Items",
+          "type": "array"
         },
         "nextCursor": {
           "anyOf": [
@@ -675,15 +802,16 @@
               "type": "null"
             }
           ],
+          "default": null,
           "title": "As Of"
         },
         "namespaces": {
+          "default": [],
           "items": {
             "type": "string"
           },
-          "type": "array",
           "title": "Namespaces",
-          "default": []
+          "type": "array"
         },
         "stats": {
           "anyOf": [
@@ -695,100 +823,85 @@
               "type": "null"
             }
           ],
+          "default": null,
           "title": "Stats"
         }
       },
-      "additionalProperties": true,
-      "type": "object",
       "required": [
         "items",
         "nextCursor"
       ],
       "title": "EntitiesQueryResult",
-      "description": "Страница перечня в порядке (kind, key, namespace); конец — nextCursor: null.",
-      "$defs": {
-        "EntityItem": {
-          "properties": {
-            "kind": {
-              "type": "string",
-              "title": "Kind"
-            },
-            "key": {
-              "type": "string",
-              "title": "Key"
-            },
-            "namespace": {
-              "type": "string",
-              "title": "Namespace"
-            },
-            "title": {
-              "type": "string",
-              "title": "Title"
-            },
-            "attributes": {
-              "additionalProperties": true,
-              "type": "object",
-              "title": "Attributes"
-            },
-            "source": {
-              "type": "string",
-              "title": "Source",
-              "description": "Источник снимка, держащий версию."
-            },
-            "scope": {
-              "type": "string",
-              "title": "Scope",
-              "description": "Scope источника снимка."
-            },
-            "snapshot_id": {
-              "type": "string",
-              "title": "Snapshot Id"
-            },
-            "source_path": {
-              "type": "string",
-              "title": "Source Path",
-              "description": "Цитата: путь/ссылка на источник версии."
-            },
-            "valid_from": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Valid From"
-            },
-            "valid_to": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Valid To"
-            }
-          },
-          "additionalProperties": true,
-          "type": "object",
-          "required": [
-            "kind",
-            "key",
-            "namespace",
-            "title",
-            "attributes",
-            "source",
-            "scope",
-            "snapshot_id",
-            "source_path"
-          ],
-          "title": "EntityItem",
-          "description": "Сущность перечня — версия, действующая на as_of."
+      "type": "object"
+    }
+  },
+  "typedRelations": {
+    "fact": {
+      "type": "object",
+      "required": [
+        "fact_id",
+        "relation",
+        "subject",
+        "object"
+      ],
+      "properties": {
+        "fact_id": {
+          "type": "string"
+        },
+        "relation": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string",
+          "description": "natural_key of the subject"
+        },
+        "object": {
+          "type": "string",
+          "description": "natural_key of the object"
+        },
+        "valid_from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "valid_to": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
+    },
+    "sectionItem": {
+      "type": "object",
+      "required": [
+        "natural_key",
+        "kind",
+        "namespace",
+        "title"
+      ],
+      "properties": {
+        "natural_key": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "anchor": {
+          "type": "boolean"
+        }
+      }
+    },
+    "relationName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,62}$"
     }
   }
 }

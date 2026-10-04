@@ -477,3 +477,34 @@ async def test_a_release_that_breaks_still_gives_the_copy_back(
 
     # Not held by the run that broke: the pool hands the copy out again.
     pool.release(pool.acquire(task["publicId"]), "failed")
+
+
+async def test_setup_sees_the_services_and_their_password_stays_out_of_durable_state(
+    client: httpx.AsyncClient, sdk: Make, tmp_path: Path, database: int
+) -> None:
+    # Setup runs after the services are ready, in the environment of the run
+    # (TASK-001273); a failing one that prints the password leaves it nowhere.
+    s = await _setup(client)
+    saw = tmp_path / "setup-saw.txt"
+    runner_yaml = RUNNER_YAML + (
+        f'setup: \'echo "${VARIABLE}" > {saw}; echo "error: cannot migrate ${VARIABLE}"; exit 1\'\n'
+    )
+    pool = ExecutionWorkspacePool(_origin(tmp_path / "forge" / "repo", runner_yaml), tmp_path / "w")
+    services, fake = _services(tmp_path, database, polls=["ready"])
+    adapter, seen = _claude(tmp_path)
+    task = await create_task(client, s["admin"], title="Needs a database")
+
+    await _work(sdk, s["agent"], adapter, pool, services, cycles=1)
+
+    url = f"postgresql://test:{PASSWORD}@localhost:{database}/test"
+    assert saw.read_text().splitlines() == [url]
+    assert not seen.exists()  # the executor never started
+    [run] = (await _get(client, s["admin"], "/runs", taskId=task["id"]))["items"]
+    assert run["failureReason"] == "setup_failed"
+    # The value of the variable carries the password: all of it is hidden.
+    assert "exited 1: error: cannot migrate ***." in run["output"]["reason"]
+    [request_id] = fake.requests
+    assert fake.signals[-1] == ("release", request_id)
+    durable = await _durable_text(client, s["admin"], task["id"])
+    assert PASSWORD not in durable and TOKEN not in durable
+    assert str(tmp_path) not in durable

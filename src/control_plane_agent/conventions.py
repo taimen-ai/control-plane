@@ -111,7 +111,11 @@ class CatalogConventions:
         if config is None:
             logger.info("%s has no %s at %s", self.entry.key, RUNNER_CONFIG_PATH, base[:12])
         if config is None or not config.neighbours:
-            return Conventions(revision=base, config=config, agents_md=agents_md)
+            # A superproject without neighbours still holds its submodules to
+            # the base's pointers (``Workspace.neighbour_check``).
+            return Conventions(
+                revision=base, config=config, agents_md=agents_md, inside=self.is_superproject
+            )
         entries = [self._neighbour(name) for name in config.neighbours]
         inside = self.is_superproject
         pins, at = (origin, base) if inside else self._superproject_base()

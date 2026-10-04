@@ -20,20 +20,20 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: control-plane
+        working-directory: services/control-plane
     steps:
       - uses: actions/checkout@v4
         with:
-          path: control-plane
+          path: services/control-plane
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.PLATFORM_AUTH_SDK_REPO || 'taimen-ai/platform-auth-sdk' }}
           ssh-key: ${{ secrets.PLATFORM_AUTH_SDK_DEPLOY_KEY }}
-          path: platform-auth-sdk
+          path: sdk/platform-auth-sdk
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-          cache-dependency-glob: control-plane/uv.lock
+          cache-dependency-glob: services/control-plane/uv.lock
       # The same make targets the runner daemon calls (.agents/runner.yaml).
       - run: make install
       - name: ruff
@@ -60,21 +60,22 @@ jobs:
           --health-retries 15
     defaults:
       run:
-        working-directory: control-plane
+        working-directory: services/control-plane
     steps:
-      # platform-auth-sdk is a path dependency (../platform-auth-sdk, ADR-0029).
+      # platform-auth-sdk is a path dependency (../../sdk/platform-auth-sdk): the
+      # checkouts repeat the umbrella layout (TAI-ADR-0064).
       - uses: actions/checkout@v4
         with:
-          path: control-plane
+          path: services/control-plane
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.PLATFORM_AUTH_SDK_REPO || 'taimen-ai/platform-auth-sdk' }}
           ssh-key: ${{ secrets.PLATFORM_AUTH_SDK_DEPLOY_KEY }}
-          path: platform-auth-sdk
+          path: sdk/platform-auth-sdk
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-          cache-dependency-glob: control-plane/uv.lock
+          cache-dependency-glob: services/control-plane/uv.lock
       - name: Install dependencies
         run: make install
       - name: Lint
@@ -110,18 +111,18 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      # The build context is the parent of the component (flat layout, ADR-0029):
-      # platform-auth-sdk is a path dependency and must sit next to control-plane.
+      # The build context is the root of the umbrella layout (TAI-ADR-0064):
+      # platform-auth-sdk is a path dependency at sdk/platform-auth-sdk.
       - uses: actions/checkout@v4
         with:
-          path: control-plane
+          path: services/control-plane
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.PLATFORM_AUTH_SDK_REPO || 'taimen-ai/platform-auth-sdk' }}
           ssh-key: ${{ secrets.PLATFORM_AUTH_SDK_DEPLOY_KEY }}
-          path: platform-auth-sdk
+          path: sdk/platform-auth-sdk
       - name: Build image
-        run: docker build -f control-plane/Dockerfile -t control-plane:ci .
+        run: docker build -f services/control-plane/Dockerfile -t control-plane:ci .
 
   # TAI-ADR-0043: the trunk must stay publishable. Same tool as the release
   # (tools/oss_check.py in the umbrella); private stop-list patterns come from a

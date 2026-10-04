@@ -1,0 +1,22 @@
+apiVersion: catalog.example/v1
+kind: View
+key: tender-card
+spec:
+  title: tenders.card.title
+  source: {process: tender, instance: param.id}
+  layout:
+    - block: header
+      title: data.procurement.object
+      status: stage
+      actions: steps
+    - block: fields
+      section: tenders.card.procurement
+      items:
+        - {label: tenders.fields.procurement.number, value: data.procurement.number}
+        - {label: tenders.fields.procurement.law, value: data.procurement.law}
+        - {label: tenders.fields.procurement.maxPrice, value: "decimal(data.procurement.maxPrice.amount)", format: money}
+    - block: related
+      knowledge: {kind: legal_entity, key: "data.procurement.customer.inn"}
+    - block: artifacts
+      types: [procurement-document]
+    - block: timeline

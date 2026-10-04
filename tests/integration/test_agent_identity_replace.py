@@ -169,7 +169,7 @@ async def test_a_binding_made_beside_the_registry_is_adopted_with_the_revision_r
 ) -> None:
     """The ADR-0053 workaround of a bootstrap: a new binding, the old one revoked.
 
-    ``iam-bindings`` no longer makes such a binding (E4); one made before is
+    ``iam-bindings`` no longer makes such a binding (I4); one made before is
     written here directly.
     """
     admin_key, principal_id, first = await _service(client)
@@ -392,7 +392,7 @@ async def test_upsert_does_not_take_the_identity_of_a_registry_agent(
         "status"
     ] == "active"
 
-    # Nor is its own identity re-bound there, for an admin neither (E4, TASK-001127).
+    # Nor is its own identity re-bound there, for an admin neither (I4, TASK-001127).
     same = await client.post(
         f"/api/v1/principals/{principal_id}/iam-bindings",
         json={**first, "permissions": ["events.read", "tasks.read"]},

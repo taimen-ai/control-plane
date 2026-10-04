@@ -17,6 +17,7 @@ from control_plane.api.middleware import (
     MetricsMiddleware,
     RequestIdMiddleware,
 )
+from control_plane.api.nul_guard import NulCharacterGuardMiddleware
 from control_plane.api.v1.router import api_v1_router
 from control_plane.application.authorization import configure_authorizer
 from control_plane.config import Settings, get_settings
@@ -31,6 +32,7 @@ from control_plane.infrastructure.context_provider import build_context_provider
 from control_plane.infrastructure.db.engine import build_engine, build_session_factory
 from control_plane.infrastructure.db.migrations import get_head_revision
 from control_plane.infrastructure.realtime.hub import RealtimeHub
+from control_plane.infrastructure.secret_store import build_secret_store
 from control_plane.logging import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         content_store = build_content_store(settings)
         app.state.content_store = content_store
         await _prepare_content_store(content_store)
+        # Secret store of connections (CP-ADR-0079 §1): None without
+        # CP_SECRET_STORE_URL; the routes that need it answer 503.
+        secret_store = build_secret_store(settings)
+        app.state.secret_store = secret_store
         await hub.start()
         try:
             yield
@@ -85,6 +91,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await hub.stop()
             if content_store is not None:
                 await content_store.aclose()
+            if secret_store is not None:
+                await secret_store.aclose()
             if enforcement is not None:
                 await enforcement.aclose()
             for closable in authz_closables:
@@ -109,6 +117,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_exception_handlers(app)
 
     # add_middleware() prepends, so the last one added runs outermost.
+    # Innermost: buffers a JSON body only after the size limit let it through.
+    # The artifact upload streams any media type into the content store, not
+    # into PostgreSQL (CP-ADR-0083).
+    app.add_middleware(NulCharacterGuardMiddleware, exempt_paths=("/api/v1/artifact-contents",))
     app.add_middleware(MetricsMiddleware, counters=metrics)
     app.add_middleware(
         BodySizeLimitMiddleware,

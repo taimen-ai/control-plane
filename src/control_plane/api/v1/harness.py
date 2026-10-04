@@ -47,6 +47,17 @@ async def list_available_work(
     include_subprojects: bool = Query(default=False, alias="includeSubprojects"),
     assignee_id: uuid.UUID | None = Query(default=None, alias="assigneeId"),
     assigned_to_me: bool = Query(default=False, alias="assignedToMe"),
+    type_key: list[str] | None = Query(
+        default=None,
+        alias="typeKey",
+        description=(
+            "Only tasks of these work item types (repeatable; a key matches every "
+            "version of the type). Narrows the queue and nothing else: permissions, "
+            "visibility and eligibility are unchanged. Combines with every other "
+            "filter and the cursor. A blank key or more than "
+            f"{discovery_queries.MAX_TYPE_KEYS} keys is 422 invalid_type_key."
+        ),
+    ),
 ) -> JSONResponse:
     # assignedToMe is the honest way for a worker to ask for its own queue: it
     # needs no knowledge of its own Principal id, and it cannot be pointed at
@@ -63,5 +74,6 @@ async def list_available_work(
         project_id=project_id,
         include_subprojects=include_subprojects,
         assignee_id=assignee_id,
+        type_keys=type_key,
     )
     return JSONResponse(page_body(await task_bodies(db, ctx, tasks), next_cursor))

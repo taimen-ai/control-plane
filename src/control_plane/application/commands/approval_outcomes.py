@@ -59,6 +59,7 @@ from control_plane.application.commands.agent_assignees import (
 )
 from control_plane.application.commands.principals import ensure_core_principal
 from control_plane.application.commands.relations import add_relation, resolve_task
+from control_plane.application.commands.role_references import is_role_reference, role_for_task
 from control_plane.application.commands.skill_invocations import (
     CANCELLED_BY_SYSTEM,
     LIVE_STATUSES,
@@ -77,6 +78,7 @@ from control_plane.application.locking import (
     lock_principal_key_share,
     lock_principals_key_share,
 )
+from control_plane.application.visibility import approval_visible, with_visibility
 from control_plane.domain.approval_outcomes import (
     COMMENT,
     COMPLETE_TASK,
@@ -500,6 +502,9 @@ async def read_context(
     for root in sorted(roots & {"task", "spawnedBy"}):
         owner = owners[root]
         if owner is not None:
+            # Invisible work is missing work to its reader (CP-ADR-0082 §3.7).
+            if not ctx.sees_workspace(owner.workspace_id):
+                raise NotFoundError("Task not found", details={"taskId": str(owner.id)})
             await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(owner.id)))
     context.spawned_by = task_view(spawned_by)
     wanted = {(path.root, path.artifact_type) for path in paths if path.artifact_type is not None}
@@ -636,6 +641,11 @@ async def _ensure_work(
         # gets no second approval.
         # The key is tenant-wide and chosen by the schema's author: finding a
         # work item by it must not hand the decider one they cannot read.
+        # Work of a workspace outside the decider's visibility is not theirs
+        # to read either (CP-ADR-0082 §3.7): ``authorize`` on a task does not
+        # see workspaces.
+        if not ctx.sees_workspace(existing.workspace_id):
+            raise NotFoundError("Task not found", details={"key": key})
         try:
             await authorize(
                 ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(existing.id))
@@ -728,16 +738,29 @@ async def _request_gate(session: AsyncSession, ctx: AuthContext, task: Task, spe
 
     if not isinstance(spec, dict):  # pragma: no cover - the schema refuses it
         raise _input_error(ENSURE_WORK, REQUEST_APPROVAL, "must be an object")
-    assignee = _optional_uuid(
-        {"assignee": spec.get("assignee")}, f"{ENSURE_WORK}.{REQUEST_APPROVAL}", "assignee"
-    )
-    if assignee is None:
-        raise _input_error(f"{ENSURE_WORK}.{REQUEST_APPROVAL}", "assignee", "resolved to nothing")
+    field_name = f"{ENSURE_WORK}.{REQUEST_APPROVAL}"
+    role_id: uuid.UUID | None = None
+    assignee: uuid.UUID | None = None
+    if is_role_reference(spec.get("assignee")):
+        # A role of the package by slug (CP-ADR-0061, amendment 2026-10-01),
+        # seen from the workspace of the work item just filed.
+        role_id = await role_for_task(
+            session,
+            ctx,
+            str(spec["assignee"]),
+            workspace_id=task.workspace_id,
+            field=f"{field_name}.assignee",
+        )
+    else:
+        assignee = _optional_uuid({"assignee": spec.get("assignee")}, field_name, "assignee")
+        if assignee is None:
+            raise _input_error(field_name, "assignee", "resolved to nothing")
     approval = await request_approval(
         session,
         ctx,
         task_ref=str(task.id),
         assigned_principal_id=assignee,
+        required_role_id=role_id,
         comment=str(spec.get("comment") or ""),
         gate=True,
     )
@@ -1064,7 +1087,7 @@ async def _referenced_principals(
             # The action itself refuses the same way when it runs.
             logger.debug(
                 "outcome action inputs do not render for the pre-lock",
-                extra={"action_index": index, "code": exc.code},
+                extra={"action_index": index, "error_code": exc.code},
             )
             continue
         gate = inputs.get(REQUEST_APPROVAL)
@@ -1078,7 +1101,7 @@ async def _referenced_principals(
                 except DomainError as exc:
                     logger.debug(
                         "outcome assignee names no agent for the pre-lock",
-                        extra={"action_index": index, "code": exc.code},
+                        extra={"action_index": index, "error_code": exc.code},
                     )
                     continue
             elif value:
@@ -1235,7 +1258,11 @@ async def execute_outcome(
     assert outcome is not None
     actions = await declared_actions(session, approval, outcome)
     causation_id = causation_id or await _decision_event_id(session, approval)
-    ctx = _decider_context(approval, trace_run_id=trace_run_id, causation_id=causation_id)
+    # The decider acts within their visibility as it stands now, like a
+    # request of theirs (CP-ADR-0082 V2).
+    ctx = await with_visibility(
+        session, _decider_context(approval, trace_run_id=trace_run_id, causation_id=causation_id)
+    )
     # The outcome acts as the decider: its principal before any task row
     # (rule 1 of ``application/locking.py``, CP-ADR-0077 §3). Only the approval
     # row is held so far, and ``principals/{id}:disable`` never takes it.
@@ -1610,7 +1637,7 @@ async def replay_outcome(
     """
     await authorize(ctx, Permission.APPROVALS_DECIDE)
     approval = await _lock_approval(session, ctx.tenant_id, approval_id)
-    if approval is None:
+    if approval is None or not await approval_visible(session, ctx, approval):
         raise NotFoundError("Approval not found", details={"approvalId": str(approval_id)})
     if not replayable(approval):
         raise ConflictError(

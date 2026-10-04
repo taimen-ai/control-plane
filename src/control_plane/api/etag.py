@@ -44,3 +44,12 @@ def parse_if_match(header_value: str | None, entity: str = "task") -> int:
 
 def format_task_etag(version: int) -> str:
     return format_etag("task", version)
+
+
+def none_match(header_value: str | None, tag: str) -> bool:
+    """Whether ``If-None-Match`` names ``tag``, quoted or not, weak or not."""
+    if not header_value:
+        return False
+    bare = tag.strip('"')
+    candidates = (value.strip().removeprefix("W/").strip('"') for value in header_value.split(","))
+    return bare in candidates

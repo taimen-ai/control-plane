@@ -6,6 +6,7 @@ its skill executor already take. What the host owns stays the host's.
 """
 
 import copy
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from control_plane_agent.revision import (
 from control_plane_agent.skills import (
     ENV_CONCURRENCY,
     ENV_HTTP_ORIGINS,
+    ENV_LOCAL_ENV,
     ENV_LOCAL_ISOLATION,
     ENV_LOCAL_PACKAGES,
     ENV_MCP_ORIGINS,
@@ -145,6 +147,38 @@ def test_skill_settings_of_the_revision_replace_the_hosts() -> None:
     assert skills_environ(_revision("reviewer.yaml"), host) is None
 
 
+def _skills_with(params: dict[str, Any]) -> AgentRevision:
+    revision = _revision("skills-executor.yaml")
+    revision.spec["executor"] = {"kind": "skills", "params": params}
+    return revision
+
+
+def test_the_settings_of_a_skills_executor_reach_the_skill_host() -> None:
+    """``executor.params.env`` (CP-ADR-0073, amendment 2026-10-01)."""
+    revision = _skills_with({"env": {"PORTAL_URL": "https://portal.example.test"}})
+    assert adapter_for_revision(revision, HOST) is None
+    values = skills_environ(revision, {ENV_LOCAL_ENV: '{"OTHER": "host"}'})
+    assert values is not None
+    # The revision owns the variable: the host's value does not leak in.
+    assert json.loads(values[ENV_LOCAL_ENV]) == {"PORTAL_URL": "https://portal.example.test"}
+
+    # No settings, empty settings: the host's value is dropped all the same.
+    for params in ({}, {"env": {}}):
+        values = skills_environ(_skills_with(params), {ENV_LOCAL_ENV: '{"OTHER": "host"}'})
+        assert values is not None and ENV_LOCAL_ENV not in values
+    # Another kind has no such parameter.
+    assert ENV_LOCAL_ENV not in (skills_environ(_revision("coder.yaml"), {}) or {})
+
+
+def test_bad_settings_of_a_skills_executor_are_a_revision_error() -> None:
+    with pytest.raises(RevisionError, match="a secret"):
+        skills_environ(_skills_with({"env": {"PORTAL_API_KEY": "x"}}), {})
+    with pytest.raises(RevisionError, match="must be a string"):
+        skills_environ(_skills_with({"env": {"PORTAL_URL": None}}), {})
+    with pytest.raises(RevisionError, match="at most"):
+        skills_environ(_skills_with({"env": {f"V{i}": "x" for i in range(51)}}), {})
+
+
 # --- executor ------------------------------------------------------------------------
 
 
@@ -222,7 +256,20 @@ def test_codex_params_come_from_the_revision() -> None:
         ({"kind": "claude-code", "params": {"tools": {"only": []}}}, "allow and deny"),
         ({"kind": "codex", "params": {"sandbox": "none"}}, "sandbox"),
         ({"kind": "codex", "params": {"timeoutSeconds": "60"}}, "timeoutSeconds"),
-        ({"kind": "skills", "params": {"x": 1}}, "takes no params"),
+        ({"kind": "skills", "params": {"x": 1}}, "takes only params.env"),
+        ({"kind": "skills", "params": {"env": {"PORTAL_TOKEN": "x"}}}, "a secret"),
+        (
+            {"kind": "skills", "params": {"env": {"CONTROL_PLANE_URL": "x"}}},
+            "belongs to the host",
+        ),
+        (
+            {"kind": "skills", "params": {"env": {"HTTPS_PROXY": "http://proxy.test"}}},
+            "belongs to the host",
+        ),
+        ({"kind": "skills", "params": {"env": {"GIT_DIR": "x"}}}, "belongs to the host"),
+        ({"kind": "skills", "params": {"env": {"portal": "x"}}}, "not a variable name"),
+        ({"kind": "skills", "params": {"env": {"PORTAL_URL": 1}}}, "must be a string"),
+        ({"kind": "skills", "params": {"env": []}}, "must be an object"),
         ({"kind": "opencode"}, "not run by this daemon"),
     ],
 )
@@ -344,7 +391,7 @@ def test_neighbours_without_a_superproject_are_refused(tmp_path: Path) -> None:
         ({"publish": 0}, "publish must be a boolean"),
         ({"neighbours": ["sdk"]}, "neighbours must map"),
         ({"neighbours": {"sdk": 1}}, "neighbours must map"),
-        ({"neighbours": {"../sdk": "SDK"}, "superproject": "SDK"}, "unsafe neighbour name"),
+        ({"neighbours": {"../sdk": "SDK"}, "superproject": "SDK"}, "unsafe neighbour path"),
         ({"superproject": ["x"]}, "superproject must be"),
         ({"baseRef": 3}, "baseRef must be"),
         ({"directory": {"a": 1}}, "directory must be"),

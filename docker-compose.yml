@@ -56,8 +56,9 @@ services:
 
   api:
     build:
-      context: ..
-      dockerfile: control-plane/Dockerfile
+      # The root of the umbrella (TAI-ADR-0064): sdk/platform-auth-sdk is a path dependency.
+      context: ../..
+      dockerfile: services/control-plane/Dockerfile
     command: >
       sh -c "alembic upgrade head &&
              uvicorn control_plane.main:app --host 0.0.0.0 --port 8000"
@@ -81,8 +82,9 @@ services:
 
   worker:
     build:
-      context: ..
-      dockerfile: control-plane/Dockerfile
+      # The root of the umbrella (TAI-ADR-0064): sdk/platform-auth-sdk is a path dependency.
+      context: ../..
+      dockerfile: services/control-plane/Dockerfile
     command: python -m control_plane.worker
     environment:
       CP_DATABASE_URL: postgresql+psycopg://control_plane:control_plane@db:5432/control_plane
@@ -101,8 +103,9 @@ services:
   # Engine. Idles harmlessly when CP_CONTEXT_PROVIDER=none (the default).
   context-adapter:
     build:
-      context: ..
-      dockerfile: control-plane/Dockerfile
+      # The root of the umbrella (TAI-ADR-0064): sdk/platform-auth-sdk is a path dependency.
+      context: ../..
+      dockerfile: services/control-plane/Dockerfile
     command: python -m control_plane.worker.context_adapter
     environment:
       CP_DATABASE_URL: postgresql+psycopg://control_plane:control_plane@db:5432/control_plane

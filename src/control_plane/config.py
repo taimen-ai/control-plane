@@ -1,8 +1,19 @@
 """Application configuration loaded from environment variables (prefix ``CP_``)."""
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def is_https_url(value: str) -> bool:
+    """An absolute ``https`` address with a host."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme == "https" and bool(parts.hostname) and value == value.strip()
 
 
 class Settings(BaseSettings):
@@ -44,6 +55,12 @@ class Settings(BaseSettings):
 
     # Realtime: WS falls back to polling at this interval if NOTIFY is lost.
     ws_poll_interval_seconds: float = 5.0
+
+    # Export of the journal (CP-ADR-0068, export amendment): the longest period and
+    # the most events one GET /events:export hands out; above either the
+    # export is refused before the body starts.
+    events_export_max_period_days: int = 92
+    events_export_max_events: int = 100_000
 
     worker_poll_interval_seconds: float = 1.0
     outbox_batch_size: int = 50
@@ -192,6 +209,34 @@ class Settings(BaseSettings):
     artifact_max_bytes: int = 104_857_600
     # How long an upload may wait for an artifact to reference it (§2, §10).
     artifact_upload_ttl_seconds: int = 86_400
+
+    # --- Secret store of connections (CP-ADR-0079 §1, §15). OpenBao; the core
+    # logs in with its IAM service token (audience below) at ``auth/jwt/login``
+    # under its own role. Empty URL: routes that need the store answer 503
+    # secret_store_unavailable and change nothing.
+    secret_store_url: str = ""
+    secret_store_audience: str = "openbao"
+    secret_store_role: str = "control-plane"
+    secret_store_timeout_seconds: float = 10.0
+    # The public https address of GET /api/v1/connections:callback, registered
+    # at the provider letter for letter; empty: :authorize is 409.
+    oauth_redirect_uri: str = ""
+    # The console page the callback returns the browser to; empty: :authorize
+    # is 409, the callback of a live state answers 200 text/plain.
+    connections_return_url: str = ""
+    oauth_state_ttl_seconds: int = 600
+    # The full pass of the worker connections-policy-sync (§9): agents'
+    # policies and roles in the store, expired keys, orphaned policies.
+    connections_sync_seconds: float = 300.0
+
+    @field_validator("oauth_redirect_uri", "connections_return_url")
+    @classmethod
+    def _https_or_empty(cls, value: str) -> str:
+        # The redirect carries the provider's code, the return page its
+        # outcome: either goes over https or OAuth stays off (CP-ADR-0079 §6).
+        if value and not is_https_url(value):
+            raise ValueError("an https:// address, or empty")
+        return value
 
 
 @lru_cache

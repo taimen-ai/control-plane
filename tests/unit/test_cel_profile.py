@@ -269,6 +269,72 @@ def test_string_and_list_extensions_and_macros() -> None:
     assert _value("cel.bind(n, data.procurement.lots, n * n)") == 4
 
 
+AMOUNTS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "amount": {"type": "string"},
+        "count": {"type": "integer"},
+        "rate": {"type": "number"},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("expression", "data", "value"),
+    [
+        ("decimal(data.amount)", {"amount": "1500000.50"}, 1500000.5),
+        ("decimal(data.amount)", {"amount": " -3 "}, -3.0),
+        ("decimal(data.amount)", {"amount": "1e3"}, 1000.0),
+        ("decimal(data.amount)", {"amount": ".5"}, 0.5),
+        ("decimal(data.count)", {"count": 7}, 7.0),
+        ("decimal(data.rate)", {"rate": 2.5}, 2.5),
+        ("decimal(data.amount) + decimal(data.count)", {"amount": "0.5", "count": 1}, 1.5),
+    ],
+)
+def test_decimal_reads_a_number_in_decimal_notation(
+    expression: str, data: dict[str, Any], value: float
+) -> None:
+    program = environment(data=AMOUNTS).compile(expression)
+    assert program.output_type == "DOUBLE"
+    assert program.evaluate({"data": data}).value == value
+
+
+@pytest.mark.parametrize("amount", ["", "abc", "1,5", "1 000", "nan", "inf", "0x10", "1e999"])
+def test_decimal_of_what_is_no_number_is_an_evaluation_error(amount: str) -> None:
+    program = environment(data=AMOUNTS).compile("decimal(data.amount)")
+    with pytest.raises(ExpressionError) as caught:
+        program.evaluate({"data": {"amount": amount}})
+    assert caught.value.code == EXPRESSION_ERROR
+
+
+def test_decimal_of_an_absent_value_is_an_evaluation_error() -> None:
+    program = environment(data=AMOUNTS).compile("decimal(data.amount)")
+    with pytest.raises(ExpressionError) as caught:
+        program.evaluate({"data": {}})
+    assert caught.value.code == EXPRESSION_ERROR
+
+
+@pytest.mark.parametrize("expression", ["decimal(true)", "decimal([1])", "decimal()"])
+def test_decimal_takes_a_string_or_a_number(expression: str) -> None:
+    with pytest.raises(ExpressionError) as caught:
+        environment(data=AMOUNTS).compile(expression)
+    assert caught.value.code == EXPRESSION_TYPE_ERROR
+
+
+def test_a_scalar_binding_is_typed() -> None:
+    env = environment(bindings={"status": {"type": "string"}, "n": {"type": "integer"}})
+    assert env.compile("status").output_type == "STRING"
+    assert (
+        env.compile('status == "running" && n > 1').evaluate({"status": "running", "n": 2}).value
+        is True
+    )
+    with pytest.raises(ExpressionError) as caught:
+        env.compile("status == 1")
+    assert caught.value.code == EXPRESSION_TYPE_ERROR
+    # A binding without a schema stays dyn, as the translation of earlier syntaxes needs.
+    assert environment(bindings={"input": None}).compile("input").output_type == "DYN"
+
+
 def test_iso_durations() -> None:
     assert _value('duration("P3D") == duration("72h")') is True
     assert _value('duration("PT1H30M") + duration("-P1W")') == -timedelta(days=7, minutes=-90)

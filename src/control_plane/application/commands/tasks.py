@@ -19,7 +19,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane import sandbox
-from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.authorization import (
+    AuthContext,
+    ResourceRef,
+    authorize,
+    check_workspace_visible,
+)
 from control_plane.application.commands._claim_release import release_claim_on_locked_task
 from control_plane.application.commands.agent_assignees import agent_principal, resolve_assignee
 from control_plane.application.commands.eligibility import (
@@ -147,7 +152,9 @@ async def resolve_task_for_update(session: AsyncSession, ctx: AuthContext, task_
     except ValueError:
         conditions.append(Task.public_id == task_ref.upper())
     task = await session.scalar(select(Task).where(*conditions).with_for_update())
-    if task is None:
+    # Work of a workspace outside the caller's visibility answers exactly as
+    # missing work, for everything under it too (CP-ADR-0082 §3.7).
+    if task is None or not ctx.sees_workspace(task.workspace_id):
         raise NotFoundError("Task not found", details={"task": task_ref})
     return task
 
@@ -184,7 +191,10 @@ async def create_task(
     resolved once the write is authorized; ``assignee_field`` names the field
     it came from in an ``unknown_agent`` refusal.
     """
-    from control_plane.application.commands.workspaces import require_active_workspace
+    from control_plane.application.commands.workspaces import (
+        require_active_workspace,
+        require_task_type_allowed,
+    )
 
     await authorize(
         ctx,
@@ -239,6 +249,7 @@ async def create_task(
             await get_tenant_principal(session, ctx, ref)
     if workspace_id is not None:
         await require_active_workspace(session, ctx, workspace_id)
+        await require_task_type_allowed(session, ctx.tenant_id, workspace_id, task_type.key)
 
     checks = await _own_checks(session, ctx, task_type, acceptance or [])
     gathered = normalize_evidence(evidence or [])
@@ -539,9 +550,21 @@ async def update_task(
         if workspace_id is not None:
             from control_plane.application.commands.workspaces import (
                 require_active_workspace,
+                require_task_type_allowed,
             )
 
+            # Moving work into a workspace the caller does not see answers as
+            # for a missing one, before its status or allowed types can tell
+            # otherwise (CP-ADR-0082 §3.7).
+            check_workspace_visible(ctx, workspace_id)
             await require_active_workspace(session, ctx, workspace_id)
+            if workspace_id != task.workspace_id:
+                # Moving work in is filing it there: the target must allow its
+                # type (CP-ADR-0008, amendment 2026-10-03 A3).
+                moved_type = await task_type_of(session, task)
+                await require_task_type_allowed(
+                    session, ctx.tenant_id, workspace_id, moved_type.key
+                )
         changes["workspace_id"] = workspace_id
     if custom_fields is not _UNSET:
         task_type = await task_type_of(session, task)

@@ -94,13 +94,14 @@ curl -f http://localhost:8000/health/ready
 `api` сам применяет миграции (`alembic upgrade head`) при старте. OpenAPI:
 <http://localhost:8000/docs>.
 
-Контекст сборки — каталог **выше** репозитория: enforcement SDK лежит в
-соседнем репозитории `platform-auth-sdk` и подключается путём, потому что
+Контекст сборки — корень раскладки umbrella, на два уровня **выше** репозитория
+(`services/control-plane`, TAI-ADR-0064): enforcement SDK лежит в репозитории
+`platform-auth-sdk` по пути `sdk/platform-auth-sdk` и подключается путём, потому что
 общего внутреннего индекса пакетов у платформы пока нет. Compose это учитывает
 сам, а вручную образ собирается так:
 
 ```bash
-docker build -f control-plane/Dockerfile -t control-plane ..
+docker build -f services/control-plane/Dockerfile -t control-plane ../..
 ```
 
 ## Запуск локально (без контейнера для приложения)
@@ -561,7 +562,7 @@ permission_escalation`, `details.previousOwnerKind`). Principal действую
 агента реестра через этот маршрут identity не получает — `409
 agent_identity_conflict` с `details.route` `/agents/{key}/identity`; повторно
 привязать identity, уже записанную в реестре, может только `admin` (CP-ADR-0073,
-амендмент 2026-09-30, Е4).
+амендмент 2026-09-30, И4).
 
 События журнала: `iam_binding.created` / `updated` / `revoked` с
 `principalId`, `issuer`, `iamPrincipalId` и правами. После коммита роутер

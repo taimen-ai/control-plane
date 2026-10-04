@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.application.authorization import AuthContext
 from control_plane.application.common import utcnow
+from control_plane.application.visibility import with_visibility
 from control_plane.config import Settings
 from control_plane.domain.enums import PrincipalStatus
 from control_plane.domain.errors import AuthenticationError, AuthorizationError
@@ -63,7 +64,7 @@ async def resolve_auth_context(
 
     if enforcement is not None and looks_like_iam_token(token):
         try:
-            return await authenticate_with_iam(
+            ctx = await authenticate_with_iam(
                 enforcement,
                 token,
                 action=action,
@@ -74,6 +75,10 @@ async def resolve_auth_context(
             )
         except EnforcementError as exc:
             raise to_domain_error(exc) from exc
+        # Visibility is read per request, not from the binding cache: the
+        # cache is keyed by identity, the mode by principal (CP-ADR-0082 §3.3).
+        async with transaction(session_factory) as session:
+            return await with_visibility(session, ctx)
 
     break_glass = settings.break_glass_enabled and is_break_glass_prefix(extract_prefix(token))
     if not settings.legacy_api_keys_enabled and not break_glass:
@@ -83,7 +88,7 @@ async def resolve_auth_context(
         raise AuthenticationError()
 
     async with transaction(session_factory) as session:
-        return await authenticate(
+        ctx = await authenticate(
             session,
             settings,
             authorization=authorization,
@@ -91,6 +96,7 @@ async def resolve_auth_context(
             correlation_id=correlation_id,
             trace_run_id=trace_run_id,
         )
+        return await with_visibility(session, ctx)
 
 
 async def authenticate(

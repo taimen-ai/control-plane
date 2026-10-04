@@ -967,3 +967,50 @@ async def test_a_call_without_a_mock_that_leaves_the_rule_waiting_is_a_warning(
     # A call its mock answers leaves no warning.
     answered = await run(client, key, helpdesk(("tests/claim.test.yaml", CLAIM_REOPENED_TEST)))
     assert not [p for p in answered["problems"] if p["code"] == "unmocked_skill_call"]
+
+
+async def test_in_members_mode_a_task_of_an_event_outside_the_sight_is_a_missing_task(
+    client: httpx.AsyncClient, settings: Settings, sync_engine: Engine
+) -> None:
+    """CP-ADR-0082 V6: the local check reads every task with the caller's flat
+    rights, but the caller in ``members`` mode does not see the workspace of
+    the task. The setting is refused as for a task that does not exist."""
+    import dataclasses
+
+    boot = await do_bootstrap(client)
+    key = boot["apiKey"]["key"]
+    own = await create_workspace(client, key, "own")
+    foreign = await create_workspace(client, key, "foreign")
+    secret = await create_task(client, key, title="Secret merger", workspaceId=foreign["id"])
+    mine = await create_task(client, key, title="Own work", workspaceId=own["id"])
+    ctx = dataclasses.replace(
+        _iam_caller(sync_engine, boot["tenant"]["id"]),
+        visibility="members",
+        visible_workspaces=frozenset({own["id"]}),
+    )
+
+    messages = []
+    for task_id in (secret["id"], str(uuid.uuid4())):
+        body = await _test_as(
+            settings,
+            ctx,
+            helpdesk(_follow_up_test({"taskId": task_id}), rule=FOLLOW_UP_RULE),
+            own["id"],
+        )
+        (result,) = body["tests"]
+        assert result["status"] == "error", result
+        (refused,) = result["failures"]
+        assert refused["message"].startswith(
+            "given_refused: given.event.payload.taskId: the core refused it: not_found"
+        ), refused
+        assert "Secret merger" not in json.dumps(body, ensure_ascii=False)
+        messages.append(refused["message"].replace(task_id, "<id>"))
+    assert messages[0] == messages[1]
+
+    body = await _test_as(
+        settings,
+        ctx,
+        helpdesk(_follow_up_test({"taskId": mine["id"]}), rule=FOLLOW_UP_RULE),
+        own["id"],
+    )
+    assert "given_refused" not in json.dumps(body), body

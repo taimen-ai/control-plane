@@ -106,6 +106,7 @@ async def install_calendar(
     return await commands.publish_calendar(db, ctx, key=payload.key, spec=spec_as_sent(payload))
 
 
+# visibility: tenant — calendars are objects of the tenant
 @router.post(
     "/calendars",
     response_model=CalendarOut,
@@ -138,6 +139,7 @@ async def publish_calendar(
     )
 
 
+# visibility: tenant — calendars are objects of the tenant
 @router.get("/calendars", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_calendars(
     ctx: AuthDep,
@@ -162,6 +164,7 @@ async def list_calendars(
     return JSONResponse(page_body(items, next_cursor))
 
 
+# visibility: tenant — calendars are objects of the tenant
 @router.get(
     "/calendars/{ref}",
     response_model=CalendarOut,
@@ -173,6 +176,7 @@ async def get_calendar(ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     return JSONResponse(await attach_package(db, ctx.tenant_id, "Calendar", body))
 
 
+# visibility: tenant — calendars are objects of the tenant
 @router.post(
     "/calendars/{key}:retire",
     response_model=CalendarRetireOut,

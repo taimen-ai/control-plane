@@ -23,12 +23,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy import and_, delete, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.application.authorization import (
     AuthContext,
     ResourceRef,
+    WorkspaceNotVisible,
     authorize,
 )
 from control_plane.application.commands._artifact_content import (
@@ -36,6 +37,7 @@ from control_plane.application.commands._artifact_content import (
     CONTENT_PURGED,
     CONTENT_STORED,
     artifact_event_fields,
+    lock_content,
 )
 from control_plane.application.commands._child_ceiling import enforce_run_ceiling
 from control_plane.application.commands.approvals import event_comment
@@ -45,6 +47,7 @@ from control_plane.application.commands.task_inputs import is_input_of
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_caller
+from control_plane.application.visibility import artifact_visible, task_visible
 from control_plane.domain.artifact_type import check_artifact_against_type
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import (
@@ -119,13 +122,6 @@ def artifact_resource(
     return None
 
 
-async def _lock_content(session: AsyncSession, tenant_id: uuid.UUID, sha256: str) -> None:
-    """Serialize every change of who needs the object (tenant, sha256)."""
-    await session.execute(
-        select(func.pg_advisory_xact_lock(func.hashtextextended(f"cp:ac:{tenant_id}:{sha256}", 0)))
-    )
-
-
 async def _object_needed(
     session: AsyncSession, tenant_id: uuid.UUID, sha256: str, now: datetime
 ) -> bool:
@@ -168,7 +164,7 @@ async def _take_upload(session: AsyncSession, ctx: AuthContext, ref: str) -> Art
     sha256 = await session.scalar(select(ArtifactContent.sha256).where(*mine))
     if sha256 is None:
         raise not_found
-    await _lock_content(session, ctx.tenant_id, sha256)
+    await lock_content(session, ctx.tenant_id, sha256)
     upload = await session.scalar(
         select(ArtifactContent)
         .where(*mine, ArtifactContent.expires_at > utcnow())
@@ -211,7 +207,7 @@ async def create_artifact(
                 Artifact.id == supersedes_artifact_id, Artifact.tenant_id == ctx.tenant_id
             )
         )
-        if superseded is None:
+        if superseded is None or not await artifact_visible(session, ctx, superseded):
             raise NotFoundError(
                 "Superseded artifact not found",
                 details={"supersedesArtifactId": str(supersedes_artifact_id)},
@@ -226,7 +222,7 @@ async def create_artifact(
         run = await session.scalar(
             select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
         )
-        if run is None:
+        if run is None or not await task_visible(session, ctx, run.task_id):
             raise NotFoundError("Run not found", details={"runId": str(run_id)})
         if task_id is None:
             task_id = run.task_id
@@ -348,7 +344,7 @@ async def record_upload(
     # does not go through the write flow, and an artifact created meanwhile may
     # hold that content lock after a task row.
     await lock_caller(session, ctx)
-    await _lock_content(session, ctx.tenant_id, spooled.sha256)
+    await lock_content(session, ctx.tenant_id, spooled.sha256)
     try:
         if not await store.exists(key):
             await store.put(key, spooled.path, spooled.size)
@@ -391,7 +387,10 @@ async def _read_artifact(
     artifact = await session.scalar(
         select(Artifact).where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
     )
-    if artifact is None:
+    # An artifact of an invisible workspace or work answers as a missing one,
+    # whichever way it is asked for — as an input of visible work too
+    # (CP-ADR-0082 §3.7): ``authorize`` on its task does not see workspaces.
+    if artifact is None or not await artifact_visible(session, ctx, artifact):
         raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
     if for_task_ref is not None:
         recipient = await resolve_task(session, ctx, for_task_ref)
@@ -410,6 +409,11 @@ async def _read_artifact(
             Permission.ARTIFACTS_READ,
             resource=artifact_resource(artifact.task_id, artifact.workspace_id),
         )
+    except WorkspaceNotVisible:
+        # The artifact's own 404, not the workspace's (CP-ADR-0082 §3.7).
+        raise NotFoundError(
+            "Artifact not found", details={"artifactId": str(artifact_id)}
+        ) from None
     except AuthorizationError:
         if not await _skill_executor_reads(session, ctx, artifact):
             raise
@@ -441,7 +445,8 @@ async def _skill_executor_reads(
         await authorize(
             ctx, Permission.ARTIFACTS_READ, resource=ResourceRef("workspace", str(workspace_id))
         )
-    except AuthorizationError:
+    except (AuthorizationError, WorkspaceNotVisible):
+        # An invisible workspace is "not allowed" too, not its 404 (CP-ADR-0082 B6).
         return False
     return True
 
@@ -558,7 +563,7 @@ async def purge_content(
         .where(Artifact.id == artifact_id, Artifact.tenant_id == ctx.tenant_id)
         .with_for_update()
     )
-    if artifact is None:
+    if artifact is None or not await artifact_visible(session, ctx, artifact):
         raise NotFoundError("Artifact not found", details={"artifactId": str(artifact_id)})
     if artifact.content_state == CONTENT_PURGED:
         return artifact
@@ -571,7 +576,7 @@ async def purge_content(
     assert artifact.sha256 is not None and artifact.size_bytes is not None
     active_store = require_store(store)
 
-    await _lock_content(session, ctx.tenant_id, artifact.sha256)
+    await lock_content(session, ctx.tenant_id, artifact.sha256)
     artifact.content_state = CONTENT_PURGED
     await session.flush()
     object_deleted = not await _object_needed(session, ctx.tenant_id, artifact.sha256, utcnow())
@@ -634,7 +639,7 @@ async def sweep_expired_uploads(
     for tenant_id, sha256 in keys:
         try:
             async with transaction(session_factory) as session:
-                await _lock_content(session, tenant_id, sha256)
+                await lock_content(session, tenant_id, sha256)
                 now = utcnow()
                 result = await session.execute(
                     delete(ArtifactContent)

@@ -301,16 +301,22 @@ async def test_invalid_runner_yaml_blocks_before_the_executor_works(
     assert "$.checks[0].run" in out["run"]["output"]["reason"]
 
 
-async def test_invalid_runner_yaml_with_checks_off_is_not_read(
+async def test_invalid_runner_yaml_with_checks_off_still_blocks_for_setup(
     client: httpx.AsyncClient, sdk: Make, tmp_path: Path
 ) -> None:
+    # With checks off the file is still read, for its setup (TASK-001273): a
+    # file that cannot be used tells nothing about what to install.
     s = await _setup(client)
     origin = _origin(tmp_path / "origin", "version: 1\nchecks:\n  - {name: lint}\n")
     pool = ExecutionWorkspacePool(origin, tmp_path / "w")
+    adapter = FixingAdapter()
 
-    await _work(sdk, s["agent"], FixingAdapter(), pool, checks=False)
+    await _work(sdk, s["agent"], adapter, pool, checks=False)
 
-    assert (await _outcome(client, s))["task"]["status"] == "done"
+    assert adapter.turns == []
+    out = await _outcome(client, s)
+    assert out["task"]["systemStatusCategory"] == "blocked"
+    assert out["run"]["failureReason"] == "runner_config_invalid"
 
 
 async def test_executor_blocked_on_the_fix_attempt_hands_nothing_in(

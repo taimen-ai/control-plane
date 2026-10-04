@@ -21,7 +21,7 @@ goes to the Control Plane is the workspace key, the branch and the commit sha;
 ``assert_portable()`` rejects anything else before it is sent.
 
 Completeness of the copy: a repository that builds against a sibling through a
-path dependency (``platform-auth-sdk`` at ``../platform-auth-sdk``) cannot be
+path dependency (``platform-auth-sdk`` at ``../../sdk/platform-auth-sdk``) cannot be
 built from a copy of itself alone. So a copy is not one directory but a small
 container — the working copy next to the neighbours it needs — and each
 neighbour is checked out at the revision the SUPERPROJECT pins, never at the
@@ -53,6 +53,8 @@ BRANCH_PREFIX = "task/"
 DEFAULT_COMMITTER = ("control-plane-agent", "agent@control-plane.local")
 #: The executor changed a neighbour, which is read-only (universal-runner FR-007).
 NEIGHBOUR_MODIFIED = "neighbour_modified"
+#: The task branch would roll back a pointer of a neighbour the base moved on.
+NEIGHBOUR_POINTER_REGRESSED = "neighbour_pointer_regressed"
 #: The prose conventions whose blob the trace of a catalog run records (FR-011).
 AGENTS_MD = "AGENTS.md"
 #: Seconds a fetch of the base branch may take before it counts as failed.
@@ -96,9 +98,16 @@ _WHOLE_PATH_RE = re.compile(r"^/(?:[^/\s]+/)*[^/\s]*$")
 _TOKEN_PREFIXES = ("cp_", "sk-", "ghp_", "github_pat_", "xox", "-----BEGIN")
 
 
-# A neighbour directory name is also a path inside the container, so it is held
-# to the same standard as a workspace key: no escaping, no surprises for git.
-_NEIGHBOUR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# A directory in a container — the copy's own, a neighbour's — is a relative
+# path of one segment (the flat layout) or several (``services/control-plane``,
+# TAI-ADR-0064). A segment starts with a letter or a digit, so ``.`` and ``..``
+# do not pass; an absolute path, an empty segment and a backslash do not
+# either. The rule of package-sdk's ``$defs.workingCopyPath``, with upper case
+# kept for the one-repository form, whose directory defaults to the origin's
+# name. \Z, not $: $ admits a trailing newline.
+_PATH_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+_PATH_RE = re.compile(rf"^{_PATH_SEGMENT}(?:/{_PATH_SEGMENT})*\Z")
+PATH_MAX_LENGTH = 200
 # "160000 commit <sha>\t<path>" — the gitlink line of ``git ls-tree``.
 _GITLINK_MODE = "160000"
 # Per-branch git config recording what a task branch was cut from. Kept in the
@@ -110,6 +119,47 @@ _BASE_COMMIT_KEY = "controlPlaneBaseCommit"
 
 #: How a published task branch relates to the mirror's (``published_state``).
 PublishedState = Literal["unreachable", "absent", "same", "behind", "diverged"]
+
+
+@dataclass(frozen=True)
+class PointerRegression:
+    """A submodule pointer of the task branch set back to an older one of the base.
+
+    ``expected`` — the pointer of the base the branch must keep (where it
+    last met the base, its head when merged); ``actual`` — what the branch
+    would hand in; ``base`` — the ref of the base to take the pointer from.
+    """
+
+    name: str
+    path: str
+    expected: str
+    actual: str
+    base: str
+
+    @property
+    def what(self) -> str:
+        return (
+            f"has its pointer rolled back to {self.actual[:12]} on the task branch, "
+            f"where the base has {self.expected[:12]}"
+        )
+
+    def reason(self) -> str:
+        """Words for the executor of the next attempt; no local path."""
+        return (
+            f"neighbour {self.name}: the task branch would roll the pointer of submodule "
+            f"{self.path} back from {self.expected} (the base) to {self.actual}. Take the "
+            f"base's pointer: git checkout {self.base} -- {self.path} && "
+            f"git submodule update -- {self.path}, commit, and do not stage the submodule "
+            "with git add -A or commit -a"
+        )
+
+
+@dataclass(frozen=True)
+class NeighbourCheck:
+    """What :meth:`Workspace.neighbour_check` found: changes, and rolled-back pointers apart."""
+
+    changes: Mapping[str, str] = field(default_factory=dict)
+    regressions: Mapping[str, PointerRegression] = field(default_factory=dict)
 
 
 class WorkspaceError(RuntimeError):
@@ -262,9 +312,10 @@ def _git_remote(
 class Neighbour:
     """A repository the working copy must be able to build against.
 
-    ``path`` is the submodule path in the superproject AND the directory name
-    next to the working copy — they are the same string on purpose, because
-    that is what a path dependency like ``../platform-auth-sdk`` names.
+    ``path`` is the submodule path in the superproject AND the neighbour's path
+    in the container of the copy — the same string on purpose: the container
+    repeats the superproject's layout, which is what a path dependency like
+    ``../../sdk/platform-auth-sdk`` resolves against.
     ``origin`` is where copies of it are cut from, normally a bare mirror on
     the runner.
     """
@@ -273,14 +324,19 @@ class Neighbour:
     origin: Path
 
     def __post_init__(self) -> None:
-        if not _NEIGHBOUR_RE.match(self.path):
-            raise WorkspaceError(f"unsafe neighbour name: {self.path!r}")
+        if not is_relative_path(self.path):
+            raise WorkspaceError(f"unsafe neighbour path: {self.path!r}")
 
 
-# A submodule path of a superproject: relative segments of the same standard.
-_SUBMODULE_PATH_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})*$"
-)
+def is_relative_path(value: object) -> bool:
+    """Whether ``value`` is a directory a container may hold (:data:`_PATH_RE`)."""
+    return isinstance(value, str) and len(value) <= PATH_MAX_LENGTH and bool(_PATH_RE.match(value))
+
+
+def _overlaps(path: str, other: str) -> bool:
+    """Whether one of two relative paths is the other or lies inside it."""
+    a, b = path.casefold(), other.casefold()
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 @dataclass(frozen=True)
@@ -299,7 +355,7 @@ class PinnedNeighbour:
     revision: str
 
     def __post_init__(self) -> None:
-        if not _SUBMODULE_PATH_RE.match(self.path) or ".." in self.path.split("/"):
+        if not is_relative_path(self.path):
             raise WorkspaceError(f"unsafe neighbour path: {self.path!r}")
 
 
@@ -522,6 +578,9 @@ class Workspace:
     conventions_base: str = ""
     # (name, directory, revision) of each neighbour placed for this run.
     placed: tuple[tuple[str, Path, str], ...] = ()
+    # The copy's directory in its container, as the pool names it: one name
+    # or several segments (``services/control-plane``). Empty — one name.
+    repo_dir: str = ""
     # Refs of the base branch in the copy: a submodule pointer a merge of
     # them brought in is the base's, not a change of the task's own.
     base_refs: tuple[str, ...] = ()
@@ -532,8 +591,9 @@ class Workspace:
 
     @property
     def container(self) -> Path:
-        """Directory holding this copy and its neighbours."""
-        return self.path.parent
+        """Directory holding this copy and its neighbours, as deep as ``repo_dir`` goes."""
+        depth = self.repo_dir.count("/") + 1 if self.repo_dir else 1
+        return self.path.parents[depth - 1]
 
     @property
     def checkpoint_data(self) -> dict[str, Any]:
@@ -583,6 +643,18 @@ class Workspace:
     def neighbour_changes(self) -> dict[str, str]:
         """What happened to each neighbour placed for the run, if anything.
 
+        Every finding of :meth:`neighbour_check` in words, a rolled-back
+        pointer included.
+        """
+        check = self.neighbour_check()
+        return {
+            **check.changes,
+            **{name: regression.what for name, regression in check.regressions.items()},
+        }
+
+    def neighbour_check(self) -> NeighbourCheck:
+        """What happened to each neighbour placed for the run, if anything.
+
         A neighbour is read-only (FR-007): changed or new files that are not
         ignored, a HEAD moved off the pinned revision, a directory removed
         or replaced — each means the run did not work against the revisions
@@ -591,24 +663,75 @@ class Workspace:
         For a task of the superproject the pointer is the neighbour's too: a
         pointer staged in the copy's index, or committed on the task branch
         and brought in by no merge of the base, is a change of the neighbour.
+        A pointer the base has — where the branch last met it, or at its head
+        now — is not: the base may move it while the run goes on, and the
+        checkout of a nested neighbour may follow it (``git submodule
+        update`` after a merge of the base).
+
+        A pointer set back to an older one of the base — a merge of the base
+        followed by ``commit -a`` with the checkout still at the revision of
+        acquisition — is told apart (``regressions``): the executor fixes it
+        with one checkout of the base's pointer.
+
+        Every submodule of the superproject is held to the base's pointers,
+        not only the neighbours ``runner.yaml`` names (package-sdk was not
+        one): its pointer is no work of the task either. One not placed is
+        named by its path; its checkout is the executor's own and is not
+        looked at.
         """
         changes: dict[str, str] = {}
-        if self._nested() and self.refresh_base is not None:
+        regressions: dict[str, PointerRegression] = {}
+        nested = self._nested()
+        superproject = self.conventions is not None and self.conventions.inside
+        if superproject and self.refresh_base is not None:
             self.refresh_base()
         for name, directory, revision in self.placed:
             if not (directory / ".git").exists():
                 changes[name] = "was removed or replaced"
                 continue
+            path = nested.get(directory)
+            allowed = self._base_pointers(path, revision) if path is not None else {revision}
             head = _git(directory, "rev-parse", "HEAD", check=False)
-            if head != revision:
+            if head != revision and not (head and head in allowed):
                 changes[name] = f"moved from {revision[:12]} to {head[:12] or 'nothing'}"
             elif _git(directory, "status", "--porcelain", check=False):
                 changes[name] = "has changed or new files"
-            elif directory in self._nested():
-                pointer = self._pointer_change(self._nested()[directory], revision)
-                if pointer:
+            elif path is not None:
+                pointer = self._pointer_change(path, allowed)
+                if not pointer:
+                    continue
+                regression = self._regression(name, directory, path, allowed)
+                if regression is not None:
+                    regressions[name] = regression
+                else:
                     changes[name] = pointer
-        return changes
+        placed = set(nested.values())
+        for path in self._gitlinks() if superproject else []:
+            if path in placed:
+                continue
+            allowed = self._base_pointers(path, "") - {""}
+            pointer = self._pointer_change(path, allowed)
+            if not pointer:
+                continue
+            regression = self._regression(path, self.path / path, path, allowed)
+            if regression is not None:
+                regressions[path] = regression
+            else:
+                changes[path] = pointer
+        return NeighbourCheck(changes, regressions)
+
+    def _gitlinks(self) -> list[str]:
+        """Paths of every submodule of the copy: gitlinks on the branch and in the index."""
+        paths: set[str] = set()
+        for listing in (
+            _git(self.path, "ls-tree", "-r", "-z", "HEAD", check=False),
+            _git(self.path, "ls-files", "--stage", "-z", check=False),
+        ):
+            for entry in listing.split("\0"):
+                meta, _, path = entry.partition("\t")
+                if path and meta.split()[:1] == [_GITLINK_MODE]:
+                    paths.add(path)
+        return sorted(paths)
 
     def _nested(self) -> dict[Path, str]:
         """Neighbours placed inside the copy, by directory: their submodule paths."""
@@ -619,27 +742,103 @@ class Workspace:
             for _, directory, _ in self.placed
         }
 
-    def _pointer_change(self, path: str, revision: str) -> str:
-        """What the task did to the pointer of the submodule at ``path``; empty if nothing."""
-        staged = _index_gitlink(self.path, path)
-        committed = _tree_gitlink(self.path, "HEAD", path)
-        if staged != committed:
-            return f"has its pointer staged at {staged[:12] or 'nothing'} in the copy"
-        # The base's pointer where the branch last met its base: the point it
-        # was cut from, moved on by each merge of a ref of the base branch.
-        # Only the latest meeting counts — a pointer rolled back to what the
-        # base had before a merge is the task's change, not the base's.
+    def _base_pointers(self, path: str, revision: str) -> set[str]:
+        """Pointers of the submodule at ``path`` that are the base's, not the task's.
+
+        The base's pointer where the branch last met its base: the point it
+        was cut from, moved on by each merge of a ref of the base branch.
+        Only the latest meeting counts — a pointer rolled back to what the
+        base had before a merge is the task's change, not the base's. And the
+        pointer at the head of the base now: one the base moved to during the
+        run is the base's, merged or not.
+        """
+        latest = self._last_meetings()
+        allowed = {_tree_gitlink(self.path, point, path) for point in latest} or {revision}
+        # The first ref that is there: the forge's copy of the base before the
+        # copy's own branch, which may be as old as the mirror.
+        for ref in self.base_refs:
+            tip = _git(
+                self.path, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False
+            )
+            if tip:
+                pointer = _tree_gitlink(self.path, tip, path)
+                if pointer:
+                    allowed.add(pointer)
+                break
+        return allowed
+
+    def _last_meetings(self) -> list[str]:
+        """Where the branch last met its base: the cut point, moved on by each merge of it."""
         points = {self.base_revision} if self.base_revision else set()
         for ref in self.base_refs:
             fork = _git(self.path, "merge-base", "HEAD", ref, check=False)
             if fork:
                 points.add(fork)
-        latest = [
+        return sorted(
             point
             for point in points
             if not any(other != point and self._is_ancestor(point, other) for other in points)
-        ]
-        allowed = {_tree_gitlink(self.path, point, path) for point in latest} or {revision}
+        )
+
+    def _regression(
+        self, name: str, directory: Path, path: str, allowed: set[str]
+    ) -> PointerRegression | None:
+        """The pointer of ``path`` the branch would hand in, if it is an older one of the base.
+
+        Older: the pointer at the point the branch was cut from — the
+        checkout of acquisition taken by ``commit -a`` after a merge of the
+        base — or an ancestor of the pointer the base expects, by the
+        history of the neighbour when ``directory`` has it (a submodule not
+        placed may have no checkout). A pointer moved anywhere else is the
+        task's own move, :data:`NEIGHBOUR_MODIFIED` as before.
+        """
+        committed = _tree_gitlink(self.path, "HEAD", path)
+        staged = _index_gitlink(self.path, path)
+        # What the commit would take: the branch's pointer, or a staged one over it.
+        actual = committed if committed not in allowed else staged
+        if not actual or actual in allowed:
+            return None
+        expected = next(
+            (
+                pointer
+                for point in self._last_meetings()
+                if (pointer := _tree_gitlink(self.path, point, path))
+            ),
+            "",
+        )
+        if not expected:
+            return None
+        cut = _tree_gitlink(self.path, self.base_revision, path) if self.base_revision else ""
+        older = actual == cut or (
+            (directory / ".git").exists()
+            and subprocess.run(
+                ["git", "merge-base", "--is-ancestor", actual, expected],
+                cwd=directory,
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+        if not older:
+            return None
+        return PointerRegression(name, path, expected, actual, self._base_name())
+
+    def _base_name(self) -> str:
+        """The base as an executor names it in the copy: ``origin/main``, or ``main``."""
+        for ref in self.base_refs:
+            if ref.startswith("refs/remotes/"):
+                return ref.removeprefix("refs/remotes/")
+        return self.base_branch or "main"
+
+    def _pointer_change(self, path: str, allowed: set[str]) -> str:
+        """What the task did to the pointer of the submodule at ``path``; empty if nothing.
+
+        ``allowed`` — the pointers of the base (:meth:`_base_pointers`).
+        """
+        staged = _index_gitlink(self.path, path)
+        committed = _tree_gitlink(self.path, "HEAD", path)
+        if staged != committed:
+            return f"has its pointer staged at {staged[:12] or 'nothing'} in the copy"
         if committed not in allowed:
             return (
                 f"has its pointer committed at {committed[:12] or 'nothing'} on the task "
@@ -772,19 +971,9 @@ class Workspace:
 
         Unlike :meth:`commit`, it never answers with a commit already there:
         a WIP record names only a commit made here. A moved submodule pointer
-        is left out: the pin is the superproject's business, and a WIP that
-        moved it would be taken for a decision nobody made.
+        is left out (:meth:`_stage_all`).
         """
         self._stage_all()
-        # "-z --raw": ":<old mode> <new mode> <old> <new> <status>\0<path>\0" per entry.
-        tokens = _git(self.path, "diff", "--cached", "--raw", "--no-renames", "-z").split("\0")
-        gitlinks = [
-            path
-            for meta, path in zip(tokens[::2], tokens[1::2], strict=False)
-            if _GITLINK_MODE in meta.lstrip(":").split()[:2]
-        ]
-        if gitlinks:
-            _git(self.path, "reset", "-q", "--", *gitlinks)
         staged = subprocess.run(
             ["git", "diff", "--cached", "--quiet"], cwd=self.path, check=False
         ).returncode
@@ -794,11 +983,22 @@ class Workspace:
         return self.head()
 
     def _stage_all(self) -> None:
-        # Nested neighbours stay out: the pointer on the branch is the base's
-        # (checked by ``neighbour_changes``), while the checkout under it may
-        # be of an older pin when the task merged its base during the run.
+        # No submodule pointer is the daemon's to commit, a neighbour's or
+        # not (9b30f86, 54d149a: package-sdk, outside ``neighbours``): the
+        # pointer on the branch is the base's (checked by ``neighbour_check``),
+        # while the checkout under it may be of an older pin when the task
+        # merged its base during the run. One staged before goes back too.
         excluded = self._excluded()
         _git(self.path, "add", "-A", *(["--", ".", *excluded] if excluded else []))
+        # "-z --raw": ":<old mode> <new mode> <old> <new> <status>\0<path>\0" per entry.
+        tokens = _git(self.path, "diff", "--cached", "--raw", "--no-renames", "-z").split("\0")
+        gitlinks = [
+            path
+            for meta, path in zip(tokens[::2], tokens[1::2], strict=False)
+            if _GITLINK_MODE in meta.lstrip(":").split()[:2]
+        ]
+        if gitlinks:
+            _git(self.path, "reset", "-q", "--", *gitlinks)
 
     def _commit_staged(
         self, summary: str, committer: tuple[str, str], *, allow_empty: bool = False
@@ -860,7 +1060,11 @@ class ExecutionWorkspacePool:
     copy at ``root/<key>/<repo_dir>/`` and, beside it, every configured
     neighbour. The nesting is what makes a path dependency ``../<neighbour>``
     resolve, and it keeps neighbours per task: two tasks running at once cannot
-    move the same sibling under each other's feet.
+    move the same sibling under each other's feet. ``repo_dir`` and the
+    neighbours' paths may have several segments (TAI-ADR-0064): the container
+    is then laid out like the superproject, and ``../../sdk/<neighbour>`` from
+    ``services/<repository>`` resolves as ``../<neighbour>`` does in the flat
+    layout.
 
     ``superproject`` is the repository whose submodules pin the neighbours.
     Revisions are read from its tree, so a copy is built against the
@@ -907,9 +1111,17 @@ class ExecutionWorkspacePool:
         # matters when a neighbour's path dependency is written relative to it,
         # so it defaults to the repository name rather than something generic.
         self.repo_dir = repo_dir or self.origin.name.removesuffix(".git")
-        if not _NEIGHBOUR_RE.match(self.repo_dir):
-            raise WorkspaceError(f"unsafe repository directory name: {self.repo_dir!r}")
+        if not is_relative_path(self.repo_dir):
+            raise WorkspaceError(f"unsafe repository directory: {self.repo_dir!r}")
         self.neighbours = tuple(neighbours)
+        for neighbour in self.neighbours:
+            # One copy inside the other would have one checkout write into
+            # the files of the other.
+            if _overlaps(neighbour.path, self.repo_dir):
+                raise WorkspaceError(
+                    f"neighbour {neighbour.path!r} and the copy's directory "
+                    f"{self.repo_dir!r} lie one inside the other"
+                )
         self.superproject = Path(superproject).expanduser().resolve() if superproject else None
         self.superproject_ref = superproject_ref
         self.superproject_remote = superproject_remote
@@ -1160,6 +1372,7 @@ class ExecutionWorkspacePool:
             base_branch=base_branch,
             repository_key=self.repository_key,
             base_revision=base_commit,
+            repo_dir=self.repo_dir,
             _lock_fd=lock_fd,
         )
 
@@ -1223,8 +1436,9 @@ class ExecutionWorkspacePool:
                 neighbours = {n.name: n.revision for n in conventions.neighbours}
             else:
                 neighbours = self._place_neighbours(container)
-                # Read only when checks run (``checks.py``); a base that
-                # cannot be told blocks them there, not every run here.
+                # Read for setup and checks (``setup_command.py``,
+                # ``checks.py``); a base that cannot be told blocks the checks
+                # there and skips setup, not every run here.
                 try:
                     conventions_base = self._base_of(branch, base_ref)
                 except WorkspaceError:
@@ -1246,6 +1460,7 @@ class ExecutionWorkspacePool:
             conventions=conventions,
             conventions_base=conventions_base,
             placed=placed,
+            repo_dir=self.repo_dir,
             base_refs=self._base_refs(wanted),
             refresh_base=functools.partial(self._track_base, wanted),
             _lock_fd=lock_fd,
@@ -1541,7 +1756,7 @@ class ExecutionWorkspacePool:
         # Two moves because git cannot move a worktree into a subdirectory of
         # itself, and the container is exactly that.
         _git(self.origin, "worktree", "move", str(container), str(staging))
-        container.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         _git(self.origin, "worktree", "move", str(staging), str(path))
         logger.info("adopted %s into the container layout", container.name)
 
@@ -1904,14 +2119,29 @@ class ExecutionWorkspacePool:
             dest = container / neighbour.path
             if dest.exists():
                 _git(neighbour.origin, "worktree", "remove", str(dest), check=False)
-        if self.neighbour_mirrors is not None and container.is_dir():
-            # Placed by runner.yaml of some base revision: what is there is
-            # found on disk, so a copy made before a restart goes as well.
-            for dest in container.iterdir():
-                if dest.name != self.repo_dir:
-                    self._drop_placed(dest)
+        if container.is_dir():
+            self._clear(container, container / self.repo_dir)
         with contextlib.suppress(OSError):
             container.rmdir()  # only when nothing else is left in it
+
+    def _clear(self, directory: Path, own: Path) -> None:
+        """Drop the neighbours placed under ``directory`` and the directories they leave empty.
+
+        Placed by runner.yaml of some base revision: what is there is found on
+        disk, so a copy made before a restart goes as well. A directory that
+        is no copy (``services/``, ``sdk/`` of a layout with segments) is
+        looked into; a copy is never entered, and ``own`` — the task's copy —
+        is left alone.
+        """
+        for child in directory.iterdir():
+            if child == own or child.is_symlink() or not child.is_dir():
+                continue
+            if (child / ".git").exists():
+                self._drop_placed(child)
+            else:
+                self._clear(child, own)
+            with contextlib.suppress(OSError):
+                child.rmdir()  # only when nothing else is left in it
 
     def _drop_nested(self, copy: Path) -> None:
         """Remove neighbours placed inside ``copy`` (submodules of a superproject task).

@@ -43,7 +43,9 @@ from control_plane.api.v1.schemas import (
 from control_plane.application.commands.agents import spec_hash_of, split_desired_state
 from control_plane.domain.enums import AgentPhase, AgentState, Permission
 from control_plane.domain.event_catalog import get_event_type
-from tests.package_sdk import PACKAGE_SDK_SCHEMAS, PINNED_SCHEMAS, live_schema_path, schema_path
+from control_plane_agent.catalog import CatalogError, RepositoryCatalog
+from control_plane_agent.skills import _SKILL_ENV_FIXED, _SKILL_ENV_RESERVED, parse_skill_env
+from tests.package_sdk import PINNED_SCHEMAS, live_schema_path, schema_path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 AGENTS = FIXTURES / "agents"
@@ -64,9 +66,10 @@ AGENT_DEFS = (
     "repositoryAlias",
 )
 # The working copy of the kind claude-code in the pinned copy, as package-sdk
-# carries it (universal-runner U001, wording of package-sdk ``0d271ed``): sha256
-# of the canonical JSON of ``_working_copy_contract``. Re-pin together with the copy.
-WORKING_COPY_CONTRACT_SHA256 = "a7e88495f48bf74c9b1c77360315cd51f27fde66c55af03857d3f1ec344cfce6"
+# carries it (universal-runner U001; ``checks`` of U023; paths with segments of
+# TAI-ADR-0064, package-sdk TASK-001361): sha256 of the canonical JSON of
+# ``_working_copy_contract``. Re-pin together with the copy.
+WORKING_COPY_CONTRACT_SHA256 = "53d9d2f2f16300592ed3abd1137a2cb107204f920f233ff7ba5de00cabe603a6"
 
 
 def _objects() -> list[dict[str, Any]]:
@@ -127,11 +130,14 @@ def _ref(schema: dict[str, Any]) -> str:
 
 # --- OpenAPI -----------------------------------------------------------------
 
-ROUTES: dict[tuple[str, str], tuple[str | None, str]] = {
+ROUTES: dict[tuple[str, str], tuple[str | None, str | None]] = {
     ("post", "/api/v1/agents"): ("AgentPublishRequest", "AgentOut"),
     ("post", "/api/v1/agents:validate"): ("AgentPublishRequest", "AgentValidationOut"),
     ("get", "/api/v1/agents"): (None, "AgentPageOut"),
-    ("get", "/api/v1/agents/me"): (None, "AgentOut"),
+    ("get", "/api/v1/agents/me"): (None, "AgentMeOut"),
+    # What an agent learns of its connections (CP-ADR-0079 §8, I011).
+    ("get", "/api/v1/agents/me/connections"): (None, "AgentConnectionListOut"),
+    ("get", "/api/v1/agents/me/connections/{key}"): (None, "AgentConnectionOut"),
     ("get", "/api/v1/agents/{ref}"): (None, "AgentOut"),
     ("patch", "/api/v1/agents/{key}/state"): ("AgentStateUpdateRequest", "AgentOut"),
     ("post", "/api/v1/agents/{key}:retire"): ("AgentRetireRequest", "AgentOut"),
@@ -140,6 +146,10 @@ ROUTES: dict[tuple[str, str], tuple[str | None, str]] = {
     ("get", "/api/v1/agents/{key}/revisions"): (None, "AgentRevisionPageOut"),
     ("get", "/api/v1/agents/{key}/status"): (None, "AgentStatusOut"),
     ("put", "/api/v1/agents/{key}/status"): ("AgentStatusReport", "AgentStatusOut"),
+    # An agent's secrets by name (CP-ADR-0079 §11, I012).
+    ("get", "/api/v1/agents/{key}/secrets"): (None, "AgentSecretListOut"),
+    ("put", "/api/v1/agents/{key}/secrets/{name}"): ("AgentSecretSetRequest", "AgentSecretOut"),
+    ("delete", "/api/v1/agents/{key}/secrets/{name}"): (None, None),
 }
 
 
@@ -156,6 +166,9 @@ def test_openapi_carries_every_agents_route_with_its_bodies() -> None:
             assert body is None, (method, path)
         else:
             assert _ref(body["content"]["application/json"]["schema"]) == request
+        if response is None:
+            assert "204" in operation["responses"], (method, path)
+            continue
         success = "201" if (method, path) == ("post", "/api/v1/agents") else "200"
         assert _ref(operation["responses"][success]["content"]["application/json"]["schema"]) == (
             response
@@ -230,7 +243,15 @@ def _working_copy_contract(schema: dict[str, Any]) -> dict[str, Any]:
     defs = schema["$defs"]
     return {
         "forms": {
-            name: defs[name] for name in ("agentWorkingCopies", "repositoryKey", "repositoryAlias")
+            name: defs[name]
+            for name in (
+                "agentWorkingCopies",
+                "repositoryKey",
+                "repositoryAlias",
+                # The rule of directories and neighbours (TAI-ADR-0064): without
+                # it the digest holds only the $ref, not the paths it admits.
+                "workingCopyPath",
+            )
         },
         "dispatch": defs["agentSpec"]["allOf"],
         "section": defs["agentSpec"]["properties"]["workingCopy"],
@@ -245,8 +266,8 @@ def _sha256(document: Any) -> str:
 def test_the_claude_code_working_copy_of_the_pinned_schema_is_the_package_one() -> None:
     """Contract of U002: the core's copy of the claude-code form is the package's.
 
-    With package-sdk checked out beside control-plane the copy is compared with
-    its live schema; the core's own CI compares it with the pinned digest.
+    The core's own CI compares the copy with the pinned digest; with package-sdk
+    checked out the copy is compared with its live schema too (below).
     """
     pinned = _working_copy_contract(json.loads(PINNED_SCHEMA.read_text(encoding="utf-8")))
     assert _sha256(pinned) == WORKING_COPY_CONTRACT_SHA256
@@ -255,10 +276,120 @@ def test_the_claude_code_working_copy_of_the_pinned_schema_is_the_package_one() 
         {"$ref": "#/$defs/agentWorkingCopies/catalog"},
         {"$ref": "#/$defs/agentWorkingCopies/single"},
     )
-    live_schema = PACKAGE_SDK_SCHEMAS / "object.schema.json"
-    if live_schema.is_file():
-        live = json.loads(live_schema.read_text(encoding="utf-8"))
-        assert pinned == _working_copy_contract(live)
+
+
+def test_the_working_copy_of_the_pinned_schema_is_the_live_one() -> None:
+    """Without package-sdk: a failure inside the umbrella, a skip with its reason
+    outside it — never a silent pass (TAI-ADR-0064, rule 4)."""
+    live = json.loads(live_schema_path("object.schema.json").read_text(encoding="utf-8"))
+    pinned = json.loads(PINNED_SCHEMA.read_text(encoding="utf-8"))
+    assert _working_copy_contract(pinned) == _working_copy_contract(live)
+
+
+# (path, admitted): the rule of $defs.workingCopyPath, as the runner reads it.
+WORKING_COPY_PATHS: list[tuple[str, bool]] = [
+    ("control-plane", True),
+    ("services/control-plane", True),
+    ("sdk/platform-auth-sdk", True),
+    ("apps/demos/support-demo", True),
+    ("a" * 100, True),
+    ("/".join(["a" * 99] * 2), True),
+    ("", False),
+    ("..", False),
+    (".", False),
+    ("../platform-auth-sdk", False),
+    ("services/../control-plane", False),
+    ("/services/control-plane", False),
+    ("services//control-plane", False),
+    ("services/control-plane/", False),
+    ("services\\control-plane", False),
+    ("services/control-plane\n", False),
+    ("Services/control-plane", False),
+    ("a" * 101, False),
+    ("/".join(["a" * 100] * 3), False),
+]
+
+
+@pytest.mark.parametrize(("path", "admitted"), WORKING_COPY_PATHS)
+def test_the_runner_admits_the_paths_the_schema_admits(path: str, admitted: bool) -> None:
+    """``$defs.workingCopyPath`` of the pinned copy and ``catalog.py`` agree on each path."""
+    rule = json.loads(PINNED_SCHEMA.read_text(encoding="utf-8"))["$defs"]["workingCopyPath"]
+    by_schema = not list(jsonschema.Draft202012Validator(rule).iter_errors(path))
+    entry = {"url": "https://forge.example/org/x.git", "directory": path}
+    try:
+        RepositoryCatalog.from_spec(
+            {"repositoryField": "repositoryKey", "repositories": {"x": entry}}
+        )
+    except CatalogError:
+        by_runner = False
+    else:
+        by_runner = True
+    assert by_schema == by_runner == admitted
+
+
+def _skill_env_names() -> Any:
+    """``propertyNames`` of ``params.env`` of a ``skills`` executor in the pinned copy."""
+    executors = json.loads(PINNED_SCHEMA.read_text(encoding="utf-8"))["$defs"]["agentExecutors"]
+    return executors["skills"]["properties"]["env"]["propertyNames"]
+
+
+def _skill_env_admitted(name: str) -> tuple[bool, bool]:
+    """Whether the pinned schema and the daemon (``parse_skill_env``) admit ``name``."""
+    by_schema = not list(jsonschema.Draft202012Validator(_skill_env_names()).iter_errors(name))
+    try:
+        parse_skill_env({name: "x"}, where="params.env")
+    except ValueError:
+        by_daemon = False
+    else:
+        by_daemon = True
+    return by_schema, by_daemon
+
+
+# Built from the daemon's own lists: a name refused in skills.py and not in the
+# schema fails here (CP-ADR-0073 Zh1).
+HOST_ENV_NAMES = sorted(
+    set(_SKILL_ENV_RESERVED)
+    | {f"{prefix}X" for prefix in _SKILL_ENV_RESERVED}
+    | {f"{prefix}SOME_SETTING" for prefix in _SKILL_ENV_RESERVED}
+    | set(_SKILL_ENV_FIXED)
+)
+
+
+@pytest.mark.parametrize("name", HOST_ENV_NAMES)
+def test_the_schema_refuses_every_host_env_name_the_daemon_refuses(name: str) -> None:
+    assert _skill_env_admitted(name) == (False, False)
+
+
+# (name, admitted): a refusal is a prefix or a whole name, never a substring.
+SKILL_ENV_NAMES: list[tuple[str, bool]] = [
+    ("PORTAL_URL", True),
+    ("PORTAL_BASE_URL", True),
+    ("PROXY_URL", True),
+    ("MY_NODE_URL", True),
+    ("MY_GIT_DIR", True),
+    ("HTTPS_PROXY_URL", True),
+    ("SSL_CERT_FILES", True),
+    ("PATHS", True),
+    ("NODE", True),
+    ("GIT", True),
+    ("A", True),
+    ("A" * 100, True),
+    ("A" * 101, False),
+    ("", False),
+    ("https_proxy", False),
+    ("Git_Dir", False),
+    ("_PORTAL_URL", False),
+    ("1PORTAL", False),
+    ("PORTAL-URL", False),
+    ("PORTAL_TOKEN", False),
+    ("PORTAL_API_KEY", False),
+    ("PORTAL_CREDENTIALS", False),
+]
+
+
+@pytest.mark.parametrize(("name", "admitted"), SKILL_ENV_NAMES)
+def test_the_schema_and_the_daemon_agree_on_skill_env_names(name: str, admitted: bool) -> None:
+    assert _skill_env_admitted(name) == (admitted, admitted)
 
 
 @pytest.mark.parametrize(
@@ -279,7 +410,8 @@ BOTH_ACCEPT: list[tuple[str, tuple[str, ...], Any]] = [
     ("skills-executor", ("placement",), DELETE),  # absent: placed with the defaults
     ("coder", ("placement", "requires"), ["gpu", "gpu.model=a100", "zone=eu-1"]),
     ("coder", ("placement", "drainSeconds"), 0),
-    ("coder", ("placement", "resources"), {"cpus": 0.5}),
+    ("coder", ("placement", "resources"), {"cpus": 2, "memoryMb": 4096}),
+    ("coder", ("placement", "resources"), {"cpus": 64}),
     ("coder", ("work", "includeSubprojects"), True),
     ("coder", ("work", "project"), "00000000-0000-4000-8000-000000000001"),
     ("coder", ("skills", "mcpOrigins"), ["https://mcp.example.com"]),
@@ -306,7 +438,14 @@ BOTH_ACCEPT: list[tuple[str, tuple[str, ...], Any]] = [
     ("process-bridge", ("identity", "iam"), DELETE),
     ("coder", ("identity", "iam"), {"audiences": ["iam"], "scopeCeiling": ["iam:agents"]}),
     ("process-bridge", ("identity", "iam", "scopeCeiling"), ["policy:check-on-behalf"]),
-    # executor.image (E1): a tag, a digest or both; a registry with a port.
+    # Dotted names of the IAM registry (iam-service ADR-0004), as the connector's.
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:identities.link"]),
+    (
+        "process-bridge",
+        ("identity", "iam", "scopeCeiling"),
+        ["iam:people", "iam:identities.link", "reports.v2:read_all", "crm:deals.write"],
+    ),
+    # executor.image (CP-ADR-0073 Z1): a tag, a digest or both; a registry with a port.
     ("coder", ("executor", "image"), "observer:1.2.0"),
     ("coder", ("executor", "image"), "observer:latest"),
     ("coder", ("executor", "image"), f"ghcr.io/org/observer@sha256:{DIGEST}"),
@@ -350,6 +489,22 @@ BOTH_REJECT: list[tuple[str, tuple[str, ...], Any]] = [
     ("coder", ("placement", "drainSeconds"), 14_401),
     ("coder", ("placement", "resources"), {"gpus": 1}),
     ("coder", ("placement", "resources"), {"memoryMb": 32}),
+    # Every number of the spec is hashed with the revision: an integer, not a float,
+    # a string or a boolean (amendment 2026-10-03).
+    ("coder", ("placement", "resources"), {"cpus": 0}),
+    ("coder", ("placement", "resources"), {"cpus": 65}),
+    ("coder", ("placement", "resources"), {"cpus": "2"}),
+    ("coder", ("placement", "resources"), {"cpus": True}),
+    ("coder", ("placement", "resources"), {"cpus": 0.5}),
+    ("coder", ("placement", "resources"), {"cpus": 1.5}),
+    ("coder", ("placement", "resources"), {"cpus": 63.99}),
+    ("coder", ("placement", "resources"), {"memoryMb": 4096.5}),
+    ("coder", ("placement", "resources"), {"memoryMb": "4096"}),
+    ("coder", ("placement", "replicas"), 1.5),
+    ("coder", ("placement", "replicas"), True),
+    ("coder", ("placement", "drainSeconds"), 0.5),
+    ("coder", ("placement", "drainSeconds"), "60"),
+    ("skills-executor", ("skills", "concurrency"), 1.5),
     ("coder", ("work", "unknownField"), True),
     ("coder", ("identity", "kind"), DELETE),
     ("coder", ("identity", "kind"), "human"),
@@ -366,6 +521,15 @@ BOTH_REJECT: list[tuple[str, tuple[str, ...], Any]] = [
     ("process-bridge", ("identity", "iam", "scopeCeiling"), ["read"]),
     ("process-bridge", ("identity", "iam", "scopeCeiling"), ["Control-Plane:read"]),
     ("process-bridge", ("identity", "iam", "scopeCeiling"), ["memory:read", "memory:read"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:identities."]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:.link"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:identities..link"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam::link"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), [":read"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam.identities.link"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:identities link"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:-link"]),
+    ("process-bridge", ("identity", "iam", "scopeCeiling"), ["iam:identities/link"]),
     (
         "process-bridge",
         ("identity", "iam", "scopeCeiling"),
@@ -374,7 +538,7 @@ BOTH_REJECT: list[tuple[str, tuple[str, ...], Any]] = [
     ("coder", ("state",), "paused"),
     ("coder", ("unknownTopLevel",), 1),
     ("coder", ("description",), "x" * 2001),
-    # executor.image (E1): no implicit latest, no credentials, no whitespace, <= 255.
+    # executor.image (CP-ADR-0073 Z1): no implicit latest, no credentials, no whitespace, <= 255.
     ("coder", ("executor", "image"), "ghcr.io/org/observer"),
     ("coder", ("executor", "image"), "observer"),
     ("coder", ("executor", "image"), "user:secret@ghcr.io/org/observer:1"),
@@ -396,6 +560,53 @@ def test_what_the_catalog_rejects_the_core_rejects(
     spec = _set(copy.deepcopy(_object(key)["spec"]), path, value)
     assert _catalog_errors(key, spec) != []
     assert not _core_accepts(key, spec)
+
+
+# Fractional CPUs (amendment 2026-10-03): the core refuses them by the shape of the
+# field, with its path, not as ``non_canonical_value`` of the revision hash; the
+# catalog schema (package-sdk TASK-001344) rejects them too (BOTH_REJECT).
+FRACTIONAL_CPUS = [0.5, 1.5, 63.99, float("inf"), float("nan")]
+
+
+@pytest.mark.parametrize("cpus", FRACTIONAL_CPUS)
+def test_fractional_cpus_are_refused_with_the_path_of_the_field(cpus: float) -> None:
+    spec = _set(copy.deepcopy(_object("coder")["spec"]), ("placement", "resources"), {"cpus": cpus})
+    with pytest.raises(ValidationError) as caught:
+        AgentPublishRequest.model_validate({"key": "coder", "spec": spec})
+    [error] = caught.value.errors()
+    assert error["loc"] == ("spec", "placement", "resources", "cpus")
+    assert "whole number" in error["msg"]
+
+
+def test_a_whole_float_is_the_integer_it_names_and_hashes_as_it() -> None:
+    """YAML ``cpus: 2.0`` is an integer to JSON Schema; the revision stores and hashes ``2``."""
+    as_int = _set(copy.deepcopy(_object("coder")["spec"]), ("placement", "resources"), {"cpus": 2})
+    as_float = _set(copy.deepcopy(as_int), ("placement", "resources"), {"cpus": 2.0})
+    sent = AgentSpec.model_validate(as_float).model_dump(
+        mode="json", by_alias=True, exclude_unset=True
+    )
+    assert type(sent["placement"]["resources"]["cpus"]) is int
+    assert _hash_as_published(as_float) == _hash_as_published(as_int)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("placement", "replicas"), 2.0),
+        (("placement", "drainSeconds"), 60.0),
+        (("placement", "resources", "memoryMb"), 4096.0),
+    ],
+)
+def test_every_whole_number_of_the_spec_reaches_the_hash_as_an_integer(
+    path: tuple[str, ...], value: float
+) -> None:
+    spec = _set(copy.deepcopy(_object("coder")["spec"]), path, value)
+    sent = AgentSpec.model_validate(spec).model_dump(mode="json", by_alias=True, exclude_unset=True)
+    target = sent
+    for part in path:
+        target = target[part]
+    assert type(target) is int
+    _hash_as_published(spec)  # the canonical form takes it
 
 
 # (example, path in spec, value): shapes of ``workingCopy`` the schema of the kind
@@ -474,7 +685,7 @@ def test_identity_iam_is_part_of_the_revision_and_absent_iam_hashes_as_before() 
 
 
 def test_executor_image_is_part_of_the_revision_and_absent_image_hashes_as_before() -> None:
-    """E1-E2: ``executor.image`` is data of the spec; without it the hash is what it was."""
+    """CP-ADR-0073 Z1-Z2: ``executor.image`` is data of the spec; no image, the hash as before."""
     without_image = _object("coder")["spec"]
     assert "image" not in without_image["executor"]
     parsed = AgentSpec.model_validate(without_image)
@@ -495,7 +706,7 @@ def test_executor_image_is_part_of_the_revision_and_absent_image_hashes_as_befor
 
 
 def test_executor_image_in_the_core_is_the_pattern_of_the_catalog() -> None:
-    """E1/E3: one grammar in the core, its OpenAPI and the catalog schema of the kind."""
+    """CP-ADR-0073 Z1/Z3: one grammar in the core, its OpenAPI and the catalog schema."""
     catalog = _catalog_schema()["$defs"]["agentSpec"]["properties"]["executor"]["properties"]
     published = _openapi()["components"]["schemas"]["AgentExecutorSpec"]["properties"]
     image = next(v for v in published["image"]["anyOf"] if v.get("type") == "string")

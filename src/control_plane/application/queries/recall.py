@@ -120,7 +120,8 @@ async def graph_scope(
     workspace = await session.scalar(
         select(Workspace).where(Workspace.id == workspace_id, Workspace.tenant_id == ctx.tenant_id)
     )
-    if workspace is None:
+    # One invisible to the caller answers alike (CP-ADR-0082 §3.7).
+    if workspace is None or not ctx.sees_workspace(workspace.id):
         raise NotFoundError("Workspace not found", details={"workspaceId": str(workspace_id)})
     ancestors = await workspace_ancestor_ids(session, ctx.tenant_id, workspace.id)
     ws_namespace, narrowed = workspace_read(

@@ -157,7 +157,7 @@ async def test_artifact_schema_is_published_with_the_version(
     consumer = next(e for e in events if e["entityId"] == created.json()["id"])
     assert consumer["payload"]["declaresArtifactSchema"] is True
     assert (consumer["payload"]["inputs"], consumer["payload"]["outputs"]) == (2, 1)
-    assert consumer["schemaVersion"] == 2
+    assert consumer["schemaVersion"] == 3
 
     plain = await create_task_type(client, boot["admin"], {}, type_key="plain")
     assert plain.json()["artifactSchema"] == {}

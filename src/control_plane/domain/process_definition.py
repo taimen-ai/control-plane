@@ -55,7 +55,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +65,15 @@ from jsonschema import Draft202012Validator
 from control_plane.domain import cel_profile, decision_table
 from control_plane.domain.cel_profile import Environment, ExpressionError, Program
 from control_plane.domain.event_catalog import current_version, get_event_type, schema_for
+from control_plane.domain.settings_refs import (
+    NONE,
+    SETTINGS,
+    SettingsScope,
+    compile_expression,
+    loose_program,
+    reads_settings,
+    type_error,
+)
 
 JsonSchema = Mapping[str, Any]
 
@@ -126,6 +135,14 @@ class SkillEntry:
     status: str = "active"
 
 
+def package_skill(spec: Mapping[str, Any]) -> SkillEntry:
+    """The entry of a ``Skill`` of a package: its contract, else its plain schemas."""
+    contract = spec.get("contract")
+    if isinstance(contract, dict):
+        return SkillEntry(contract.get("inputs"), contract.get("outputs"))
+    return SkillEntry(spec.get("inputSchema"), spec.get("outputSchema"))
+
+
 @dataclass(frozen=True)
 class Catalog:
     """What the tenant's catalog holds of the definition's references.
@@ -154,6 +171,8 @@ class Catalog:
     versions: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
     retired_calendars: frozenset[str] = frozenset()
     retired_processes: frozenset[str] = frozenset()
+    # The settings of the process's package (CP-ADR-0081 §6): the type of ``settings``.
+    settings: SettingsScope = NONE
 
 
 @dataclass(frozen=True)
@@ -313,6 +332,8 @@ class CheckedProcess:
     # JSON pointer, typed as the check typed it, and the parsed decision tables.
     programs: Mapping[str, Program] = field(default_factory=dict, compare=False)
     tables: Mapping[str, decision_table.Table] = field(default_factory=dict, compare=False)
+    # Some expression reads ``settings``: the journal records the version it saw.
+    reads_settings: bool = False
 
     @property
     def errors(self) -> list[Problem]:
@@ -481,6 +502,7 @@ def check_process(
         tuple(sorted(checker.documents)),
         programs={read.path: read.program for read in checker.reads},
         tables=dict(checker.built_tables),
+        reads_settings=any(read.reads_settings for read in checker.reads),
     )
 
 
@@ -596,12 +618,14 @@ STRING = "string"
 KEY = "key"
 TIME = "time"
 LIST = "list"
+COUNT = "count"
 _EXPECTED: Mapping[str, tuple[str, ...]] = {
     BOOL: ("BOOL",),
     STRING: ("STRING",),
     KEY: ("STRING", "INT", "UINT"),
     TIME: ("TIMESTAMP", "DURATION"),
     LIST: ("LIST",),
+    COUNT: ("INT", "UINT"),
 }
 _EXPECTED_WORDS = {
     BOOL: "bool",
@@ -609,6 +633,20 @@ _EXPECTED_WORDS = {
     KEY: "string or int",
     TIME: "timestamp or duration",
     LIST: "list",
+    COUNT: "int",
+}
+
+# What a ``celMap`` writes into: (unknown key, type mismatch, owner in the message).
+_SKILL_INPUT = ("unknown_skill_input", "skill_input_type_mismatch", "the skill input")
+_MAP_TARGETS = {
+    "data": ("unknown_data_field", "data_type_mismatch", "data"),
+    "input": _SKILL_INPUT,
+    # human.customFields (CP-ADR-0074 §7, amendment 2026-10-01).
+    "customFields": (
+        "unknown_custom_field",
+        "custom_field_type_mismatch",
+        "the fieldSchema of the task type",
+    ),
 }
 
 
@@ -630,6 +668,12 @@ class _Place:
 class _Read:
     path: str
     program: Program
+    # A catch clause names its error ``settings``: what the program reads is the error.
+    shadowed: bool = False
+
+    @property
+    def reads_settings(self) -> bool:
+        return not self.shadowed and reads_settings(self.program)
 
 
 _TERMINAL_STEPS = ("complete", "raise")
@@ -691,7 +735,7 @@ class _Checker:
             Problem(code, "warning" if warning else "error", path, message, hint=hint)
         )
 
-    def env(self, place: _Place) -> Environment | None:
+    def env(self, place: _Place, settings: JsonSchema | None = None) -> Environment | None:
         bindings: dict[str, JsonSchema | None] = {"milestone": self._milestone_schema()}
         if place.compensated is not None:
             bindings["compensated"] = place.compensated
@@ -706,6 +750,8 @@ class _Checker:
                 stages=tuple(self.stage_ids),
                 calendar=self.spec.get("calendar"),
                 bindings=bindings,
+                # A catch clause that names its error ``settings`` hides the settings.
+                settings=None if SETTINGS in place.errors else settings,
             )
         except (ValueError, TypeError, KeyError) as exc:
             self.problem(
@@ -726,13 +772,24 @@ class _Checker:
         environment = self.env(place)
         if environment is None:
             return None
+        shadowed = SETTINGS in place.errors
         try:
-            program = environment.compile(text, path=path)
+            if shadowed:
+                program = environment.compile(text, path=path)
+            else:
+                program = compile_expression(
+                    self.catalog.settings,
+                    lambda settings: self.env(place, settings),
+                    text,
+                    path=path,
+                )
         except ExpressionError as exc:
             self.problems.append(Problem(exc.code, "error", path, exc.message, hint=exc.hint))
             return None
-        self.reads.append(_Read(path, program))
+        self.reads.append(_Read(path, program, shadowed))
         if expect is not None and not _gives(program.output_type, expect):
+            if self._settings_fault(place, text, path, lambda out: _gives(out, expect)):
+                return program
             self.problem(
                 "expression_type_error",
                 path,
@@ -740,6 +797,23 @@ class _Checker:
                 f" {_EXPECTED_WORDS[expect]} is expected here",
             )
         return program
+
+    def _settings_fault(
+        self, place: _Place, text: str, path: str, fits: Callable[[str], bool]
+    ) -> bool:
+        """Whether the type of a read of ``settings`` is why the expression misfits its place.
+
+        So it is when the expression with ``settings`` untyped would fit:
+        ``settings_ref_type`` is then the finding (CP-ADR-0081 §6).
+        """
+        if self.catalog.settings.schema is None or SETTINGS in place.errors:
+            return False
+        loose = loose_program(lambda settings: self.env(place, settings), text, path=path)
+        if loose is None or not reads_settings(loose) or not fits(loose.output_type):
+            return False
+        error = type_error(loose.reads, path=path)
+        self.problems.append(Problem(error.code, "error", path, error.message))
+        return True
 
     def expr_map(
         self,
@@ -750,7 +824,8 @@ class _Checker:
         target: JsonSchema | None,
         what: str,
     ) -> None:
-        """A ``celMap``: keys are paths in ``target`` (the data, a skill input), values CEL."""
+        """A ``celMap``: keys are paths in ``target`` (the data, a skill input,
+        the fields of a task type), values CEL."""
         if not isinstance(mapping, dict):
             return
         for name, text in mapping.items():
@@ -762,8 +837,7 @@ class _Checker:
                 self.writes.add(name)
             resolved = _resolve(target, name.split("."))
             if isinstance(resolved, _Unknown):
-                code = "unknown_data_field" if what == "data" else "unknown_skill_input"
-                owner = "data" if what == "data" else "the skill input"
+                code, _, owner = _MAP_TARGETS.get(what, _SKILL_INPUT)
                 prefix = ".".join(name.split(".")[: resolved.depth])
                 self.problem(
                     code,
@@ -777,7 +851,11 @@ class _Checker:
                 and resolved is not None
                 and not _fits(program.output_type, resolved)
             ):
-                code = "data_type_mismatch" if what == "data" else "skill_input_type_mismatch"
+                if isinstance(text, str) and self._settings_fault(
+                    place, text, here, partial(_fits, schema=resolved)
+                ):
+                    continue
+                code = _MAP_TARGETS.get(what, _SKILL_INPUT)[1]
                 self.problem(
                     code,
                     here,
@@ -1000,6 +1078,13 @@ class _Checker:
             for unit in _WORKING_UNITS
             if unit in span
         ]
+        # An amount may be an expression: an integer computed at the step's entry
+        # (CP-ADR-0081, amendment 2026-10-03 G1); settings.* are checked as anywhere else.
+        for here, span in spans:
+            for unit in _WORKING_UNITS:
+                amount = span.get(unit)
+                if isinstance(amount, dict):
+                    self.expr(f"{here}/{unit}/expr", amount.get("expr"), place, COUNT)
         if not units:
             return
         key = value.get("calendar")
@@ -1067,6 +1152,14 @@ class _Checker:
             custom_fields = self.task_type(here + "/taskType", body["taskType"])
             result = self.form(here + "/form", body.get("form")) or custom_fields
             self.expr(here + "/title", body.get("title"), place, STRING)
+            # The fields filled from the case: checked against the type's fieldSchema.
+            self.expr_map(
+                here + "/customFields",
+                body.get("customFields"),
+                place,
+                target=custom_fields,
+                what="customFields",
+            )
             self.assign_chain(here + "/assign", body["assign"], place)
             self.sla_due(here + "/due", body.get("due"), place)
             self.escalations(here + "/escalations", body.get("escalations"), place)

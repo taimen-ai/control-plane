@@ -78,6 +78,7 @@ from control_plane.domain.process_definition import (
     pointer,
     step_kind,
 )
+from control_plane.domain.settings_refs import NONE, SettingsScope
 
 # Revisions of the engine's semantics (CP-ADR-0074, amendment 2026-09-29): a
 # version runs under the revision it was published with, and an instance moves
@@ -212,6 +213,10 @@ class Input:
     correlationId, payload}``; an observation adds ``observation`` (its kind)
     and ``source``. ``calendars`` — the calendar versions the input is
     evaluated with (the journal records them; a replay passes the same ones).
+    ``settings`` — the effective settings of the process's package the input
+    is evaluated with (CP-ADR-0081 §6): read once per step by the application
+    layer, recorded in the journal by version, the same ones in a replay.
+    Neither is part of :meth:`out`.
     """
 
     kind: str
@@ -219,6 +224,7 @@ class Input:
     body: Mapping[str, Any] = field(default_factory=dict)
     actor_id: str | None = None
     calendars: Mapping[str, Calendar] = field(default_factory=dict)
+    settings: Mapping[str, Any] | None = None
 
     def out(self) -> dict[str, Any]:
         return {
@@ -294,6 +300,9 @@ class Definition:
     stage_ids: tuple[str, ...]
     cost_limit: int = DEFAULT_COST_LIMIT
     engine_revision: int = ENGINE_REVISION
+    # Some expression reads ``settings`` (CP-ADR-0081 §6); the type it was compiled with.
+    reads_settings: bool = False
+    settings: SettingsScope = NONE
 
     def __post_init__(self) -> None:
         if self.engine_revision not in ENGINE_REVISIONS:
@@ -392,6 +401,8 @@ class Definition:
             stage_ids=tuple(s["id"] for s in spec["stages"]),
             cost_limit=cost_limit,
             engine_revision=engine_revision,
+            reads_settings=checked.reads_settings,
+            settings=catalog.settings,
         )
 
     def stage(self, stage_id: str) -> tuple[str, Mapping[str, Any]]:
@@ -413,7 +424,8 @@ def trigger_matches(
 ) -> bool:
     """Whether ``event`` is the trigger's event or observation and passes its ``where``.
 
-    ``values`` — the other variables the ``where`` may read (the instance's data).
+    ``values`` — the other variables the ``where`` may read (the instance's
+    data, the settings of the package).
     """
     if trigger.get("event") is not None:
         if event.get("observation") is not None or event.get("type") != trigger["event"]:
@@ -435,30 +447,48 @@ def trigger_matches(
     return value.value is True
 
 
-def start_key(definition: Definition, event: Mapping[str, Any]) -> str | None:
-    """The instance key ``event`` starts (or reaches), ``None`` when it is not the start trigger."""
+def _settings_values(settings: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {"settings": settings} if settings is not None else {}
+
+
+def start_key(
+    definition: Definition, event: Mapping[str, Any], settings: Mapping[str, Any] | None = None
+) -> str | None:
+    """The instance key ``event`` starts (or reaches), ``None`` when it is not the start trigger.
+
+    ``settings`` — the effective settings of the package, when the process reads them.
+    """
     start = definition.spec["start"]
-    if not trigger_matches(definition, start["on"], "/spec/start/on", event):
+    values = _settings_values(settings)
+    if not trigger_matches(definition, start["on"], "/spec/start/on", event, values):
         return None
-    return _key_of(definition, "/spec/start/key", event)
+    return _key_of(definition, "/spec/start/key", event, values)
 
 
-def correlation_keys(definition: Definition, event: Mapping[str, Any]) -> list[str]:
+def correlation_keys(
+    definition: Definition, event: Mapping[str, Any], settings: Mapping[str, Any] | None = None
+) -> list[str]:
     """Instance keys ``event`` reaches through ``correlate``, in declaration order."""
     keys: list[str] = []
+    values = _settings_values(settings)
     for index, item in enumerate(definition.spec.get("correlate") or ()):
         path = pointer("spec", "correlate", index)
-        if trigger_matches(definition, item["on"], path + "/on", event):
-            key = _key_of(definition, path + "/key", event)
+        if trigger_matches(definition, item["on"], path + "/on", event, values):
+            key = _key_of(definition, path + "/key", event, values)
             if key is not None and key not in keys:
                 keys.append(key)
     return keys
 
 
-def _key_of(definition: Definition, path: str, event: Mapping[str, Any]) -> str | None:
+def _key_of(
+    definition: Definition,
+    path: str,
+    event: Mapping[str, Any],
+    values: Mapping[str, Any] | None = None,
+) -> str | None:
     try:
         value = definition.programs[path].evaluate(
-            {"event": _event_var(event)}, cost_limit=definition.cost_limit
+            {**(values or {}), "event": _event_var(event)}, cost_limit=definition.cost_limit
         )
     except ExpressionError:
         return None
@@ -620,6 +650,7 @@ class _Engine:
                 "clock": _rfc3339(self.now),
             },
             "milestone": {m: bool(v) for m, v in state["milestones"].items()},
+            **_settings_values(self.settings()),
         }
         for frame in (thread or {}).get("stack") or ():
             values.update(frame.get("bindings") or {})
@@ -628,6 +659,12 @@ class _Engine:
                 values["compensated"] = frame["stepVar"]
         values.update(extra)
         return values
+
+    def settings(self) -> Mapping[str, Any] | None:
+        """The settings of the input, for a definition that reads them."""
+        if not self.d.reads_settings:
+            return None
+        return self.input.settings if self.input.settings is not None else {}
 
     def matches(self, trigger: Mapping[str, Any], path: str, event: Mapping[str, Any]) -> bool:
         return trigger_matches(self.d, trigger, path, event, self.values())
@@ -744,7 +781,7 @@ class _Engine:
         # An explicit start (an operator or a parent process) names the key and
         # the initial data itself; there is no trigger event to evaluate.
         explicit = body.get("key") is not None
-        key = _key_text(body["key"]) if explicit else start_key(self.d, event)
+        key = _key_text(body["key"]) if explicit else start_key(self.d, event, self.settings())
         if key is None:
             raise EngineError("the event is not the start trigger of the process")
         self.state = {
@@ -1397,6 +1434,14 @@ class _Engine:
             title = str(self.evaluate(here + "/title", values, entry.id))
         assign = self.assignees(here + "/assign", body["assign"], values, entry.id)
         due, due_recipe, failed = self.due_of(here + "/due", body.get("due"), values, entry.id)
+        prefill: dict[str, Any] = {}
+        if body.get("customFields"):
+            # The task's fields filled from the case (CP-ADR-0074 §7, amendment
+            # 2026-10-01); a value that is null leaves the field to the person.
+            computed = self.evaluate_map(
+                here + "/customFields", body["customFields"], values, entry.id
+            )
+            prefill["customFields"] = {k: v for k, v in computed.items() if v is not None}
         activity = self.open_activity(tid, entry, "task", assign=assign, due=due)
         self.intent(
             "create_task",
@@ -1411,6 +1456,7 @@ class _Engine:
             context=self.context_profile(here + "/context", body.get("context"), values, entry.id),
             input=self.step_input(entry, values),
             externalRef=self.external_ref(entry.id),
+            **prefill,
         )
         self.open_sla(activity, here + "/due", body.get("due"), values, failed)
         self.escalation_timers(activity, here, body.get("escalations"), due_recipe, values, failed)
@@ -1645,6 +1691,7 @@ class _Engine:
             return None, None, None
         recipe = sla.due_recipe(value, path, self.d.spec.get("calendar"))
         try:
+            recipe = self.resolve(recipe, values, element)
             due, _, _ = self.compute(recipe, self.now, values, element)
         except _Raised as raised:
             if not self.sla_on:
@@ -2481,6 +2528,8 @@ class _Engine:
         self.state["timers"][timer_id] = timer
         if self.state["status"] == SUSPENDED and not self.timer_runs_while_suspended(timer):
             self.freeze(timer)
+        # What the expressions of the deadline gave, so that a replay compares it too.
+        amounts = sla.computed_amounts(recipe)
         self.decide(
             "timer_set",
             element,
@@ -2488,6 +2537,7 @@ class _Engine:
             timerKind=kind,
             dueAt=timer["dueAt"],
             provisional=provisional,
+            **({"computed": amounts} if amounts else {}),
         )
         self.intent("set_timer", **self.timer_row(timer))
         return timer_id
@@ -2890,13 +2940,13 @@ class _Engine:
         does not stop the instance: it is ``process.sla_failed`` and a record
         marked ``failed``.
         """
-        calendar = self.d.spec.get("calendar")
-        due_recipe = sla.due_recipe(value, path, calendar)
-        warn_recipe = sla.warn_recipe(value, due_recipe, calendar)
+        due_recipe: dict[str, Any] = {}
+        warn_recipe = None
         due = warn = None
         provisional = False
         if failed is None:
             try:
+                due_recipe, warn_recipe = self.resolved(value, path, values, element)
                 due, provisional, _ = self.compute(due_recipe, self.now, values, element)
                 if warn_recipe is not None:
                     warn, marked, _ = self.compute(warn_recipe, self.now, values, element)
@@ -2927,6 +2977,37 @@ class _Engine:
             timer=made[0],
             warn_timer=made[1] if len(made) > 1 else None,
         )
+
+    def resolved(
+        self, value: Any, path: str, values: Mapping[str, Any], element: str
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """The recipes of the deadline at ``path`` and of its warning, expressions computed."""
+        calendar = self.d.spec.get("calendar")
+        due = self.resolve(sla.due_recipe(value, path, calendar), values, element)
+        warn = sla.warn_recipe(value, due, calendar, path)
+        return due, self.resolve(warn, values, element) if warn is not None else None
+
+    def resolve(
+        self, recipe: dict[str, Any], values: Mapping[str, Any], element: str
+    ) -> dict[str, Any]:
+        """A recipe with the ``{expr}`` amounts of its working units computed.
+
+        An amount is computed once, from the values of the step's entry, and
+        the recipe keeps the number: the warning, a pause and a new calendar
+        version count it as they count a number (CP-ADR-0081, amendment 2026-10-03 G1).
+        """
+        kind = recipe.get("kind")
+        if kind == "before":
+            return {**recipe, "span": self.resolve(recipe["span"], values, element)}
+        if kind not in sla.WORKING or "expr" not in recipe:
+            return recipe
+        path = str(recipe["expr"])
+        raw = self.evaluate(path, values, element)
+        try:
+            amount = sla.amount_of(raw, str(kind), path)
+        except sla.DeadlineError as exc:
+            raise _Raised(ProcessError(exc.code, 422, exc.message, element)) from None
+        return sla.computed(recipe, amount)
 
     def sla_failure(
         self, scope: str, element: str | None, aid: str | None, error: Mapping[str, Any]
@@ -3152,13 +3233,11 @@ class _Engine:
                 holder.pop("sla")
                 self.decide("deadline_migrated", named, **report, dueAt=None, breached=False)
             return None, None, None
-        calendar = self.d.spec.get("calendar")
-        due_recipe = sla.due_recipe(value, path, calendar)
-        warn_recipe = sla.warn_recipe(value, due_recipe, calendar)
         # The deadline keeps the pauses of its timer: a past suspension still counts.
         pauses = self.deadline_pauses(timers)
         paused: dict[str, Any] = {"paused": pauses} if pauses else {}
         try:
+            due_recipe, warn_recipe = self.resolved(value, path, values, element)
             due, provisional, _ = self.paced(due_recipe, base, values, element, pauses)
             warn = None
             if warn_recipe is not None:

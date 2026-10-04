@@ -1,0 +1,25 @@
+apiVersion: catalog.example/v1
+kind: View
+key: tenders-board
+spec:
+  title: tenders.board.title
+  nav: {group: work, icon: tender, order: 20}
+  audience: {roles: [tender-lead, tender-finance, general-director]}
+  source:
+    process: tender
+    filter: "status == 'active'"
+  layout:
+    - block: metrics
+      items:
+        - {title: tenders.board.inProgress, value: "count()"}
+        - {title: tenders.board.totalPrice, value: "sum(decimal(data.procurement.maxPrice.amount))", format: money}
+    - block: board
+      columns: stages
+      card:
+        title: data.procurement.object
+        subtitle: data.procurement.customer.shortName
+        fields:
+          - {value: "decimal(data.procurement.maxPrice.amount)", format: money}
+          - {value: "timestamp(data.procurement.deadlines.submissionEnd)", format: due}
+        badge: slaState
+      open: {view: tender-card, id: id}

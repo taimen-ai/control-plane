@@ -24,6 +24,7 @@ from control_plane.application.queries import lists as queries
 router = APIRouter(tags=["sessions"])
 
 
+# visibility: tenant — a session is the caller's own
 @router.post(
     "/sessions",
     response_model=SessionOut,
@@ -72,6 +73,7 @@ async def open_session(
     )
 
 
+# visibility: tenant — a session is the caller's own
 @router.get("/sessions", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_sessions(
     ctx: AuthDep,
@@ -84,12 +86,14 @@ async def list_sessions(
     return JSONResponse(page_body([dump(SessionOut, s) for s in page.items], page.next_cursor))
 
 
+# visibility: tenant — a session is the caller's own
 @router.get("/sessions/{session_id}", response_model=SessionOut, responses=ERROR_RESPONSES)
 async def get_session(session_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     work_session = await queries.get_session(db, ctx, session_id)
     return JSONResponse(dump(SessionOut, work_session))
 
 
+# visibility: tenant — a session is the caller's own
 @router.post(
     "/sessions/{session_id}:heartbeat",
     response_model=SessionOut,
@@ -132,6 +136,7 @@ async def heartbeat_session(
     )
 
 
+# visibility: tenant — a session is the caller's own
 @router.post(
     "/sessions/{session_id}:close",
     response_model=SessionOut,

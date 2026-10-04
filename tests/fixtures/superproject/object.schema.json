@@ -1,15 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://taimen.ai/schema/packages/v1/object.schema.json",
-  "title": "Объект пакета каталога Control Plane", "$comment": "TAI-ADR-0044",
-  "description": "Одна обёртка для манифеста и всех видов каталога: apiVersion + kind + key + spec. spec — тело запроса API control-plane в camelCase без поля идентичности. Схема проверяет форму; окончательную проверку делает ядро (и package-sdk check его валидаторами).",
+  "title": "Control Plane catalog package object", "$comment": "TAI-ADR-0044",
+  "description": "One wrapper for the manifest and every catalog kind: apiVersion + kind + key + spec. spec is the control-plane API request body in camelCase without the identity field. The schema checks the shape; the final check is done by the core (and by package-sdk check with its validators).",
   "type": "object",
   "required": ["apiVersion", "kind", "key", "spec"],
   "additionalProperties": false,
   "properties": {
     "apiVersion": {"const": "taimen.ai/v1"},
     "kind": {
-      "enum": ["Package", "Installation", "ArtifactType", "TaskType", "ProjectTemplate", "WorkspaceType", "Role", "Capability", "Skill", "WorkRule", "Agent", "NotificationRule", "Process", "Calendar", "KnowledgePack"]
+      "enum": ["Package", "Installation", "ArtifactType", "TaskType", "ProjectTemplate", "WorkspaceType", "Role", "Capability", "ConnectionType", "Skill", "WorkRule", "Agent", "NotificationRule", "Process", "Calendar", "KnowledgePack"]
     },
     "key": {"type": "string", "minLength": 1, "maxLength": 200},
     "spec": {"type": "object"}
@@ -31,6 +31,8 @@
      "then": {"properties": {"key": {"$ref": "#/$defs/slug"}, "spec": {"$ref": "#/$defs/roleSpec"}}}},
     {"if": {"properties": {"kind": {"const": "Capability"}}},
      "then": {"properties": {"spec": {"$ref": "#/$defs/capabilitySpec"}}}},
+    {"if": {"properties": {"kind": {"const": "ConnectionType"}}},
+     "then": {"properties": {"key": {"$ref": "#/$defs/connectionKey"}, "spec": {"$ref": "#/$defs/connectionTypeSpec"}}}},
     {"if": {"properties": {"kind": {"const": "Skill"}}},
      "then": {"properties": {"spec": {"$ref": "#/$defs/skillSpec"}}}},
     {"if": {"properties": {"kind": {"const": "WorkRule"}}},
@@ -42,7 +44,7 @@
     {"if": {"properties": {"kind": {"const": "Process"}}},
      "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/processSpec"}}}},
     {"if": {"properties": {"kind": {"const": "KnowledgePack"}}},
-     "then": {"properties": {"key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"}, "spec": {"$ref": "knowledge-pack.schema.json", "properties": {"version": {"type": "integer", "minimum": 1, "description": "Версия онтологии в пакете — целое: включение ссылается на неё как name@version, правка — новая версия"}}}}}},
+     "then": {"properties": {"key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"}, "spec": {"$ref": "knowledge-pack.schema.json", "properties": {"version": {"type": "integer", "minimum": 1, "description": "Ontology version in the package, an integer: an inclusion refers to it as name@version, an edit is a new version"}}}}}},
     {"if": {"properties": {"kind": {"const": "Calendar"}}},
      "then": {"properties": {"key": {"$ref": "#/$defs/typeKey"}, "spec": {"$ref": "#/$defs/calendarSpec"}}}}
   ],
@@ -50,26 +52,26 @@
     "envOrUuid": {
       "type": "string",
       "pattern": "^(\\$\\{[A-Z][A-Z0-9_]*\\}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
-      "description": "UUID или ${ПЕРЕМЕННАЯ} установки (топология окружения в пакет не пишется)"
+      "description": "UUID or an installation ${VARIABLE} (environment topology is not written into the package)"
     },
     "permission": {
       "type": "string", "pattern": "^[a-z_]+(\\.[a-z_]+)+$",
-      "description": "Право Control Plane, например tasks.claim"
+      "description": "Control Plane permission, e.g. tasks.claim"
     },
     "nodeLabel": {
       "type": "string", "maxLength": 100,
       "pattern": "^[a-z0-9][a-z0-9.-]*(=[a-zA-Z0-9._-]+)?$",
-      "description": "Метка узла: имя или имя=значение"
+      "description": "Node label: name or name=value"
     },
     "secretName": {
       "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
-      "description": "Имя секрета на узле; значение в описание не пишется"
+      "description": "Secret name on the node; the value is not written into the description"
     },
     "agentSpec": {
       "type": "object",
       "required": ["displayName", "identity"],
       "additionalProperties": false,
-      "description": "Агент: кто он, какую работу берёт, чем и как исполняет, где размещается. Каждое изменение — новая неизменяемая ревизия в ядре; прогон помнит ревизию.", "$comment": "TAI-ADR-0052, CP-ADR-0073",
+      "description": "Agent: who it is, what work it takes, with what and how it executes, where it is placed. Every change is a new immutable revision in the core; a run remembers its revision.", "$comment": "TAI-ADR-0052, CP-ADR-0073",
       "properties": {
         "displayName": {"$ref": "#/$defs/displayName"},
         "description": {"type": "string", "maxLength": 2000},
@@ -77,41 +79,41 @@
           "type": "object",
           "required": ["kind"],
           "additionalProperties": false,
-          "description": "Личность: principal ядра и IAM и связка с правами — их заводит и поддерживает платформа. Права не шире прав того, кто применяет описание.",
+          "description": "Identity: the core and IAM principal and its binding to permissions, created and maintained by the platform. Permissions are no broader than those of whoever applies the description.",
           "properties": {
             "kind": {"enum": ["agent", "service"]},
-            "roles": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}, "description": "Роли tenant'а (из пакетов)"},
+            "roles": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}, "description": "Tenant roles (from packages)"},
             "permissions": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/permission"}},
             "capabilities": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
-            "iam": {"type": "object", "required": ["audiences", "scopeCeiling"], "additionalProperties": false, "description": "IAM-часть учётки: audiences и потолок scope. Данные для того, кто выпускает учётку (bootstrap, контроллер узлов исполнителей); ядро их хранит, но не толкует.", "properties": {"audiences": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}}, "scopeCeiling": {"type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true, "items": {"type": "string", "maxLength": 200, "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"}, "description": "Scope вида <audience>:<действие>"}}}
+            "iam": {"type": "object", "required": ["audiences", "scopeCeiling"], "additionalProperties": false, "description": "IAM part of the account: audiences and the scope ceiling. Data for whoever issues the account (bootstrap, executor node controller); the core stores it but does not interpret it.", "properties": {"audiences": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}}, "scopeCeiling": {"type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true, "items": {"type": "string", "maxLength": 200, "pattern": "^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9][a-z0-9_-]*)*(:[a-z0-9][a-z0-9_-]*(\\.[a-z0-9][a-z0-9_-]*)*)+$"}, "description": "Scope <audience>:<action>, segments may be dotted (control-plane:read, iam:identities.link)", "$comment": "CP-ADR-0073 К1"}}}
           }
         },
         "work": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Какую работу агент берёт из очереди",
+          "description": "What work the agent takes from the queue",
           "properties": {
             "workspace": {"$ref": "#/$defs/envOrUuid"},
             "project": {"$ref": "#/$defs/envOrUuid"},
             "includeSubprojects": {"type": "boolean", "default": false},
-            "onlyAssigned": {"type": "boolean", "default": true, "description": "Только назначенная ему работа"},
-            "taskTypes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Пусто — любые типы"}
+            "onlyAssigned": {"type": "boolean", "default": true, "description": "Only work assigned to it"},
+            "taskTypes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Empty means any types"}
           }
         },
         "executor": {
           "type": "object",
           "required": ["kind"],
           "additionalProperties": false,
-          "description": "Чем агент исполняет работу. Вид — данные (строка для ядра); образ по умолчанию выбирает узел, image из описания — только из списка узла.",
+          "description": "What the agent executes work with. The kind is data (a string for the core); the default image is chosen by the node, an image from the description only from the node's list.",
           "properties": {
             "kind": {"enum": ["claude-code", "codex", "skills", "git-connector", "observer"]},
             "params": {"type": "object"},
             "image": {
               "type": "string", "minLength": 1, "maxLength": 255,
               "pattern": "^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}(?:@sha256:[a-f0-9]{64})?|@sha256:[a-f0-9]{64})$",
-              "description": "Образ исполнителя: [registry[:port]/]path:tag, …@sha256:<64 hex> или …:tag@sha256:<64 hex> — тег или дайджест обязателен. Узел запускает его, только если образ есть в списке executors.<вид>.images узла, иначе image_not_allowed; без поля — образ вида по умолчанию", "$comment": "грамматика CP-ADR-0073 Е1; амендмент TAI-ADR-0052 п.7, TAI-ADR-0062 п.9"
+              "description": "Executor image: [registry[:port]/]path:tag, …@sha256:<64 hex> or …:tag@sha256:<64 hex>; a tag or digest is required. The node runs it only if the image is in the node's executors.<kind>.images list, otherwise image_not_allowed; without the field, the kind's default image", "$comment": "grammar CP-ADR-0073 З1; amendment TAI-ADR-0052 item 7, TAI-ADR-0062 item 9"
             },
-            "instructions": {"type": "string", "maxLength": 65536, "description": "Инструкции исполнителю — слой после инструкций платформы, проекта и типа задачи", "$comment": "CP-ADR-0066"}
+            "instructions": {"type": "string", "maxLength": 65536, "description": "Instructions for the executor: a layer after the platform, project and task type instructions", "$comment": "CP-ADR-0066"}
           },
           "allOf": [
             {"if": {"properties": {"kind": {"const": "claude-code"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/agentExecutors/claude-code"}}}},
@@ -123,46 +125,50 @@
         },
         "workingCopy": {
           "type": "object",
-          "description": "Рабочая копия задачи. Толкует демон исполнителя, ядро хранит объект как данные; форму задаёт вид исполнителя: формы по видам — agentWorkingCopies: у вида исполнителя кода — один репозиторий или каталог с полем задачи, у остальных видов — один репозиторий", "$comment": "TAI-ADR-0016 п.5; TAI-ADR-0063, амендменты ADR-0052 п.1 и CP-ADR-0073 п.1, п.14"
+          "description": "Task working copy. Interpreted by the executor daemon, the core stores the object as data; the shape is set by the executor kind: shapes per kind are in agentWorkingCopies: for the code executor kind, one repository or a catalog with a task field, for other kinds, one repository", "$comment": "TAI-ADR-0016 item 5; TAI-ADR-0063, amendments ADR-0052 item 1 and CP-ADR-0073 items 1, 14"
         },
         "skills": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Какие скиллы агент исполняет сам и куда им можно ходить", "$comment": "CP-ADR-0056",
+          "description": "Which skills the agent executes itself and where they may connect", "$comment": "CP-ADR-0056",
           "properties": {
             "protocols": {"type": "array", "uniqueItems": true, "items": {"enum": ["local", "http", "mcp"]}},
-            "local": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z_][\\w.]*(:[A-Za-z_]\\w*)?$"}, "description": "Разрешённые entrypoints или пакеты"},
+            "local": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z_][\\w.]*(:[A-Za-z_]\\w*)?$"}, "description": "Allowed entrypoints or packages"},
             "httpOrigins": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
             "mcpOrigins": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
-            "audiences": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}, "description": "Audiences IAM, в которые скиллы получают токен"},
+            "audiences": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}, "description": "IAM audiences the skills get a token for"},
             "concurrency": {"type": "integer", "minimum": 1, "maximum": 32},
-            "invoke": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 251, "pattern": "^[^@\\s/]{1,200}@[^@\\s/]{1,50}$"}, "description": "Версии скиллов, которые агент вызывает через ядро (имя@версия), а не исполняет сам; реестр назначает их principal'у агента", "$comment": "CP-ADR-0073, амендмент 2026-09-28"}
+            "invoke": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 251, "pattern": "^[^@\\s/]{1,200}@[^@\\s/]{1,50}$"}, "description": "Skill versions the agent invokes through the core (name@version) rather than executing itself; the registry assigns them to the agent's principal", "$comment": "CP-ADR-0073, amendment 2026-09-28"}
           }
         },
         "placement": {
-          "description": "Где и сколько: none — только личность, без процесса (сервисная учётка)",
-          "oneOf": [
-            {"const": "none"},
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "requires": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/nodeLabel"}, "description": "Метки, которые должны быть у узла"},
-                "secrets": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/secretName"}, "description": "Секреты, которые должны быть на узле: статические (файл в каталоге секретов узла) и выдаваемые — их узел выпускает сам и обновляет, например часовой forge-token из установки приложения forge. Объявляются одинаково, по имени; материал в описание не пишется", "$comment": "TAI-ADR-0063 п.9"},
-                "resources": {
-                  "type": "object", "additionalProperties": false,
-                  "properties": {
-                    "cpus": {"type": "number", "exclusiveMinimum": 0, "maximum": 64},
-                    "memoryMb": {"type": "integer", "minimum": 64, "maximum": 262144}
-                  }
-                },
-                "replicas": {"type": "integer", "minimum": 0, "maximum": 20, "default": 1},
-                "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 14400, "default": 14400, "description": "Сколько ждать текущий прогон перед переходом на новую ревизию"}
-              }
+          "description": "Where and how many: none means identity only, without a process (service account)",
+          "$comment": "if/then/else rather than oneOf: with oneOf a finding loses the path into the object (spec/placement instead of spec/placement/resources/cpus)",
+          "if": {"type": "string"},
+          "then": {"const": "none"},
+          "else": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "requires": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/nodeLabel"}, "description": "Labels the node must have"},
+              "secrets": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/secretName"}, "description": "Secrets the node must have: static ones (a file in the node's secrets directory) and issued ones, which the node issues and renews itself, e.g. an hourly forge-token from the forge app installation. Declared the same way, by name; the material is not written into the description", "$comment": "TAI-ADR-0063 item 9"},
+              "resources": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                  "cpus": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Whole CPUs: the core canonical hash of a revision rejects fractional numbers (non_canonical_value)"},
+                  "memoryMb": {"type": "integer", "minimum": 64, "maximum": 262144}
+                }
+              },
+              "replicas": {"type": "integer", "minimum": 0, "maximum": 20, "default": 1},
+              "drainSeconds": {"type": "integer", "minimum": 0, "maximum": 14400, "default": 14400, "description": "How long to wait for the current run before switching to a new revision"}
             }
-          ]
+          }
         },
-        "state": {"enum": ["running", "stopped"], "default": "running"}
+        "state": {"enum": ["running", "stopped"], "default": "running"},
+        "connections": {
+          "type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/connectionKey"},
+          "description": "Keys of the tenant's connections whose access material the agent may read. Whether such a connection exists is not checked on publish; a non-empty list needs connections.manage of whoever applies it", "$comment": "CP-ADR-0079 §8"
+        }
       },
       "allOf": [
         {"if": {"not": {"properties": {"placement": {"const": "none"}}, "required": ["placement"]}},
@@ -174,38 +180,45 @@
     },
     "repositoryKey": {
       "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$(?![\\s\\S])",
-      "description": "Канонический ключ репозитория в каталоге рабочей копии: ASCII, как в customFields задачи. Ключи и псевдонимы сопоставляются без учёта регистра (casefold): так разрешают ключ задачи демон исполнителя и tasks.check@1",
-      "$comment": "(?![\\s\\S]) после $ — потому что $ в re Python допускает завершающий перевод строки"
+      "description": "Canonical repository key in the working copy catalog: ASCII, as in the task's customFields. Keys and aliases are matched case-insensitively (casefold): this is how the executor daemon and tasks.check@1 resolve the task key",
+      "$comment": "(?![\\s\\S]) after $ because $ in Python re allows a trailing newline"
     },
     "repositoryAlias": {
       "type": "string", "maxLength": 63,
       "pattern": "^[A-Za-z0-9\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u0400-\u04ff][A-Za-z0-9\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u0400-\u04ff._-]{0,62}$(?![\\s\\S])",
-      "description": "Прежнее имя репозитория (ключ карты, строка «Репозиторий» документа задач, ключ дедупликации коннектора): буквы латиницы и кириллицы, цифры, . _ -. Сопоставляется с ключом задачи без учёта регистра (casefold)",
-      "$comment": "Буквы — явными диапазонами (латиница с Latin-1 и Extended-A/B, кириллица), а не \\p{L}: re Python, которым проверяет package-sdk, \\p{…} не знает. (?![\\s\\S]) после $ — потому что $ в re Python допускает завершающий перевод строки"
+      "description": "Former repository name (map key, repository row of the task document, connector deduplication key): Latin and Cyrillic letters, digits, . _ -. Matched against the task key case-insensitively (casefold)",
+      "$comment": "Letters as explicit ranges (Latin with Latin-1 and Extended-A/B, Cyrillic) rather than \\p{L}: Python re, which package-sdk checks with, does not know \\p{…}. (?![\\s\\S]) after $ because $ in Python re allows a trailing newline"
+    },
+    "workingCopyPath": {
+      "type": "string", "maxLength": 200,
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,99}(?:/[a-z0-9][a-z0-9._-]{0,99})*$(?![\\s\\S])",
+      "description": "A directory in the working copy relative to its root: one name (flat layout, control-plane) or a path of several segments joined by / (services/control-plane, sdk/platform-auth-sdk). A segment starts with a lowercase Latin letter or a digit, so . and .. do not pass; an absolute path, an empty segment (//, a trailing /) and a backslash are rejected",
+      "$comment": "TAI-ADR-0064 items 1–2. (?![\\s\\S]) after $ because $ in Python re allows a trailing newline"
     },
     "agentWorkingCopies": {
-      "description": "Формы раздела workingCopy по видам исполнителя: ядро хранит раздел как данные, проверяют эта схема и демон исполнителя", "$comment": "TAI-ADR-0063",
+      "description": "Shapes of the workingCopy section per executor kind: the core stores the section as data, this schema and the executor daemon check it", "$comment": "TAI-ADR-0063",
       "single": {
         "type": "object",
         "required": ["repository"],
         "additionalProperties": false,
-        "description": "Прежняя форма: один репозиторий, соседи и суперпроект адресами",
+        "description": "Legacy shape: one repository, neighbours and superproject by address",
         "properties": {
           "repository": {"type": "string", "minLength": 1, "maxLength": 500},
-          "directory": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "description": "Имя каталога репозитория в рабочей копии (плоская раскладка)", "$comment": "ADR-0029"},
+          "directory": {"allOf": [{"$ref": "#/$defs/workingCopyPath"}], "description": "Directory of the repository in the working copy: a name (flat layout) or a path of several segments", "$comment": "ADR-0029, TAI-ADR-0064 item 2"},
           "baseRef": {"type": "string", "minLength": 1, "maxLength": 200},
-          "neighbours": {"type": "object", "propertyNames": {"pattern": "^[a-z0-9][a-z0-9._-]*$"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Соседние репозитории на ревизиях, закреплённых суперпроектом"},
+          "neighbours": {"type": "object", "propertyNames": {"$ref": "#/$defs/workingCopyPath"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 500}, "description": "Neighbour repositories at revisions pinned by the superproject. The key is the neighbour's directory in the working copy: a name or a path of several segments", "$comment": "TAI-ADR-0064 item 1"},
           "superproject": {"type": "string", "minLength": 1, "maxLength": 500},
-          "publish": {"type": "boolean", "default": true, "description": "Публиковать ветку задачи в forge"},
+          "publish": {"type": "boolean", "default": true, "description": "Publish the task branch to the forge"},
+          "checks": {"type": "boolean", "default": false, "description": "Run the checks of .agents/runner.yaml of the base revision before hand-in; the report goes to metadata.checks of the commit artifact", "$comment": "TAI-ADR-0063, U014"},
           "review": {
             "type": "object",
             "additionalProperties": false,
             "deprecated": true,
-            "description": "Устарело: ревью объявляет тип задачи критериями приёмки; секция удаляется вместе с авто-ревью демона", "$comment": "TAI-ADR-0053",
+            "description": "Deprecated: review is declared by the task type as acceptance criteria; the section is removed together with the daemon's auto-review", "$comment": "TAI-ADR-0053",
             "properties": {
               "mode": {"enum": ["human", "agent", "none"]},
               "taskType": {"$ref": "#/$defs/typeKey"},
-              "taskTypes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Для каких типов задач заводится ревью"},
+              "taskTypes": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Task types that get a review"},
               "reviewer": {"$ref": "#/$defs/envOrUuid"},
               "base": {"type": "string", "minLength": 1, "maxLength": 200}
             }
@@ -216,11 +229,12 @@
         "type": "object",
         "required": ["repositories", "repositoryField"],
         "additionalProperties": false,
-        "description": "Каталог репозиториев — единственный источник адресов клона, соседей и публикации. Репозиторий задачи — ключ каталога или псевдоним в поле задачи repositoryField; адрес из задачи не принимается, значения по умолчанию нет. Ключи и псевдонимы сопоставляются без учёта регистра (casefold) — так разрешают ключ задачи демон исполнителя и tasks.check@1. Ссылку superproject на ключ каталога, однозначность ключей и псевдонимов (casefold), адресов (нормализованных) и каталогов между записями проверяет package-sdk check",
+        "description": "Repository catalog: the only source of clone, neighbour and publication addresses. The task repository is a catalog key or an alias in the task field repositoryField; an address from the task is not accepted, there is no default. Keys and aliases are matched case-insensitively (casefold): this is how the executor daemon and tasks.check@1 resolve the task key. package-sdk check verifies that superproject refers to a catalog key and that keys and aliases (casefold), addresses (normalized) and directories are unambiguous across entries",
         "properties": {
-          "repositoryField": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}$(?![\\s\\S])", "description": "Имя поля customFields задачи с ключом репозитория (у coding-task — repositoryKey)"},
-          "superproject": {"allOf": [{"$ref": "#/$defs/repositoryKey"}], "description": "Ключ каталога, чьи сабмодули закрепляют ревизии соседей"},
-          "publish": {"type": "boolean", "default": true, "description": "Публиковать ветку задачи в forge; запись каталога может переопределить"},
+          "repositoryField": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,62}$(?![\\s\\S])", "description": "Name of the task's customFields field holding the repository key (repositoryKey for coding-task)"},
+          "superproject": {"allOf": [{"$ref": "#/$defs/repositoryKey"}], "description": "Catalog key whose submodules pin the neighbours' revisions"},
+          "publish": {"type": "boolean", "default": true, "description": "Publish the task branch to the forge; a catalog entry may override it"},
+          "checks": {"type": "boolean", "default": false, "description": "Run the checks of .agents/runner.yaml of the base revision before hand-in; the report goes to metadata.checks of the commit artifact", "$comment": "TAI-ADR-0063, U014"},
           "repositories": {
             "type": "object", "minProperties": 1, "maxProperties": 50,
             "propertyNames": {"$ref": "#/$defs/repositoryKey"},
@@ -236,23 +250,23 @@
           "url": {
             "type": "string", "maxLength": 500,
             "pattern": "^(?:\\$\\{[A-Z][A-Z0-9_]*\\}|https://[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?(?:/[A-Za-z0-9_~][A-Za-z0-9._~-]*)+/?)$(?![\\s\\S])",
-            "description": "Адрес клона: ${ПЕРЕМЕННАЯ} установки или https без учётных данных, запроса и фрагмента (топология окружения в пакет не пишется). Хост — метки DNS, порт 1–65535; сегменты пути — ASCII без dot-сегментов и ведущей точки: имя зеркала берётся из последнего сегмента. Совпадение адресов двух записей package-sdk check ищет после нормализации (без завершающего /, без .git, без учёта регистра)"
+            "description": "Clone address: an installation ${VARIABLE} or https without credentials, query and fragment (environment topology is not written into the package). Host: DNS labels, port 1–65535; path segments: ASCII without dot segments or a leading dot, since the mirror name is taken from the last segment. package-sdk check looks for matching addresses of two entries after normalization (no trailing /, no .git, case-insensitive)"
           },
-          "baseRef": {"type": "string", "maxLength": 200, "pattern": "^(?![-/.])(?!@$)(?!.*\\.\\.)(?!.*@\\{)(?!.*//)(?!.*/\\.)(?!.*[/.]$)(?!.*\\.lock(?:/|$))[^\\x00-\\x20\\x7f~^:?*\\[\\\\\u200b-\u200f\u2028\u2029\u2060\ufeff]{1,200}$(?![\\s\\S])", "description": "Базовая ветка задачи — имя ref git: без ведущих - / ., без пробелов и управляющих символов, без .., @{, //, ~^:?*[\\ и завершающих / . .lock"},
-          "directory": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,99}$(?![\\s\\S])", "description": "Имя каталога в рабочей копии (плоская раскладка); не повторяет каталог или ключ другой записи — проверяет package-sdk check", "$comment": "ADR-0029"},
-          "publish": {"type": "boolean", "description": "false — сосед, в который агент не пишет; по умолчанию — publish каталога"},
-          "aliases": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/repositoryAlias"}, "description": "Прежние имена, которые принимаются вместо ключа; сопоставление без учёта регистра (casefold), поэтому псевдонимы не повторяют ни свои, ни чужие ключи и псевдонимы и в другом регистре"}
+          "baseRef": {"type": "string", "maxLength": 200, "pattern": "^(?![-/.])(?!@$)(?!.*\\.\\.)(?!.*@\\{)(?!.*//)(?!.*/\\.)(?!.*[/.]$)(?!.*\\.lock(?:/|$))[^\\x00-\\x20\\x7f~^:?*\\[\\\\\u200b-\u200f\u2028\u2029\u2060\ufeff]{1,200}$(?![\\s\\S])", "description": "Task base branch, a git ref name: no leading - / ., no spaces or control characters, no .., @{, //, ~^:?*[\\ and no trailing / . .lock"},
+          "directory": {"allOf": [{"$ref": "#/$defs/workingCopyPath"}], "description": "Directory in the working copy: a name (flat layout) or a path of several segments (services/control-plane). It does not repeat the directory or the key of another entry, and is neither inside the directory of another entry nor contains it — checked by package-sdk check", "$comment": "ADR-0029, TAI-ADR-0064 item 2"},
+          "publish": {"type": "boolean", "description": "false means a neighbour the agent does not write to; defaults to the catalog's publish"},
+          "aliases": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/repositoryAlias"}, "description": "Former names accepted instead of the key; matching is case-insensitive (casefold), so aliases repeat neither their own nor other keys and aliases, even in another case"}
         }
       },
       "claude-code": {
-        "description": "Один репозиторий (прежняя форма) или каталог: наличие repositories или repositoryField выбирает каталог",
+        "description": "One repository (legacy shape) or a catalog: the presence of repositories or repositoryField selects the catalog",
         "if": {"anyOf": [{"required": ["repositories"]}, {"required": ["repositoryField"]}]},
         "then": {"$ref": "#/$defs/agentWorkingCopies/catalog"},
         "else": {"$ref": "#/$defs/agentWorkingCopies/single"}
       }
     },
     "agentExecutors": {
-      "description": "Параметры видов исполнителя; ядро хранит их, не толкуя, проверяет эта схема и адаптер",
+      "description": "Executor kind parameters; the core stores them without interpreting, this schema and the adapter check them",
       "claude-code": {
         "type": "object", "additionalProperties": false,
         "properties": {
@@ -262,7 +276,7 @@
           "resume": {"type": "boolean", "default": true},
           "tools": {
             "type": "object", "additionalProperties": false,
-            "description": "Сужение инструментов агента; запрет авторитетных команд Control Plane не снимается",
+            "description": "Narrowing of the agent's tools; the ban on authoritative Control Plane commands is not lifted",
             "properties": {
               "allow": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
               "deny": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}}
@@ -277,23 +291,39 @@
           "sandbox": {"enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write"},
           "timeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 14400, "default": 3600},
           "resume": {"type": "boolean", "default": true},
-          "credentialClass": {"enum": ["subscription", "api_key"], "description": "Чей credential расходуется", "$comment": "TAI-ADR-0016 п.4"}
+          "credentialClass": {"enum": ["subscription", "api_key"], "description": "Whose credential is consumed", "$comment": "TAI-ADR-0016 item 4"}
         }
       },
       "skills": {
         "type": "object", "additionalProperties": false,
-        "description": "Исполнитель только скиллов: параметров нет, что исполнять — секция skills агента"
+        "description": "Skills-only executor: what to execute is the agent's skills section; params are non-secret skill settings",
+        "properties": {
+          "env": {
+            "type": "object", "maxProperties": 50,
+            "description": "Non-secret skill settings (portal address, limits): environment variables of every local skill call on the skills host. No secrets here: names like *TOKEN, *SECRET, *PASSWORD, *API_KEY are forbidden, secrets come as node secret files (placement.secrets); host names (CONTROL_PLANE_*, IAM_*, PATH…) are forbidden too",
+            "$comment": "CP-ADR-0073, amendment 2026-10-01",
+            "propertyNames": {
+              "pattern": "^[A-Z][A-Z0-9_]{0,99}$",
+              "not": {"anyOf": [
+                {"pattern": "(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|API_KEY)$"},
+                {"pattern": "^(CONTROL_PLANE_|IAM_|PYTHON|LD_|DYLD_|GIT_|NODE_|UV_|PIP_|XDG_)"},
+                {"enum": ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]}
+              ]}
+            },
+            "additionalProperties": {"type": "string", "maxLength": 2000}
+          }
+        }
       },
       "git-connector": {
         "type": "object", "required": ["repositories"], "additionalProperties": false,
-        "description": "Источник наблюдений git: что наблюдать и какие наблюдения порождать. Курсор — в томе реплики, наблюдения — POST /observations workspace агента.", "$comment": "TAI-ADR-0053, TAI-ADR-0036",
+        "description": "Git observation source: what to observe and which observations to produce. The cursor lives in the replica volume, observations go to POST /observations of the agent's workspace.", "$comment": "TAI-ADR-0053, TAI-ADR-0036",
         "properties": {
           "repositories": {
             "type": "array", "minItems": 1, "maxItems": 50,
             "items": {
               "type": "object", "required": ["name", "url"], "additionalProperties": false,
               "properties": {
-                "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "maxLength": 100, "description": "Имя в наблюдениях (payload.data.repo, source git:<name>)"},
+                "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "maxLength": 100, "description": "Name in observations (payload.data.repo, source git:<name>)"},
                 "url": {"type": "string", "minLength": 1, "maxLength": 500},
                 "branch": {"type": "string", "minLength": 1, "maxLength": 200, "default": "main"}
               }
@@ -305,21 +335,21 @@
             "description": "commits — repo.commit_observed; adrRegistry — adr.registry_observed; ciRuns — ci.run_observed"
           },
           "intervalSeconds": {"type": "integer", "minimum": 60, "maximum": 86400, "default": 300},
-          "knowledgeSnapshots": {"type": "boolean", "default": true, "description": "Отдавать снимки контрактов в память через POST /knowledge/snapshots"},
-          "registryRepository": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "description": "Из какого репозитория читать реестр ADR (имя из repositories)"},
-          "ciRepository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "description": "owner/repo прогонов CI"},
+          "knowledgeSnapshots": {"type": "boolean", "default": true, "description": "Send contract snapshots to memory via POST /knowledge/snapshots"},
+          "registryRepository": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$", "description": "Repository to read the ADR registry from (a name from repositories)"},
+          "ciRepository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "description": "owner/repo of CI runs"},
           "ciBranch": {"type": "string", "minLength": 1, "maxLength": 200, "default": "main"}
         }
       },
       "observer": {
         "type": "object", "required": ["entrypoint"], "additionalProperties": false,
-        "description": "Источник наблюдений пакета интеграции (коннектор = наблюдатель + скиллы): долгоживущий процесс, который по циклу опрашивает внешнюю систему и пишет наблюдения в workspace агента (POST /observations). Что опрашивать — config, его толкует код интеграции; какой код — entrypoint, его должен содержать образ вида observer на узле. Курсор — в томе реплики, секреты — только файлами секретов узла (placement.secrets).", "$comment": "TAI-ADR-0036",
+        "description": "Integration package observation source (connector = observer + skills): a long-lived process that polls an external system in a loop and writes observations to the agent's workspace (POST /observations). What to poll is config, interpreted by the integration code; which code is entrypoint, which the observer kind image on the node must contain. The cursor lives in the replica volume, secrets come only as node secret files (placement.secrets).", "$comment": "TAI-ADR-0036",
         "properties": {
-          "entrypoint": {"type": "string", "pattern": "^[A-Za-z_][\\w.]*:[A-Za-z_]\\w*$", "description": "Наблюдатель интеграции «модуль:функция»; процесс образа проверяет, что исполняет именно его"},
+          "entrypoint": {"type": "string", "pattern": "^[A-Za-z_][\\w.]*:[A-Za-z_]\\w*$", "description": "Integration observer \"module:function\"; the image process checks that it executes exactly this one"},
           "intervalSeconds": {"type": "integer", "minimum": 60, "maximum": 86400, "default": 900},
           "config": {
             "type": "object",
-            "description": "Параметры интеграции (фильтры, адреса, лимиты) — данные пакета. Секретов здесь нет: ключи вида *token, *secret, *password запрещены",
+            "description": "Integration parameters (filters, addresses, limits) are package data. No secrets here: keys like *token, *secret, *password are forbidden",
             "propertyNames": {"not": {"pattern": "([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd])$"}}
           }
         }
@@ -329,7 +359,7 @@
       "type": "object",
       "required": ["key", "kind", "description"],
       "additionalProperties": false,
-      "description": "Критерий приёмки: грамматику spec по виду проверяет ядро", "$comment": "CP-ADR-0062, CP-ADR-0067",
+      "description": "Acceptance criterion: the core checks the spec grammar per kind", "$comment": "CP-ADR-0062, CP-ADR-0067",
       "properties": {
         "key": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$", "maxLength": 63},
         "kind": {"enum": ["deterministic", "external_state", "human", "llm_judge"]},
@@ -338,14 +368,14 @@
         "when": {
           "type": "array", "minItems": 1, "maxItems": 8,
           "items": {"type": "string", "pattern": "^\\$\\.task"},
-          "description": "Пути $.task…; критерий исполняется, только если все непусты, иначе skipped", "$comment": "CP-ADR-0067 В5"
+          "description": "$.task… paths; the criterion runs only if all are non-empty, otherwise skipped", "$comment": "CP-ADR-0067 В5"
         }
       }
     },
     "typeKey": {
       "type": "string", "minLength": 1, "maxLength": 63,
       "pattern": "^[a-z0-9][a-z0-9_-]*$",
-      "description": "Ключ типа: латиница в нижнем регистре, цифры, _ и -"
+      "description": "Type key: lowercase Latin letters, digits, _ and -"
     },
     "slug": {
       "type": "string", "minLength": 2, "maxLength": 63,
@@ -354,7 +384,7 @@
     "displayName": {"type": "string", "minLength": 1, "maxLength": 200},
     "jsonSchema": {
       "type": "object",
-      "description": "JSON Schema документа (draft 2020-12). Удалённые $ref ядро отвергает."
+      "description": "Document JSON Schema (draft 2020-12). The core rejects remote $ref."
     },
 
     "packageSpec": {
@@ -362,7 +392,7 @@
       "required": ["version", "displayName"],
       "additionalProperties": false,
       "properties": {
-        "version": {"type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "SemVer пакета"},
+        "version": {"type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "Package SemVer"},
         "displayName": {"$ref": "#/$defs/displayName"},
         "description": {"type": "string"},
         "requires": {
@@ -379,43 +409,227 @@
               }
             ]
           },
-          "description": "Пакеты, на объекты которых этот пакет ссылается: ключ (любая версия) или {package, version} с диапазоном SemVer", "$comment": "TAI-ADR-0062 п.4"
+          "description": "Packages whose objects this package refers to: a key (any version) or {package, version} with a SemVer range", "$comment": "TAI-ADR-0062 item 4"
         },
         "engines": {
           "type": "object",
           "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,62}$"},
           "additionalProperties": {"$ref": "#/$defs/semverRange"},
-          "description": "Диапазоны версий компонентов, против которых пакет проверен, например {control-plane: \">=0.9,<0.11\"}; check и plan отвергают несовместимую версию до записи"
+          "description": "Version ranges of the components the package is tested against, e.g. {control-plane: \">=0.9,<0.11\"}; check and plan reject an incompatible version before writing"
         },
         "variables": {
           "type": "object",
           "propertyNames": {"pattern": "^[A-Z][A-Z0-9_]*$"},
           "additionalProperties": {"$ref": "#/$defs/packageVariable"},
-          "description": "Объявление каждой ${NAME} пакета. Использованная переменная обязана быть объявлена, объявленная — использована. Секретов в пакете нет: поля secret у переменной нет"
+          "description": "Declaration of every ${NAME} of the package. A used variable must be declared, a declared one must be used. There are no secrets in a package: a variable has no secret field"
         },
         "knowledge": {
           "type": "array", "uniqueItems": true,
           "items": {"type": "string", "pattern": "^(tenant:)?[a-z0-9][a-z0-9._-]{0,63}@[0-9]+$"},
-          "description": "Онтологии (имя@мажор), на которые опираются процессы и правила пакета; check сверяет с recall/remember/memory процессов"
+          "description": "Ontologies (name@major) the package's processes and rules rely on; check matches them against recall/remember/memory of the processes"
         },
-        "license": {"type": "string", "minLength": 1, "maxLength": 100, "description": "Лицензия пакета (идентификатор SPDX)"},
+        "license": {"type": "string", "minLength": 1, "maxLength": 100, "description": "Package license (SPDX identifier)"},
         "authors": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 200}},
         "homepage": {"type": "string", "pattern": "^https://"},
         "renames": {
           "type": "array", "maxItems": 100,
-          "description": "Явные переименования объектов (как moved в Terraform): план переносит объект, а не удаляет и создаёт", "$comment": "TAI-ADR-0054 Р9",
+          "description": "Explicit object renames (like moved in Terraform): the plan moves the object instead of deleting and creating it", "$comment": "TAI-ADR-0054 Р9",
           "items": {
             "type": "object", "required": ["kind", "from", "to"], "additionalProperties": false,
             "properties": {"kind": {"type": "string"}, "from": {"type": "string", "minLength": 1}, "to": {"type": "string", "minLength": 1}}
+          }
+        },
+        "settings": {"$ref": "#/$defs/packageSettings"}
+      }
+    },
+
+    "packageSettings": {
+      "type": "object", "required": ["schema"], "additionalProperties": false,
+      "description": "Package settings: values an organization administrator changes in the live system without a new package version or an installation plan. Values live in the core; processes, work rules and views read them as settings.<field>",
+      "$comment": "TAI-ADR-0067",
+      "properties": {
+        "schema": {"$ref": "#/$defs/settingsSchema"},
+        "uischema": {"$ref": "#/$defs/settingsUiElement", "description": "Form layout: the closed subset of JSON Forms the console renders — VerticalLayout, HorizontalLayout, Group, Control and Label with SHOW/HIDE/ENABLE/DISABLE rules; anything else, options of a Control included, is rejected. Labels are keys of the package dictionaries, not texts: label of a Group and of a Control, text of a Label. Unlike the uischema of process step forms, which is open and whose label is a text. Without it the console lays the fields out in schema order"}
+      }
+    },
+
+    "settingsSchema": {
+      "type": "object", "required": ["type", "properties"], "additionalProperties": false,
+      "description": "Schema of the settings: a subset of JSON Schema, as for process data. The root is an object; objects nest at most 3 levels deep; at most 100 properties per object. Field labels are not in the schema: they are keys <package>.settings.<path> of the package dictionaries",
+      "properties": {
+        "type": {"const": "object"},
+        "properties": {
+          "type": "object", "minProperties": 1, "maxProperties": 100,
+          "propertyNames": {"$ref": "#/$defs/settingsFieldName"},
+          "additionalProperties": {"$ref": "#/$defs/settingsField1"}
+        },
+        "required": {"$ref": "#/$defs/settingsRequired"},
+        "additionalProperties": {"const": false, "description": "Implied on every object: a value with an undeclared member is refused"}
+      }
+    },
+
+    "settingsFieldName": {"type": "string", "pattern": "^[a-z][A-Za-z0-9_]{0,62}$", "description": "Field name: camelCase, as referenced in expressions (settings.<field>)"},
+
+    "settingsRequired": {"type": "array", "uniqueItems": true, "maxItems": 100, "items": {"$ref": "#/$defs/settingsFieldName"}, "description": "Fields that must always have a value"},
+
+    "settingsScalar": {"type": ["string", "integer", "number", "boolean"]},
+
+    "settingsKeywords": {
+      "type": "object", "required": ["type"], "additionalProperties": false,
+      "description": "One settings field: only the keywords listed here; secret markers (writeOnly, format: password) and keywords outside the subset are rejected",
+      "properties": {
+        "type": {"enum": ["string", "integer", "number", "boolean", "array", "object"]},
+        "properties": {
+          "type": "object", "minProperties": 1, "maxProperties": 100,
+          "propertyNames": {"$ref": "#/$defs/settingsFieldName"}
+        },
+        "required": {"$ref": "#/$defs/settingsRequired"},
+        "additionalProperties": {"const": false},
+        "enum": {"type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/settingsScalar"}},
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"},
+        "minLength": {"type": "integer", "minimum": 0},
+        "maxLength": {"type": "integer", "minimum": 0},
+        "pattern": {"type": "string", "minLength": 1, "description": "ECMA-262 regular expression"},
+        "format": {"enum": ["date", "uri", "email", "uuid"]},
+        "items": {"type": "object"},
+        "minItems": {"type": "integer", "minimum": 0},
+        "maxItems": {"type": "integer", "minimum": 0},
+        "default": {"description": "Value in effect until an administrator saves another; every optional field must have one (package-sdk check)"},
+        "x-ref": {
+          "enum": ["role", "principal", "workspace", "calendar", "taskType"],
+          "description": "The string references a platform object of this kind in the organization: the id of a role, principal or workspace, the key of a task type or calendar; the core rejects a value that references a missing object"
+        }
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "object"}}}, "then": {"required": ["properties"]}, "else": {"properties": {"properties": false, "required": false, "additionalProperties": false}}},
+        {"if": {"properties": {"type": {"const": "array"}}}, "then": {"required": ["items"]}, "else": {"properties": {"items": false, "minItems": false, "maxItems": false}}},
+        {"if": {"properties": {"type": {"const": "string"}}}, "else": {"properties": {"minLength": false, "maxLength": false, "pattern": false, "format": false, "x-ref": false}}},
+        {"if": {"properties": {"type": {"enum": ["integer", "number"]}}}, "else": {"properties": {"minimum": false, "maximum": false}}}
+      ]
+    },
+
+    "settingsField1": {
+      "$ref": "#/$defs/settingsKeywords",
+      "properties": {
+        "properties": {"additionalProperties": {"$ref": "#/$defs/settingsField2"}},
+        "items": {"$ref": "#/$defs/settingsField2"}
+      }
+    },
+
+    "settingsField2": {
+      "$ref": "#/$defs/settingsKeywords",
+      "properties": {
+        "properties": {"additionalProperties": {"$ref": "#/$defs/settingsField3"}},
+        "items": {"$ref": "#/$defs/settingsField3"}
+      }
+    },
+
+    "settingsField3": {
+      "$ref": "#/$defs/settingsKeywords",
+      "description": "The deepest level: a scalar field or an array of scalars, no nested objects",
+      "properties": {
+        "type": {"enum": ["string", "integer", "number", "boolean", "array"]},
+        "items": {
+          "$ref": "#/$defs/settingsKeywords",
+          "properties": {"type": {"enum": ["string", "integer", "number", "boolean"]}}
+        }
+      }
+    },
+
+    "settingsLabelKey": {
+      "type": "string", "maxLength": 200,
+      "pattern": "^[a-z0-9][a-z0-9-]*(\\.[A-Za-z0-9_-]+)+$",
+      "description": "Key of the package dictionaries (<package>.settings.<name>), not the text: the console shows its string in the user's language"
+    },
+
+    "settingsScope": {
+      "type": "string",
+      "pattern": "^#/properties/[a-z][A-Za-z0-9_]{0,62}(/properties/[a-z][A-Za-z0-9_]{0,62}){0,2}$",
+      "description": "JSON Pointer to a property of the settings schema: #/properties/<field>[/properties/<field>…]"
+    },
+
+    "settingsUiRule": {
+      "type": "object", "required": ["effect", "condition"], "additionalProperties": false,
+      "description": "JSON Forms rule: the effect applies while the value at condition.scope matches condition.schema",
+      "properties": {
+        "effect": {"enum": ["SHOW", "HIDE", "ENABLE", "DISABLE"]},
+        "condition": {
+          "type": "object", "required": ["scope", "schema"], "additionalProperties": false,
+          "properties": {
+            "scope": {"$ref": "#/$defs/settingsScope"},
+            "schema": {
+              "type": "object", "minProperties": 1, "additionalProperties": false,
+              "description": "Condition on the value: the keywords of a settings field without x-ref and default, and const",
+              "properties": {
+                "type": {"enum": ["string", "integer", "number", "boolean", "array", "object"]},
+                "const": {"$ref": "#/$defs/settingsScalar"},
+                "enum": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/settingsScalar"}},
+                "minimum": {"type": "number"},
+                "maximum": {"type": "number"},
+                "minLength": {"type": "integer", "minimum": 0},
+                "maxLength": {"type": "integer", "minimum": 0},
+                "pattern": {"type": "string", "minLength": 1},
+                "format": {"enum": ["date", "uri", "email", "uuid"]},
+                "minItems": {"type": "integer", "minimum": 0},
+                "maxItems": {"type": "integer", "minimum": 0}
+              }
+            },
+            "failWhenUndefined": {"type": "boolean"}
           }
         }
       }
     },
 
+    "settingsUiElement": {
+      "type": "object", "required": ["type"],
+      "description": "Element of the settings form: VerticalLayout, HorizontalLayout, Group, Control or Label. Other JSON Forms elements (Categorization, ListWithDetail, custom renderers) are not rendered by the console and are rejected",
+      "properties": {
+        "type": {"enum": ["VerticalLayout", "HorizontalLayout", "Group", "Control", "Label"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"enum": ["VerticalLayout", "HorizontalLayout"]}}},
+          "then": {
+            "required": ["elements"], "additionalProperties": false,
+            "properties": {"type": true, "elements": {"$ref": "#/$defs/settingsUiElements"}, "rule": {"$ref": "#/$defs/settingsUiRule"}}
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "Group"}}},
+          "then": {
+            "required": ["label", "elements"], "additionalProperties": false,
+            "properties": {"type": true, "label": {"$ref": "#/$defs/settingsLabelKey"}, "elements": {"$ref": "#/$defs/settingsUiElements"}, "rule": {"$ref": "#/$defs/settingsUiRule"}}
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "Control"}}},
+          "then": {
+            "required": ["scope"], "additionalProperties": false,
+            "properties": {
+              "type": true,
+              "scope": {"$ref": "#/$defs/settingsScope", "description": "Property of the settings schema this control edits; package-sdk check resolves it against the schema"},
+              "label": {"$ref": "#/$defs/settingsLabelKey", "description": "Dictionary key instead of the field's own <package>.settings.<path>"},
+              "rule": {"$ref": "#/$defs/settingsUiRule"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "Label"}}},
+          "then": {
+            "required": ["text"], "additionalProperties": false,
+            "properties": {"type": true, "text": {"$ref": "#/$defs/settingsLabelKey"}, "rule": {"$ref": "#/$defs/settingsUiRule"}}
+          }
+        }
+      ]
+    },
+
+    "settingsUiElements": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/settingsUiElement"}},
+
     "semverRange": {
       "type": "string", "minLength": 1, "maxLength": 100,
       "pattern": "^\\s*(\\*|(>=|<=|>|<|=|\\^|~)?\\s*\\d+(\\.\\d+){0,2}(-[0-9A-Za-z.-]+)?(\\s*,\\s*(>=|<=|>|<|=|\\^|~)?\\s*\\d+(\\.\\d+){0,2}(-[0-9A-Za-z.-]+)?)*)\\s*$",
-      "description": "Диапазон версий: условия через запятую, все выполняются (>=0.9,<0.11); операторы >=, >, <=, <, =, ^, ~; без оператора — версия или префикс (1.2 = 1.2.x); * — любая"
+      "description": "Version range: comma-separated conditions, all must hold (>=0.9,<0.11); operators >=, >, <=, <, =, ^, ~; without an operator, a version or prefix (1.2 = 1.2.x); * means any"
     },
 
     "packageVariable": {
@@ -424,28 +638,28 @@
         "description": {"type": "string", "minLength": 1, "maxLength": 500},
         "kind": {
           "enum": ["url", "workspace", "project", "principal", "role", "string", "integer"],
-          "description": "Вид значения: url — абсолютный URL; workspace|project|principal|role — UUID, существующий на стенде (проверяет plan); integer — целое; string — любое"
+          "description": "Value kind: url is an absolute URL; workspace|project|principal|role is a UUID existing on the environment (checked by plan); integer is an integer; string is anything"
         },
         "required": {"type": "boolean", "default": true},
-        "default": {"type": "string", "description": "Значение, если инсталляция не задала своё"},
+        "default": {"type": "string", "description": "Value used if the installation did not set its own"},
         "example": {"type": "string"}
       }
     },
 
     "packageSource": {
       "oneOf": [
-        {"$ref": "#/$defs/typeKey", "description": "Пакет каталога установки (packages/<key> рядом с файлом установки или spec.packagesDir)"},
+        {"$ref": "#/$defs/typeKey", "description": "Installation catalog package (packages/<key> next to the installation file or spec.packagesDir)"},
         {
           "type": "object", "required": ["key", "path"], "additionalProperties": false,
-          "properties": {"key": {"$ref": "#/$defs/typeKey"}, "path": {"type": "string", "minLength": 1, "description": "Путь к каталогу пакета относительно файла установки"}}
+          "properties": {"key": {"$ref": "#/$defs/typeKey"}, "path": {"type": "string", "minLength": 1, "description": "Package directory path relative to the installation file"}}
         },
         {
           "type": "object", "required": ["key", "git", "ref"], "additionalProperties": false,
           "properties": {
             "key": {"$ref": "#/$defs/typeKey"},
-            "git": {"type": "string", "pattern": "^(https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?/[^\\s@]*[^\\s@/]|git@[A-Za-z0-9][A-Za-z0-9.-]*:[^\\s@-][^\\s@]*)$", "description": "https://хост/путь без учётных данных в адресе или git@хост:путь; доступ — credential helper git"},
-            "ref": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^(?!.*\\.\\.)(?!.*//)(?!.*(\\.|/|\\.lock)$)[A-Za-z0-9_][A-Za-z0-9._+/-]*$", "description": "Тег релиза пакета (refs/tags/<ref>; ветки и коммиты не принимаются); воспроизводимость держит packages.lock"},
-            "path": {"type": "string", "minLength": 1, "maxLength": 500, "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$", "description": "Подкаталог пакета в репозитории, если он не в корне: относительный путь без . и .."}
+            "git": {"type": "string", "pattern": "^(https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?/[^\\s@]*[^\\s@/]|git@[A-Za-z0-9][A-Za-z0-9.-]*:[^\\s@-][^\\s@]*)$", "description": "https://host/path without credentials in the address, or git@host:path; access through the git credential helper"},
+            "ref": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^(?!.*\\.\\.)(?!.*//)(?!.*(\\.|/|\\.lock)$)[A-Za-z0-9_][A-Za-z0-9._+/-]*$", "description": "Package release tag (refs/tags/<ref>; branches and commits are not accepted); packages.lock keeps it reproducible"},
+            "path": {"type": "string", "minLength": 1, "maxLength": 500, "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$", "description": "Package subdirectory in the repository if it is not at the root: a relative path without . and .."}
           }
         }
       ]
@@ -459,33 +673,34 @@
         "packages": {
           "type": "array", "minItems": 0, "uniqueItems": true,
           "items": {"$ref": "#/$defs/packageSource"},
-          "description": "Пакеты установки: ключ (каталог установки), {key, path} или {key, git, ref}; requires подтягиваются сами. Пусто — только системный тип task ядра"
+          "description": "Installation packages: a key (installation catalog), {key, path} or {key, git, ref}; requires are pulled in automatically. Empty means only the core's system task type"
         },
-        "packagesDir": {"type": "string", "minLength": 1, "description": "Каталог пакетов установки относительно файла установки; по умолчанию packages/ рядом с ним"},
+        "packagesDir": {"type": "string", "minLength": 1, "description": "Installation packages directory relative to the installation file; defaults to packages/ next to it"},
         "knowledge": {
           "type": "array",
-          "description": "Включение онтологий для пространств работы — топология, поэтому в установке; набор заменяет прежний целиком", "$comment": "TAI-ADR-0062 п.5",
+          "description": "Ontology inclusion for work spaces is topology, hence in the installation; the set replaces the previous one entirely", "$comment": "TAI-ADR-0062 item 5",
           "items": {
             "type": "object", "required": ["workspace", "packs"], "additionalProperties": false,
             "properties": {
-              "workspace": {"type": "string", "minLength": 1, "description": "${ПЕРЕМЕННАЯ} установки или UUID"},
+              "workspace": {"type": "string", "minLength": 1, "description": "Installation ${VARIABLE} or UUID"},
               "packs": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^(tenant:)?[a-z0-9][a-z0-9._-]{0,63}@[0-9]+$"}},
-              "strict": {"type": "boolean", "default": false, "description": "Строгий режим памяти: записи вне включённых видов отвергаются, а не принимаются как есть"}
+              "strict": {"type": "boolean", "default": false, "description": "Strict memory mode: records outside the included kinds are rejected rather than accepted as is"}
             }
           }
         },
         "retire": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Ключи, которые окружение выводит из оборота (все активные версии → deprecated)",
+          "description": "Keys the environment retires (all active versions → deprecated)",
           "properties": {
             "TaskType": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}},
             "ProjectTemplate": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}},
-            "Agent": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}, "description": "Агент выводится из оборота: исполнитель остановлен, credential отозван, история сохранена", "$comment": "TAI-ADR-0052"},
-            "NotificationRule": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/ruleKey"}, "description": "Правило уведомления выводится из оборота в сервисе уведомлений (:retire); отправленные уведомления остаются", "$comment": "ADR-0005 notification-service"},
-            "WorkRule": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/ruleKey"}, "description": "Правило вывода работы архивируется; заведённые им работы доживают"},
-            "Process": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Процесс выводится маршрутом ядра :retire: новые экземпляры не стартуют, живые доживают", "$comment": "амендмент CP-ADR-0074"},
-            "Calendar": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Календарь выводится, только если на него не ссылается активный процесс (calendar_in_use)"}
+            "Agent": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/slug"}, "description": "The agent is retired: the executor is stopped, the credential revoked, the history kept", "$comment": "TAI-ADR-0052"},
+            "NotificationRule": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/ruleKey"}, "description": "The notification rule is retired in the notification service (:retire); sent notifications remain", "$comment": "ADR-0005 notification-service"},
+            "WorkRule": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/ruleKey"}, "description": "The work rule is archived; work it created lives on"},
+            "Process": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "The process is retired via the core's :retire route: new instances do not start, live ones run to completion", "$comment": "amendment CP-ADR-0074"},
+            "Calendar": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "A calendar is retired only if no active process refers to it (calendar_in_use)"},
+            "ConnectionType": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/connectionKey"}, "description": "Every active version of the connection type becomes deprecated: no new connections of the type, existing ones keep working", "$comment": "CP-ADR-0079 §2"}
           }
         }
       }
@@ -529,9 +744,9 @@
       "allOf": [{"$ref": "#/$defs/lifecycle"}],
       "properties": {
         "statuses": {"items": {"properties": {"category": {"$ref": "#/$defs/workItemCategory"}}}},
-        "claimStatus": {"$ref": "#/$defs/statusKey", "description": "Статус при claim; не терминальный"},
-        "releaseStatus": {"$ref": "#/$defs/statusKey", "description": "Статус при release; не терминальный"},
-        "completionStatus": {"$ref": "#/$defs/statusKey", "description": "Статус успешного завершения; категория terminal_success"}
+        "claimStatus": {"$ref": "#/$defs/statusKey", "description": "Status on claim; not terminal"},
+        "releaseStatus": {"$ref": "#/$defs/statusKey", "description": "Status on release; not terminal"},
+        "completionStatus": {"$ref": "#/$defs/statusKey", "description": "Successful completion status; category terminal_success"}
       }
     },
     "projectLifecycle": {
@@ -543,7 +758,7 @@
 
     "outcomeAction": {
       "type": "object",
-      "description": "Одно действие исхода approval: объект ровно с одним ключом. В строках — выражения $.path, суффикс ! делает значение обязательным.", "$comment": "CP-ADR-0061",
+      "description": "One approval outcome action: an object with exactly one key. In strings, $.path expressions; the ! suffix makes the value required.", "$comment": "CP-ADR-0061",
       "minProperties": 1, "maxProperties": 1,
       "properties": {
         "ensureWork": {
@@ -551,8 +766,8 @@
           "required": ["type", "key", "title"],
           "additionalProperties": false,
           "properties": {
-            "type": {"type": "string", "description": "Ключ типа задачи"},
-            "key": {"type": "string", "description": "Ключ идемпотентности создаваемой работы"},
+            "type": {"type": "string", "description": "Task type key"},
+            "key": {"type": "string", "description": "Idempotency key of the created work"},
             "title": {"type": "string"},
             "description": {"type": "string"},
             "assignee": {"type": "string"},
@@ -565,14 +780,14 @@
             },
             "customFields": {
               "type": "object", "maxProperties": 32,
-              "description": "Поля создаваемой задачи — выражения/шаблоны; проверяются по fieldSchema целевого типа при исполнении", "$comment": "CP-ADR-0061, амендмент 2026-09-25",
+              "description": "Fields of the created task: expressions/templates; checked against the target type's fieldSchema at execution", "$comment": "CP-ADR-0061, amendment 2026-09-25",
               "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
               "additionalProperties": {"type": "string"}
             },
             "requestApproval": {
               "type": "object", "required": ["assignee"], "additionalProperties": false,
-              "description": "Gate-approval на только что созданной задаче", "$comment": "CP-ADR-0061, амендмент 2026-09-25",
-              "properties": {"assignee": {"type": "string"}, "comment": {"type": "string"}}
+              "description": "Gate approval on the task just created", "$comment": "CP-ADR-0061, amendment 2026-09-25",
+              "properties": {"assignee": {"type": "string", "description": "Principal id or role:<slug>, a role declared by the package (its holder decides); an expression or template", "$comment": "CP-ADR-0061, amendment 2026-10-01"}, "comment": {"type": "string"}}
             }
           }
         },
@@ -590,11 +805,11 @@
         },
         "invokeSkill": {
           "type": "object", "required": ["skill"], "additionalProperties": false,
-          "description": "Вызов скилла; реакции исполняются по итогу вызова", "$comment": "CP-ADR-0061 §10",
+          "description": "Skill call; reactions run on the call's outcome", "$comment": "CP-ADR-0061 §10",
           "properties": {
-            "skill": {"type": "string", "description": "name@version (для external_write — обязательно с версией)"},
-            "inputs": {"type": "object", "description": "входы скилла; строки — выражения $.task…, $.spawnedBy…, $.approval…"},
-            "expect": {"type": "object", "description": "ожидаемые поля outputs; расхождение — onFailure"},
+            "skill": {"type": "string", "description": "name@version (required with a version for external_write)"},
+            "inputs": {"type": "object", "description": "skill inputs; strings are $.task…, $.spawnedBy…, $.approval… expressions"},
+            "expect": {"type": "object", "description": "expected outputs fields; a mismatch triggers onFailure"},
             "onSuccess": {"type": "array", "items": {"$ref": "#/$defs/outcomeAction"}},
             "onFailure": {"type": "array", "items": {"$ref": "#/$defs/outcomeAction"}}
           }
@@ -608,7 +823,7 @@
       "properties": {
         "gates": {
           "type": "object",
-          "description": "Пока поддерживается только gate default",
+          "description": "Only the default gate is supported for now",
           "propertyNames": {"pattern": "^[a-z][a-z0-9_.-]*$"},
           "additionalProperties": {
             "type": "object",
@@ -630,14 +845,14 @@
     },
     "execution": {
       "type": "object",
-      "description": "Задачу типа исполняет один вызов скилла", "$comment": "CP-ADR-0056 §3",
+      "description": "A task of this type is executed by one skill call", "$comment": "CP-ADR-0056 §3",
       "required": ["skill", "version"],
       "additionalProperties": false,
       "properties": {
         "skill": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^@]+$"},
         "version": {"type": "string", "minLength": 1, "maxLength": 50},
         "inputs": {
-          "description": "Путь $.… ко всему входу или объект {имяВхода: путь}; по умолчанию $.customFields",
+          "description": "$.… path to the whole input or an object {inputName: path}; defaults to $.customFields",
           "oneOf": [
             {"type": "string"},
             {"type": "object", "additionalProperties": {"type": "string"}}
@@ -653,28 +868,33 @@
       "properties": {
         "displayName": {"$ref": "#/$defs/displayName"},
         "description": {"type": "string"},
-        "fieldSchema": {"$ref": "#/$defs/jsonSchema", "description": "Схема customFields задачи"},
+        "fieldSchema": {"$ref": "#/$defs/jsonSchema", "description": "Task customFields schema"},
         "lifecycleSchema": {"$ref": "#/$defs/workItemLifecycle"},
         "execution": {"$ref": "#/$defs/execution"},
         "approvalSchema": {"$ref": "#/$defs/approvalSchema"},
         "completionSchema": {
           "type": "object",
-          "description": "Работа после завершения задачи: {onComplete: {when?, actions}} — ensureWork (customFields, relation, requestApproval) и comment. Грамматику проверяет ядро.", "$comment": "CP-ADR-0061, амендмент 2026-09-25"
+          "description": "Work after the task completes: {onComplete: {when?, actions}}: ensureWork (customFields, relation, requestApproval) and comment. The core checks the grammar.", "$comment": "CP-ADR-0061, amendment 2026-09-25"
         },
         "instructions": {
           "type": "string",
           "maxLength": 16384,
-          "description": "Инструкции исполнителю: Markdown ≤ 16 KiB, слой типа задачи после контракта платформы и проекта. Размер в байтах и отсутствие секретов проверяет ядро.", "$comment": "CP-ADR-0066"
+          "description": "Instructions for the executor: Markdown ≤ 16 KiB, the task type layer after the platform and project contract. The core checks the size in bytes and the absence of secrets.", "$comment": "CP-ADR-0066"
         },
         "artifactSchema": {"$ref": "#/$defs/artifactSchema"},
+        "executorRoles": {
+          "type": "array", "maxItems": 20, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/slug"},
+          "description": "Keys of the roles a person needs to take work of this type: a Role of the package, its requires or the tenant. Absent or empty — people are not restricted. The core refuses a role the tenant does not have (422 unknown_role).", "$comment": "CP-ADR-0048, amendment 2026-10-03 А1"
+        },
         "acceptance": {
           "type": "array", "maxItems": 20,
           "items": {"$ref": "#/$defs/acceptanceCriterion"},
-          "description": "Критерии приёмки по умолчанию у всех задач типа: исполняются после обязательных выходов и до критериев самой задачи; задача не может заменить критерий типа — её критерий с тем же key отвергается (422). deterministic со скиллом external_write — только после human той же попытки.", "$comment": "CP-ADR-0067 В5, TAI-ADR-0053"
+          "description": "Default acceptance criteria for all tasks of the type: run after the required outputs and before the task's own criteria; a task cannot replace a type criterion, its criterion with the same key is rejected (422). deterministic with an external_write skill only after human in the same attempt.", "$comment": "CP-ADR-0067 В5, TAI-ADR-0053"
         },
         "contextSchema": {
           "type": "object",
-          "description": "Профиль контекста задачи: anchors, traverse, asOf, budgetTokens. Грамматику проверяет ядро.", "$comment": "TAI-ADR-0042 п.3, CP-ADR-0064",
+          "description": "Task context profile: anchors, traverse, asOf, budgetTokens. The core checks the grammar.", "$comment": "TAI-ADR-0042 item 3, CP-ADR-0064",
           "properties": {
             "anchors": {"type": "array"},
             "traverse": {"type": "array"},
@@ -688,25 +908,25 @@
     "mediaType": {
       "type": "string", "minLength": 3, "maxLength": 255,
       "pattern": "^([a-z0-9][a-z0-9!#$&^_.+-]*|\\*)/([a-z0-9][a-z0-9!#$&^_.+-]*|\\*)$",
-      "description": "Media type в нижнем регистре; маска */* или type/* допустима"
+      "description": "Lowercase media type; a */* or type/* mask is allowed"
     },
     "artifactTypeSpec": {
       "type": "object",
       "required": ["displayName"],
       "additionalProperties": false,
-      "description": "Тип артефакта: версионируемый неизменяемый объект каталога, как TaskType.", "$comment": "CP-ADR-0072, TAI-ADR-0044 амендмент 2026-09-26",
+      "description": "Artifact type: a versioned immutable catalog object, like TaskType.", "$comment": "CP-ADR-0072, TAI-ADR-0044 amendment 2026-09-26",
       "properties": {
         "displayName": {"$ref": "#/$defs/displayName"},
         "description": {"type": "string"},
-        "metadataSchema": {"$ref": "#/$defs/jsonSchema", "description": "Схема metadata артефакта этого типа (≤ 16 KiB)"},
+        "metadataSchema": {"$ref": "#/$defs/jsonSchema", "description": "Metadata schema of artifacts of this type (≤ 16 KiB)"},
         "mediaTypes": {
           "type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": true,
           "items": {"$ref": "#/$defs/mediaType"},
-          "description": "Допустимые media types содержимого; по умолчанию любой"
+          "description": "Allowed content media types; any by default"
         },
         "maxBytes": {
           "type": "integer", "minimum": 1,
-          "description": "Лимит размера содержимого; не больше глобального лимита установки (CP_ARTIFACT_MAX_BYTES)"
+          "description": "Content size limit; no more than the installation's global limit (CP_ARTIFACT_MAX_BYTES)"
         }
       }
     },
@@ -714,20 +934,20 @@
       "type": "object",
       "required": ["key", "type"],
       "properties": {
-        "key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,55}$", "description": "Имя входа или выхода; уникально внутри inputs и внутри outputs", "$comment": "CP-ADR-0072 п.7"},
-        "type": {"$ref": "#/$defs/typeKey", "description": "Ключ типа артефакта (ArtifactType)"},
+        "key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,55}$", "description": "Input or output name; unique within inputs and within outputs", "$comment": "CP-ADR-0072 item 7"},
+        "type": {"$ref": "#/$defs/typeKey", "description": "Artifact type key (ArtifactType)"},
         "required": {"type": "boolean", "default": false},
         "mediaTypes": {
           "type": "array", "minItems": 1, "uniqueItems": true,
           "items": {"$ref": "#/$defs/mediaType"},
-          "description": "Сужение media types типа артефакта (подмножество его mediaTypes)"
+          "description": "Narrowing of the artifact type's media types (a subset of its mediaTypes)"
         }
       }
     },
     "artifactSchema": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Входы и выходы типа задачи. Вход — head-ревизии артефактов нужного типа у задач по связи; без обязательного входа claim отвергается (409 input_missing). Обязательный выход — детерминированный критерий стадии проверки.", "$comment": "CP-ADR-0072",
+      "description": "Task type inputs and outputs. An input is the head revisions of artifacts of the required type on tasks via a relation; without a required input, claim is rejected (409 input_missing). A required output is a deterministic criterion of the verification stage.", "$comment": "CP-ADR-0072",
       "properties": {
         "inputs": {
           "type": "array", "maxItems": 32,
@@ -736,7 +956,7 @@
             "required": ["from"],
             "properties": {
               "key": true, "type": true, "required": true,
-              "from": {"enum": ["depends_on", "spawned_by", "parent"], "description": "Связь, по которой ищется задача-источник"}
+              "from": {"enum": ["depends_on", "spawned_by", "parent"], "description": "Relation used to find the source task"}
             },
             "additionalProperties": false
           }
@@ -747,7 +967,7 @@
             "allOf": [{"$ref": "#/$defs/artifactSlot"}],
             "properties": {
               "key": true, "type": true, "required": true, "mediaTypes": true,
-              "content": {"enum": ["required", "optional"], "default": "required", "description": "Нужно ли содержимое в хранилище (иначе достаточно ссылки)"}
+              "content": {"enum": ["required", "optional"], "default": "required", "description": "Whether the content must be in storage (otherwise a reference is enough)"}
             },
             "additionalProperties": false
           }
@@ -820,12 +1040,12 @@
     "ruleKey": {
       "type": "string", "minLength": 1, "maxLength": 128,
       "pattern": "^[a-z0-9][a-z0-9._-]*$",
-      "description": "Ключ правила в tenant'е", "$comment": "CP-ADR-0063 §1"
+      "description": "Rule key in the tenant", "$comment": "CP-ADR-0063 §1"
     },
 
     "workRuleSpec": {
       "type": "object",
-      "description": "Правило вывода работы: ровно тело POST /rules без key. Грамматику условий и шаблонов проверяет ядро (normalize_rule_spec). workspaceId — топология установки: только через ${ПЕРЕМЕННУЮ}, задаётся при создании и дальше не меняется.", "$comment": "CP-ADR-0063, TAI-ADR-0036",
+      "description": "Work rule: exactly the POST /rules body without key. The core checks the grammar of conditions and templates (normalize_rule_spec). workspaceId is installation topology: only via a ${VARIABLE}, set on creation and not changed afterwards.", "$comment": "CP-ADR-0063, TAI-ADR-0036",
       "required": ["trigger", "action"],
       "additionalProperties": false,
       "properties": {
@@ -833,7 +1053,10 @@
         "workspaceId": {"type": "string", "pattern": "^\\$\\{[A-Z][A-Z0-9_]*\\}$"},
         "trigger": {
           "type": "object", "required": ["kind"],
-          "properties": {"kind": {"enum": ["observation", "event", "schedule"]}}
+          "properties": {
+            "kind": {"enum": ["observation", "event", "schedule"]},
+            "agent": {"type": "string", "pattern": "^([a-z0-9][a-z0-9-]{0,62}|\\$\\{[A-Z][A-Z0-9_]*\\})$", "description": "Only with observation: the observation matches when its author is the principal of this agent. An agent key or an installation ${VARIABLE} — a neutral package does not know the provider's agent", "$comment": "CP-ADR-0063 Ж6"}
+          }
         },
         "condition": {"type": ["object", "boolean"]},
         "interpretation": {
@@ -847,15 +1070,16 @@
           "type": "object", "required": ["kind"],
           "properties": {
             "kind": {"enum": ["ensure_work", "update_work", "cancel_work", "complete_work", "request_decision"]},
-            "taskType": {"type": "string", "description": "Ключ типа или шаблон {{item.…}} — шаблон только при непустом taskTypes"},
-            "taskTypes": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Допустимые типы для шаблонного taskType", "$comment": "CP-ADR-0063 А6"},
+            "taskType": {"type": "string", "description": "Type key or a {{item.…}} template; a template only with non-empty taskTypes"},
+            "taskTypes": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/typeKey"}, "description": "Allowed types for a templated taskType; with complete_work and cancel_work with target: task — the types the rule may close", "$comment": "CP-ADR-0063 А6, Ж2"},
+            "target": {"enum": ["dedup", "task"], "description": "Only with complete_work and cancel_work: dedup — the work under the rule's key (the default), task — the task the triggering observation is bound to; needs taskTypes and an author filter trigger.agent or trigger.actorId", "$comment": "CP-ADR-0063 Ж1, Ж6"},
             "fields": {
               "type": "object",
               "properties": {
-                "workspaceId": {"type": "string", "description": "Шаблон id workspace заводимой работы; по умолчанию — workspace правила", "$comment": "CP-ADR-0063, амендмент process-packages"},
+                "workspaceId": {"type": "string", "description": "Template of the workspace id of the created work; defaults to the rule's workspace", "$comment": "CP-ADR-0063, amendment process-packages"},
                 "relations": {
                   "type": "object", "additionalProperties": false,
-                  "description": "Связи заводимой работы: spawnedBy — шаблон id задачи; dependsOn — ключи дедупликации работы этого правила (той же оценки или заведённой раньше)", "$comment": "CP-ADR-0063 А6",
+                  "description": "Relations of the created work: spawnedBy is a task id template; dependsOn are deduplication keys of this rule's work (from the same evaluation or created earlier)", "$comment": "CP-ADR-0063 А6",
                   "properties": {
                     "spawnedBy": {"type": "string"},
                     "dependsOn": {"oneOf": [{"type": "string"}, {"type": "array", "maxItems": 50, "items": {"type": "string"}}]}
@@ -867,16 +1091,16 @@
         },
         "identity": {
           "type": "object", "required": ["agent"], "additionalProperties": false,
-          "description": "От чьего имени действует правило: описание агента вида service или agent; без identity — полномочиями того, кто применил правило", "$comment": "CP-ADR-0063 А6, TAI-ADR-0053",
+          "description": "On whose behalf the rule acts: an agent description of kind service or agent; without identity, with the authority of whoever applied the rule", "$comment": "CP-ADR-0063 А6, TAI-ADR-0053",
           "properties": {"agent": {"$ref": "#/$defs/slug"}}
         },
-        "status": {"enum": ["enabled", "disabled"], "description": "По умолчанию enabled"}
+        "status": {"enum": ["enabled", "disabled"], "description": "enabled by default"}
       }
     },
 
     "notificationRuleSpec": {
       "type": "object",
-      "description": "Правило уведомления: событие ядра и условие → адресат → текст и кнопки. Хранит и исполняет сервис уведомлений; шаблоны — подстановка {{payload.…}}, {{event.…}}, {{task.…}} без логики.", "$comment": "TAI-ADR-0053, ADR-0003 notification-service",
+      "description": "Notification rule: core event and condition → recipient → text and buttons. Stored and executed by the notification service; templates are {{payload.…}}, {{event.…}}, {{task.…}} substitution without logic.", "$comment": "TAI-ADR-0053, ADR-0003 notification-service",
       "required": ["on", "recipient", "notification"],
       "additionalProperties": false,
       "properties": {
@@ -884,70 +1108,77 @@
         "on": {
           "type": "object", "required": ["type"], "additionalProperties": false,
           "properties": {
-            "type": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*(\\.\\*)?$", "description": "Тип события каталога ядра или префикс.*"},
-            "when": {"type": ["object", "boolean"], "description": "Условие грамматики правил ядра над payload, event и task"}
+            "type": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*(\\.\\*)?$", "description": "Core catalog event type or a prefix.*"},
+            "when": {"type": ["object", "boolean"], "description": "Condition in the core rule grammar over payload, event and task"}
           }
         },
         "recipient": {
           "type": "object", "required": ["kind"], "additionalProperties": false,
           "properties": {
             "kind": {"enum": ["assigned", "role", "taskOwner", "taskAssignee", "principal"]},
-            "ref": {"type": "string", "maxLength": 200, "description": "Путь к principal или роли в событии (assigned, role) или id/переменная (principal)"},
-            "workspace": {"type": "string", "maxLength": 200, "description": "Путь к workspace для role; по умолчанию workspace события"},
+            "ref": {"type": "string", "maxLength": 200, "description": "Path to a principal or role in the event (assigned, role) or an id/variable (principal)"},
+            "workspace": {"type": "string", "maxLength": 200, "description": "Path to the workspace for role; defaults to the event's workspace"},
             "fallback": {"enum": ["taskOwner", "taskAssignee", "none"], "default": "none"}
           }
         },
         "notification": {
           "type": "object", "required": ["type", "title"], "additionalProperties": false,
           "properties": {
-            "type": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$", "description": "Тип уведомления — по нему работают настройки получателя и обязательные правила"},
+            "type": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$", "description": "Notification type: recipient settings and mandatory rules work by it"},
             "title": {"type": "string", "minLength": 1, "maxLength": 300},
             "body": {"type": "string", "maxLength": 4000},
             "links": {"type": "array", "maxItems": 5, "items": {"type": "object", "required": ["label", "url"], "additionalProperties": false, "properties": {"label": {"type": "string", "maxLength": 100}, "url": {"type": "string", "maxLength": 1000}}}},
-            "actions": {"type": "array", "uniqueItems": true, "items": {"enum": ["approvalDecide"]}, "description": "approvalDecide — кнопки «Одобрить»/«Отклонить» решения из payload.approvalId"}
+            "actions": {"type": "array", "uniqueItems": true, "items": {"enum": ["approvalDecide"]}, "description": "approvalDecide: Approve/Reject buttons for the decision from payload.approvalId"}
           }
         },
         "dedupKeyTemplate": {"type": "string", "minLength": 1, "maxLength": 300},
         "close": {
           "type": "object", "required": ["on"], "additionalProperties": false,
-          "description": "Закрыть кнопки уведомления с тем же ключом дедупликации, когда пришло событие",
+          "description": "Close the notification's buttons with the same deduplication key when the event arrives",
           "properties": {
             "on": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
-            "outcome": {"type": "string", "maxLength": 200, "description": "Шаблон исхода, который показывается вместо кнопок"}
+            "outcome": {"type": "string", "maxLength": 200, "description": "Outcome template shown instead of the buttons"}
           }
         },
-        "status": {"enum": ["enabled", "disabled"], "description": "По умолчанию enabled"}
+        "status": {"enum": ["enabled", "disabled"], "description": "enabled by default"}
       }
     },
 
     "cel": {
       "type": "string", "minLength": 1, "maxLength": 4000,
-      "description": "Выражение CEL в профиле taimen/1: переменные data, event, step, task, instance; функции cal.*; без текущего времени. Типы и лимит стоимости проверяет ядро", "$comment": "CP-ADR-0075"
+      "description": "CEL expression in the taimen/1 profile: variables data, event, step, task, instance; cal.* functions; no current time. The core checks types and the cost limit", "$comment": "CP-ADR-0075"
     },
     "processElementId": {
       "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$",
-      "description": "Стабильный id элемента процесса: на него ссылаются раскладка схемы, карты миграции, журнал и граф памяти. Переименование — только картой migrations"
+      "description": "Stable process element id: the schema layout, migration maps, the journal and the memory graph refer to it. Renaming only via the migrations map"
     },
     "duration": {
       "type": "string", "pattern": "^P(?!$)(\\d+Y)?(\\d+M)?(\\d+W)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+S)?)?$",
-      "description": "Длительность ISO 8601, например P3D, PT4H"
+      "description": "ISO 8601 duration, e.g. P3D, PT4H"
     },
     "durationOrCel": {
-      "description": "Длительность ISO 8601 или выражение CEL, дающее момент времени (timestamp) или длительность",
+      "description": "ISO 8601 duration or a CEL expression yielding a point in time (timestamp) or a duration",
       "oneOf": [{"$ref": "#/$defs/duration"}, {"type": "object", "required": ["at"], "additionalProperties": false, "properties": {"at": {"$ref": "#/$defs/cel"}}}]
     },
-    "workdayCount": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Рабочие дни по календарю: то же время суток через n рабочих дней (cal.addWorkdays)"},
-    "workhourCount": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000, "description": "Часы рабочего времени по календарю с рабочими часами (cal.addWorkingTime)"},
+    "workdayCount": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Workdays by the calendar: the same time of day n workdays later (cal.addWorkdays)"},
+    "workhourCount": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000, "description": "Working-time hours by a calendar with working hours (cal.addWorkingTime)"},
+    "workingAmountExpr": {
+      "type": "object", "required": ["expr"], "additionalProperties": false,
+      "description": "Number of work units as a CEL expression: a non-negative integer, evaluated once on entering the step (settings.* are the package settings); after that the due date is computed as from a number", "$comment": "CP-ADR-0081 Г1",
+      "properties": {"expr": {"$ref": "#/$defs/cel"}}
+    },
+    "workdayAmount": {"oneOf": [{"$ref": "#/$defs/workdayCount"}, {"$ref": "#/$defs/workingAmountExpr"}]},
+    "workhourAmount": {"oneOf": [{"$ref": "#/$defs/workhourCount"}, {"$ref": "#/$defs/workingAmountExpr"}]},
     "workingSpan": {
-      "description": "Промежуток: длительность ISO 8601 (астрономическое время), {workdays} или {workhours} по календарю срока",
+      "description": "Interval: an ISO 8601 duration (astronomical time), {workdays} or {workhours} by the due calendar",
       "oneOf": [
         {"$ref": "#/$defs/duration"},
-        {"type": "object", "required": ["workdays"], "additionalProperties": false, "properties": {"workdays": {"$ref": "#/$defs/workdayCount"}}},
-        {"type": "object", "required": ["workhours"], "additionalProperties": false, "properties": {"workhours": {"$ref": "#/$defs/workhourCount"}}}
+        {"type": "object", "required": ["workdays"], "additionalProperties": false, "properties": {"workdays": {"$ref": "#/$defs/workdayAmount"}}},
+        {"type": "object", "required": ["workhours"], "additionalProperties": false, "properties": {"workhours": {"$ref": "#/$defs/workhourAmount"}}}
       ]
     },
     "processDue": {
-      "description": "Срок (SLA) шага или процесса: длительность ISO 8601, {at} — момент или длительность от данных, либо ровно одно из duration, workdays, workhours с необязательными calendar и warnBefore", "$comment": "CP-ADR-0078 §1",
+      "description": "Due (SLA) of a step or process: an ISO 8601 duration, {at}, a point in time or a duration from data, or exactly one of duration, workdays, workhours with optional calendar and warnBefore", "$comment": "CP-ADR-0078 §1",
       "oneOf": [
         {"$ref": "#/$defs/durationOrCel"},
         {
@@ -955,10 +1186,10 @@
           "oneOf": [{"required": ["duration"]}, {"required": ["workdays"]}, {"required": ["workhours"]}],
           "properties": {
             "duration": {"$ref": "#/$defs/duration"},
-            "workdays": {"$ref": "#/$defs/workdayCount"},
-            "workhours": {"$ref": "#/$defs/workhourCount"},
-            "calendar": {"$ref": "#/$defs/typeKey", "description": "Календарь рабочих единиц; по умолчанию spec.calendar процесса"},
-            "warnBefore": {"$ref": "#/$defs/workingSpan", "description": "Порог предупреждения до срока; без него предупреждения нет"}
+            "workdays": {"$ref": "#/$defs/workdayAmount"},
+            "workhours": {"$ref": "#/$defs/workhourAmount"},
+            "calendar": {"$ref": "#/$defs/typeKey", "description": "Calendar of the working units; defaults to the process's spec.calendar"},
+            "warnBefore": {"$ref": "#/$defs/workingSpan", "description": "Warning threshold before the due; without it there is no warning"}
           }
         }
       ]
@@ -967,11 +1198,11 @@
       "type": "object", "maxProperties": 100,
       "propertyNames": {"pattern": "^[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*$"},
       "additionalProperties": {"$ref": "#/$defs/cel"},
-      "description": "Путь в данных экземпляра → выражение CEL"
+      "description": "Path in the instance data → CEL expression"
     },
     "processTrigger": {
       "type": "object", "additionalProperties": false,
-      "description": "Источник события: событие журнала ядра или наблюдение. where — фильтр CEL над event",
+      "description": "Event source: a core journal event or an observation. where is a CEL filter over event",
       "oneOf": [{"required": ["event"]}, {"required": ["observation"]}],
       "properties": {
         "event": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"},
@@ -982,7 +1213,7 @@
     },
     "governedBy": {
       "type": "array", "maxItems": 20,
-      "description": "Регламенты базы знаний, которым подчиняется элемент: естественный ключ документа памяти и, при необходимости, пункт", "$comment": "TAI-ADR-0054 Р17",
+      "description": "Knowledge base regulations the element is subject to: the natural key of the memory document and, if needed, a clause", "$comment": "TAI-ADR-0054 Р17",
       "items": {
         "type": "object", "required": ["document"], "additionalProperties": false,
         "properties": {
@@ -998,17 +1229,17 @@
         "principal": {"$ref": "#/$defs/envOrUuid"},
         "role": {"$ref": "#/$defs/slug"},
         "agent": {"$ref": "#/$defs/slug"},
-        "expr": {"$ref": "#/$defs/cel", "description": "CEL → id principal, agent:<key> или role:<slug>"}
+        "expr": {"$ref": "#/$defs/cel", "description": "CEL → principal id, agent:<key> or role:<slug>"}
       }
     },
     "assignChain": {
       "type": "array", "minItems": 1, "maxItems": 10, "items": {"$ref": "#/$defs/assignee"},
-      "description": "Кандидаты по порядку: берётся первый разрешимый"
+      "description": "Candidates in order: the first resolvable one is taken"
     },
     "memoryAnchor": {
       "type": "object", "additionalProperties": false,
       "oneOf": [{"required": ["case"]}, {"required": ["key", "kind"]}],
-      "description": "Якорь обхода графа: узел дела экземпляра или сущность по естественному ключу (CEL от данных)",
+      "description": "Graph traversal anchor: the instance's case node or an entity by natural key (CEL over data)",
       "properties": {
         "case": {"const": true},
         "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
@@ -1018,7 +1249,7 @@
     },
     "memoryTraverse": {
       "type": "array", "maxItems": 10,
-      "description": "Шаги обхода от якорей — та же форма, что traverse в contextSchema", "$comment": "CP-ADR-0064",
+      "description": "Traversal steps from the anchors, the same shape as traverse in contextSchema", "$comment": "CP-ADR-0064",
       "items": {
         "type": "object", "required": ["relation"], "additionalProperties": false,
         "properties": {
@@ -1032,13 +1263,13 @@
     },
     "memoryWhere": {
       "type": "array", "minItems": 1, "maxItems": 20,
-      "description": "Фильтры по атрибутам узлов: применяются к узлам результата и к якорям-кандидатам смыслового добора; условия соединяются через И", "$comment": "TAI-ADR-0056 Р7, MEM-ADR-020",
+      "description": "Filters on node attributes: applied to result nodes and to candidate anchors of semantic expansion; conditions are joined with AND", "$comment": "TAI-ADR-0056 Р7, MEM-ADR-020",
       "items": {
         "type": "object", "required": ["attr", "op"], "additionalProperties": false,
         "properties": {
-          "attr": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$", "description": "Имя атрибута узла (плоское), например okpd2 или validUntil; атрибут-список выполняет условие, если его выполняет хоть один элемент", "$comment": "MEM-ADR-020"},
-          "op": {"enum": ["eq", "in", "prefix", "lte", "gte", "exists"], "description": "prefix сравнивает коды по сегментам через точку: 62.01 совпадает с 62.01.11, но не с 62.011; lte/gte — даты RFC 3339 или числа"},
-          "value": {"description": "CEL-выражение от данных экземпляра (строковый литерал — в кавычках CEL: \"'62.01'\"); для in — CEL-список или список выражений; для exists — true или false", "anyOf": [{"$ref": "#/$defs/cel"}, {"type": ["number", "boolean"]}, {"type": "array", "minItems": 1, "maxItems": 200, "items": {"$ref": "#/$defs/cel"}}]}
+          "attr": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$", "description": "Node attribute name (flat), e.g. okpd2 or validUntil; a list attribute satisfies the condition if any of its elements does", "$comment": "MEM-ADR-020"},
+          "op": {"enum": ["eq", "in", "prefix", "lte", "gte", "exists"], "description": "prefix compares codes by dot-separated segments: 62.01 matches 62.01.11 but not 62.011; lte/gte are RFC 3339 dates or numbers"},
+          "value": {"description": "CEL expression over the instance data (a string literal goes in CEL quotes: \"'62.01'\"); for in, a CEL list or a list of expressions; for exists, true or false", "anyOf": [{"$ref": "#/$defs/cel"}, {"type": ["number", "boolean"]}, {"type": "array", "minItems": 1, "maxItems": 200, "items": {"$ref": "#/$defs/cel"}}]}
         },
         "allOf": [
           {"if": {"properties": {"op": {"not": {"const": "exists"}}}}, "then": {"required": ["value"]}}
@@ -1047,18 +1278,18 @@
     },
     "stepContext": {
       "type": "object", "additionalProperties": false, "required": ["anchors"],
-      "description": "Профиль контекста исполнителя шага из памяти: явные связи первыми, смысловой добор с пометкой inferred", "$comment": "TAI-ADR-0054 Р16",
+      "description": "Context profile of the step executor from memory: explicit relations first, semantic expansion marked inferred", "$comment": "TAI-ADR-0054 Р16",
       "properties": {
         "anchors": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/memoryAnchor"}},
         "traverse": {"$ref": "#/$defs/memoryTraverse"},
-        "semantic": {"type": "boolean", "description": "Добор по смыслу (inferred); по умолчанию true"},
+        "semantic": {"type": "boolean", "description": "Semantic expansion (inferred); true by default"},
         "budgetTokens": {"type": "integer", "minimum": 200, "maximum": 32000}
       }
     },
     "escalation": {
       "type": "object", "required": ["after", "action"], "additionalProperties": false,
       "properties": {
-        "after": {"oneOf": [{"const": "due"}, {"$ref": "#/$defs/durationOrCel"}], "description": "due — в момент срока; длительность — после срока"},
+        "after": {"oneOf": [{"const": "due"}, {"$ref": "#/$defs/durationOrCel"}], "description": "due means at the due moment; a duration means after the due"},
         "action": {"enum": ["remind", "reassign", "notify", "raise"]},
         "to": {"$ref": "#/$defs/assignChain"},
         "error": {"$ref": "#/$defs/processError"}
@@ -1066,7 +1297,7 @@
     },
     "processError": {
       "type": "object", "required": ["type"], "additionalProperties": false,
-      "description": "Ошибка в форме RFC 7807",
+      "description": "Error in RFC 7807 form",
       "properties": {
         "type": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"},
         "status": {"type": "integer", "minimum": 100, "maximum": 599},
@@ -1075,16 +1306,16 @@
     },
     "processForm": {
       "type": "object", "required": ["schema"], "additionalProperties": false,
-      "description": "Форма шага: JSON Schema данных и uischema JSON Forms представления",
+      "description": "Step form: JSON Schema of the data and JSON Forms uischema of the view",
       "properties": {"schema": {"$ref": "#/$defs/jsonSchema"}, "uischema": {"type": "object"}}
     },
     "blocks": {
       "type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/processStep"},
-      "description": "Последовательность шагов (блок do)"
+      "description": "Sequence of steps (do block)"
     },
     "processStep": {
       "type": "object", "required": ["id"], "additionalProperties": false,
-      "description": "Шаг процесса: ровно один вид (human, approve, call, decide, recall, remember, listen, wait, set, raise, compensate, fork, try, do, suspend, resume, complete) плюс общие поля",
+      "description": "Process step: exactly one kind (human, approve, call, decide, recall, remember, listen, wait, set, raise, compensate, fork, try, do, suspend, resume, complete) plus common fields",
       "oneOf": [
         {"required": ["human"]}, {"required": ["approve"]}, {"required": ["call"]}, {"required": ["decide"]},
         {"required": ["recall"]}, {"required": ["remember"]}, {"required": ["listen"]}, {"required": ["wait"]},
@@ -1095,17 +1326,23 @@
       "properties": {
         "id": {"$ref": "#/$defs/processElementId"},
         "displayName": {"$ref": "#/$defs/displayName"},
-        "when": {"$ref": "#/$defs/cel", "description": "Сторож: шаг выполняется, только если истинно"},
+        "when": {"$ref": "#/$defs/cel", "description": "Guard: the step runs only if it is true"},
         "input": {"type": "object", "additionalProperties": false, "properties": {"from": {"$ref": "#/$defs/cel"}}},
-        "output": {"type": "object", "additionalProperties": false, "properties": {"as": {"$ref": "#/$defs/celMap"}}, "description": "Запись результата шага (step.result) в данные экземпляра"},
+        "output": {"type": "object", "additionalProperties": false, "properties": {"as": {"$ref": "#/$defs/celMap"}}, "description": "Writing the step result (step.result) into the instance data"},
         "export": {"type": "object", "additionalProperties": false, "properties": {"as": {"$ref": "#/$defs/celMap"}}},
         "governedBy": {"$ref": "#/$defs/governedBy"},
-        "onCompensate": {"$ref": "#/$defs/blocks", "description": "Компенсация сделанного шага: выполняется при compensate в обратном порядке"},
+        "onCompensate": {"$ref": "#/$defs/blocks", "description": "Compensation of a completed step: runs on compensate in reverse order"},
         "human": {
           "type": "object", "required": ["taskType", "assign"], "additionalProperties": false,
           "properties": {
             "taskType": {"$ref": "#/$defs/typeKey"},
             "title": {"$ref": "#/$defs/cel"},
+            "customFields": {
+              "type": "object", "maxProperties": 32,
+              "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+              "additionalProperties": {"$ref": "#/$defs/cel"},
+              "description": "Prefill of the created task's fields with case data: a field of the type's fieldSchema → CEL; checked against fieldSchema on publication and on task creation, null leaves the field to the human", "$comment": "CP-ADR-0074 §7, amendment 2026-10-01"
+            },
             "form": {"$ref": "#/$defs/processForm"},
             "assign": {"$ref": "#/$defs/assignChain"},
             "due": {"$ref": "#/$defs/processDue"},
@@ -1125,7 +1362,7 @@
               {"type": "object", "required": ["percent"], "additionalProperties": false, "properties": {"percent": {"type": "number", "exclusiveMinimum": 0, "maximum": 100}}}
             ]},
             "earlyDecision": {"type": "boolean", "default": true},
-            "separationOfDuties": {"$ref": "#/$defs/cel", "description": "CEL → список principal, которым голосовать нельзя; проверяет ядро при решении"},
+            "separationOfDuties": {"$ref": "#/$defs/cel", "description": "CEL → list of principals who may not vote; the core checks it at decision time"},
             "due": {"$ref": "#/$defs/processDue"},
             "onDue": {"enum": ["approve", "reject", "escalate"]},
             "escalations": {"type": "array", "maxItems": 5, "items": {"$ref": "#/$defs/escalation"}},
@@ -1151,11 +1388,11 @@
         },
         "recall": {
           "type": "object", "required": ["anchors"], "additionalProperties": false,
-          "description": "Запрос к памяти через ядро; ответ — событие журнала (детерминированный replay)",
+          "description": "Memory query through the core; the answer is a journal event (deterministic replay)",
           "properties": {
             "anchors": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/memoryAnchor"}},
             "traverse": {"$ref": "#/$defs/memoryTraverse"},
-            "query": {"$ref": "#/$defs/cel", "description": "Текст смыслового добора"},
+            "query": {"$ref": "#/$defs/cel", "description": "Semantic expansion text"},
             "kinds": {"type": "array", "maxItems": 20, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}},
             "where": {"$ref": "#/$defs/memoryWhere"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -1167,7 +1404,7 @@
         "remember": {
           "type": "object", "additionalProperties": false,
           "oneOf": [{"required": ["facts"]}, {"required": ["entity"]}],
-          "description": "Запись в память наблюдением ядра от identity процесса, со ссылкой на дело",
+          "description": "Write to memory as a core observation from the process identity, with a reference to the case",
           "properties": {
             "entity": {
               "type": "object", "required": ["kind", "key"], "additionalProperties": false,
@@ -1179,12 +1416,12 @@
                 "links": {"type": "array", "maxItems": 20, "items": {"type": "object", "required": ["rel", "kind", "key"], "additionalProperties": false, "properties": {"rel": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}, "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}, "key": {"$ref": "#/$defs/cel"}}}}
               }
             },
-            "facts": {"$ref": "#/$defs/celMap", "description": "Имя факта дела → значение"}
+            "facts": {"$ref": "#/$defs/celMap", "description": "Case fact name → value"}
           }
         },
         "listen": {
           "type": "object", "required": ["any"], "additionalProperties": false,
-          "description": "Ожидание первого из событий (отложенный выбор); timeout — таймер",
+          "description": "Waiting for the first of the events (deferred choice); timeout is a timer",
           "properties": {
             "any": {"type": "array", "minItems": 1, "maxItems": 10, "items": {
               "type": "object", "required": ["on"], "additionalProperties": false,
@@ -1194,12 +1431,12 @@
             "onTimeout": {"$ref": "#/$defs/blocks"}
           }
         },
-        "wait": {"$ref": "#/$defs/durationOrCel", "description": "Пауза: длительность или момент; срока (due) у wait нет — пауза сама задаёт время"},
+        "wait": {"$ref": "#/$defs/durationOrCel", "description": "Pause: a duration or a point in time; wait has no due, the pause itself sets the time"},
         "set": {"$ref": "#/$defs/celMap"},
         "raise": {"$ref": "#/$defs/processError"},
         "compensate": {
           "oneOf": [{"const": "all"}, {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/processElementId"}}],
-          "description": "Выполнить onCompensate сделанных шагов в обратном порядке"
+          "description": "Run onCompensate of completed steps in reverse order"
         },
         "fork": {
           "type": "object", "required": ["branches"], "additionalProperties": false,
@@ -1221,7 +1458,7 @@
                 "delay": {"$ref": "#/$defs/duration"},
                 "backoff": {"enum": ["constant", "exponential"]},
                 "maxDelay": {"$ref": "#/$defs/duration"},
-                "on": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"}, "description": "Типы ошибок для повтора; по умолчанию все"}
+                "on": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]*$"}, "description": "Error types to retry; all by default"}
               }
             },
             "catch": {"type": "array", "maxItems": 10, "items": {
@@ -1244,16 +1481,16 @@
     },
     "processStage": {
       "type": "object", "required": ["id", "steps"], "additionalProperties": false,
-      "description": "Стадия кейса (CMMN): вход и выход по сторожам, вехи, обязательная и необязательная работа",
+      "description": "Case stage (CMMN): entry and exit by guards, milestones, required and optional work",
       "properties": {
         "id": {"$ref": "#/$defs/processElementId"},
         "displayName": {"$ref": "#/$defs/displayName"},
-        "entry": {"$ref": "#/$defs/cel", "description": "Сторож входа; stage.<id>.completed, milestone.<id> и data доступны в выражении"},
+        "entry": {"$ref": "#/$defs/cel", "description": "Entry guard; stage.<id>.completed, milestone.<id> and data are available in the expression"},
         "exit": {"$ref": "#/$defs/cel"},
         "repeatable": {"type": "boolean"},
         "governedBy": {"$ref": "#/$defs/governedBy"},
         "steps": {"$ref": "#/$defs/blocks"},
-        "discretionary": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/processStep"}, "description": "Работа, которую человек добавляет по решению"},
+        "discretionary": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/processStep"}, "description": "Work a human adds at their discretion"},
         "milestones": {"type": "array", "maxItems": 20, "items": {
           "type": "object", "required": ["id", "when"], "additionalProperties": false,
           "properties": {"id": {"$ref": "#/$defs/processElementId"}, "when": {"$ref": "#/$defs/cel"}}}},
@@ -1262,7 +1499,7 @@
     },
     "processTimers": {
       "type": "array", "maxItems": 20,
-      "description": "Граничные таймеры: срабатывают, пока стадия (процесс) открыта; at от данных пересчитывается при их изменении",
+      "description": "Boundary timers: fire while the stage (process) is open; at from data is recalculated when the data changes",
       "items": {
         "type": "object", "required": ["id", "at", "do"], "additionalProperties": false,
         "properties": {
@@ -1275,7 +1512,7 @@
     },
     "decisionTable": {
       "type": "object", "required": ["id", "hitPolicy", "inputs", "outputs", "rules"], "additionalProperties": false,
-      "description": "Таблица решений (DMN по смыслу). Ячейка условия: '-' (любое), литерал, список 'a,b', диапазон '[a..b)'",
+      "description": "Decision table (DMN in spirit). Condition cell: '-' (any), a literal, a list 'a,b', a range '[a..b)'",
       "properties": {
         "id": {"$ref": "#/$defs/processElementId"},
         "displayName": {"$ref": "#/$defs/displayName"},
@@ -1299,7 +1536,7 @@
     },
     "memoryProjection": {
       "type": "object", "required": ["case"], "additionalProperties": false,
-      "description": "Проекция дела в граф памяти: доставляется событиями, в граф идут только объявленные поля", "$comment": "TAI-ADR-0054 Р15",
+      "description": "Projection of the case into the memory graph: delivered by events, only declared fields go into the graph", "$comment": "TAI-ADR-0054 Р15",
       "properties": {
         "case": {
           "type": "object", "required": ["key"], "additionalProperties": false,
@@ -1309,7 +1546,7 @@
             "title": {"$ref": "#/$defs/cel"}
           }
         },
-        "facts": {"$ref": "#/$defs/celMap", "description": "Имя факта дела → значение; изменение закрывает прежний факт сроком действия"},
+        "facts": {"$ref": "#/$defs/celMap", "description": "Case fact name → value; a change closes the previous fact with a validity end"},
         "entities": {"type": "array", "maxItems": 30, "items": {
           "type": "object", "required": ["kind", "key", "rel"], "additionalProperties": false,
           "properties": {
@@ -1318,7 +1555,7 @@
             "name": {"$ref": "#/$defs/cel"},
             "rel": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
             "when": {"$ref": "#/$defs/cel"},
-            "many": {"type": "boolean", "description": "key даёт список: по сущности на элемент"}
+            "many": {"type": "boolean", "description": "key yields a list: one entity per element"}
           }}},
         "documents": {
           "type": "object", "additionalProperties": false,
@@ -1328,31 +1565,31 @@
     },
     "processSpec": {
       "type": "object",
-      "description": "Процесс: кейс со стадиями и блоками исполнения, данные по схеме, выражения CEL, проекция в память. Исполняет ядро", "$comment": "TAI-ADR-0054, CP-ADR-0074",
+      "description": "Process: a case with stages and execution blocks, data by schema, CEL expressions, projection into memory. Executed by the core", "$comment": "TAI-ADR-0054, CP-ADR-0074",
       "required": ["version", "displayName", "data", "start", "stages"],
       "additionalProperties": false,
       "properties": {
-        "version": {"type": "integer", "minimum": 1, "description": "Версия определения: опубликованная версия неизменяема"},
+        "version": {"type": "integer", "minimum": 1, "description": "Definition version: a published version is immutable"},
         "displayName": {"$ref": "#/$defs/displayName"},
         "description": {"type": "string", "maxLength": 4000},
         "workspaceId": {"type": "string", "pattern": "^\\$\\{[A-Z][A-Z0-9_]*\\}$"},
         "identity": {
           "type": "object", "required": ["agent"], "additionalProperties": false,
-          "description": "От чьего имени действует процесс: описание агента вида service или agent",
+          "description": "On whose behalf the process acts: an agent description of kind service or agent",
           "properties": {"agent": {"$ref": "#/$defs/slug"}}
         },
         "owner": {
           "$ref": "#/$defs/assignChain",
-          "description": "Владелец процесса — ему адресуются задачи о процессе: расхождение с регламентом, ошибки экземпляров. Не обязателен; проверка пакета предупреждает, если его нет", "$comment": "TAI-ADR-0054 п.5, амендмент 2026-09-27"
+          "description": "Process owner: tasks about the process are addressed to them (divergence from the regulation, instance errors). Optional; the package check warns if it is missing", "$comment": "TAI-ADR-0054 item 5, amendment 2026-09-27"
         },
-        "calendar": {"$ref": "#/$defs/typeKey", "description": "Календарь по умолчанию для cal.*"},
-        "due": {"$ref": "#/$defs/processDue", "description": "Срок процесса целиком от старта экземпляра", "$comment": "CP-ADR-0078 §1"},
-        "data": {"$ref": "#/$defs/jsonSchema", "description": "JSON Schema данных экземпляра; {$ref: <файл пакета>} раскрывает package-sdk"},
+        "calendar": {"$ref": "#/$defs/typeKey", "description": "Default calendar for cal.*"},
+        "due": {"$ref": "#/$defs/processDue", "description": "Due of the whole process from the instance start", "$comment": "CP-ADR-0078 §1"},
+        "data": {"$ref": "#/$defs/jsonSchema", "description": "JSON Schema of the instance data; package-sdk expands {$ref: <package file>}"},
         "start": {
           "type": "object", "required": ["on", "key"], "additionalProperties": false,
           "properties": {
             "on": {"$ref": "#/$defs/processTrigger"},
-            "key": {"$ref": "#/$defs/cel", "description": "Ключ экземпляра: повтор события с тем же ключом — correlate, а не новый экземпляр"},
+            "key": {"$ref": "#/$defs/cel", "description": "Instance key: a repeated event with the same key is a correlate, not a new instance"},
             "set": {"$ref": "#/$defs/celMap"}
           }
         },
@@ -1369,12 +1606,12 @@
         "memory": {"$ref": "#/$defs/memoryProjection"},
         "retrospective": {
           "type": "object", "required": ["taskType", "assign"], "additionalProperties": false,
-          "description": "Разбор закрытого дела: агент предлагает уроки, человек подтверждает", "$comment": "TAI-ADR-0054 Р18",
+          "description": "Review of a closed case: the agent proposes lessons, a human confirms", "$comment": "TAI-ADR-0054 Р18",
           "properties": {
             "skill": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$", "default": "process.retrospective@1"},
             "taskType": {"$ref": "#/$defs/typeKey"},
             "assign": {"$ref": "#/$defs/assignChain"},
-            "appliesTo": {"type": "array", "maxItems": 10, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}, "description": "Виды сущностей, к которым привязываются уроки"},
+            "appliesTo": {"type": "array", "maxItems": 10, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"}, "description": "Entity kinds lessons are attached to"},
             "when": {"$ref": "#/$defs/cel"}
           }
         },
@@ -1390,7 +1627,7 @@
     },
     "workingIntervals": {
       "type": "array", "maxItems": 10,
-      "description": "Интервалы рабочего времени дня по порядку и без пересечений, from раньше to (порядок проверяет ядро); 24:00 — конец суток",
+      "description": "Working-time intervals of the day, in order and non-overlapping, from before to (the core checks the order); 24:00 is the end of the day",
       "items": {
         "type": "object", "required": ["from", "to"], "additionalProperties": false,
         "properties": {
@@ -1401,31 +1638,31 @@
     },
     "calendarSpec": {
       "type": "object", "required": ["displayName", "timezone", "years"], "additionalProperties": false,
-      "description": "Производственный календарь: выходные по умолчанию, праздники и переносы по годам", "$comment": "TAI-ADR-0054 Р6",
+      "description": "Business calendar: default days off, holidays and transfers by year", "$comment": "TAI-ADR-0054 Р6",
       "properties": {
         "displayName": {"$ref": "#/$defs/displayName"},
         "timezone": {"type": "string", "maxLength": 64},
-        "weekend": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 7}, "default": [6, 7], "description": "Дни недели ISO: 1 — понедельник"},
+        "weekend": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 1, "maximum": 7}, "default": [6, 7], "description": "ISO weekdays: 1 is Monday"},
         "workingHours": {
           "type": "object", "required": ["intervals"], "additionalProperties": false,
-          "description": "Рабочие часы в рабочие дни календаря, местное время календаря. Без поля календарь знает только рабочие дни", "$comment": "CP-ADR-0078 §2",
+          "description": "Working hours on the calendar's working days, in the calendar's local time. Without the field the calendar knows only working days", "$comment": "CP-ADR-0078 §2",
           "properties": {
-            "intervals": {"$ref": "#/$defs/workingIntervals", "minItems": 1, "description": "Интервалы обычного рабочего дня"},
+            "intervals": {"$ref": "#/$defs/workingIntervals", "minItems": 1, "description": "Intervals of a regular working day"},
             "weekdays": {
               "type": "object", "propertyNames": {"pattern": "^[1-7]$"}, "additionalProperties": {"$ref": "#/$defs/workingIntervals"},
-              "description": "Интервалы по дню недели ISO (1 — понедельник) вместо intervals; [] — рабочих часов нет"
+              "description": "Intervals per ISO weekday (1 is Monday) instead of intervals; [] means no working hours"
             },
-            "shortDayReduction": {"$ref": "#/$defs/duration", "description": "На сколько короче сокращённый день (shortDays): вычитается с конца последнего интервала"}
+            "shortDayReduction": {"$ref": "#/$defs/duration", "description": "How much shorter a shortened day (shortDays) is: subtracted from the end of the last interval"}
           }
         },
         "years": {"type": "array", "minItems": 1, "items": {
           "type": "object", "required": ["year"], "additionalProperties": false,
           "properties": {
             "year": {"type": "integer", "minimum": 2000, "maximum": 2100},
-            "provisional": {"type": "boolean", "description": "Год ещё не утверждён: результаты cal.* помечаются «предварительно»"},
+            "provisional": {"type": "boolean", "description": "The year is not approved yet: cal.* results are marked as preliminary"},
             "source": {"type": "string", "maxLength": 500},
             "holidays": {"type": "array", "uniqueItems": true, "items": {"type": "string", "format": "date"}},
-            "workdays": {"type": "array", "uniqueItems": true, "items": {"type": "string", "format": "date"}, "description": "Перенесённые рабочие дни, выпавшие на выходные"},
+            "workdays": {"type": "array", "uniqueItems": true, "items": {"type": "string", "format": "date"}, "description": "Transferred working days that fall on days off"},
             "shortDays": {"type": "array", "uniqueItems": true, "items": {"type": "string", "format": "date"}}
           }}}
       }
@@ -1439,9 +1676,67 @@
       }
     },
 
+    "connectionKey": {
+      "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "description": "Key of a connection type or of a connection", "$comment": "CP-ADR-0079"
+    },
+    "connectionTypeSpec": {
+      "type": "object",
+      "required": ["version", "displayName", "auth", "settingsSchema", "defaultKey"],
+      "additionalProperties": false,
+      "description": "Connection type: what it takes to connect a system of this kind. Versions work as for Skill: the package sets the version, and a published (key, version) pair is immutable. A type carries no secret values: an administrator enters them in the console.",
+      "$comment": "CP-ADR-0079 §2, TAI-ADR-0061",
+      "properties": {
+        "version": {"type": "integer", "minimum": 1, "description": "The package sets the version of the type; a published version is immutable"},
+        "displayName": {"$ref": "#/$defs/displayName"},
+        "description": {"type": "string", "maxLength": 2000},
+        "auth": {
+          "type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["oauth2", "token"]},
+          "description": "Ways to connect: oauth2 — a person consents at the provider, token — a long-lived key an administrator pastes"
+        },
+        "oauth2": {
+          "type": "object",
+          "required": ["authorizeUrl", "tokenUrlTemplate", "authStyle", "scopes"],
+          "additionalProperties": false,
+          "properties": {
+            "authorizeUrl": {"type": "string", "format": "uri", "pattern": "^https://", "description": "Where a person is sent to consent"},
+            "tokenUrlTemplate": {"type": "string", "pattern": "^https://", "description": "Address of the code exchange and refresh; the only placeholder is {account}, the host is an external DNS name"},
+            "accountParam": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "Callback parameter that names the account; required when tokenUrlTemplate has {account}"},
+            "authStyle": {"enum": ["in_params", "in_header"], "description": "How the client id and secret go to the exchange address: in the request body or as Authorization: Basic"},
+            "scopes": {"type": "array", "maxItems": 50, "items": {"type": "string", "minLength": 1, "maxLength": 200}, "description": "Requested permissions"}
+          }
+        },
+        "accountField": {
+          "type": "object",
+          "required": ["title", "pattern"],
+          "additionalProperties": false,
+          "description": "Account field: its label in the key form and the account check; required with token or with {account} in tokenUrlTemplate",
+          "properties": {
+            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+            "description": {"type": "string", "maxLength": 2000},
+            "pattern": {"type": "string", "minLength": 1, "maxLength": 500, "description": "Regular expression the whole account matches"}
+          }
+        },
+        "settingsSchema": {
+          "allOf": [{"$ref": "#/$defs/jsonSchema"}],
+          "required": ["type"], "properties": {"type": {"const": "object"}},
+          "description": "JSON Schema (draft 2020-12) of the connection's non-secret settings, root type: object. Properties named like secrets (password, token, clientSecret…) are refused"
+        },
+        "defaultKey": {"$ref": "#/$defs/connectionKey", "description": "Key of the default connection — the agents of the package name it in Agent.spec.connections"}
+      },
+      "allOf": [
+        {"if": {"required": ["auth"], "properties": {"auth": {"contains": {"const": "oauth2"}}}},
+         "then": {"required": ["oauth2"]}},
+        {"if": {"required": ["auth"], "properties": {"auth": {"contains": {"const": "token"}}}},
+         "then": {"required": ["accountField"]}},
+        {"if": {"required": ["oauth2"], "properties": {"oauth2": {"required": ["tokenUrlTemplate"], "properties": {"tokenUrlTemplate": {"pattern": "\\{account\\}"}}}}},
+         "then": {"required": ["accountField"], "properties": {"oauth2": {"required": ["accountParam"]}}}}
+      ]
+    },
+
     "skillContract": {
       "type": "object",
-      "description": "Контракт Skill v1. Неизменяем в версии.", "$comment": "CP-ADR-0056 §1",
+      "description": "Skill v1 contract. Immutable within a version.", "$comment": "CP-ADR-0056 §1",
       "required": ["inputs", "outputs", "implementation"],
       "additionalProperties": false,
       "properties": {
@@ -1469,9 +1764,9 @@
           "additionalProperties": false,
           "properties": {
             "protocol": {"enum": ["http", "local", "mcp"]},
-            "endpoint": {"type": "string", "description": "http: адрес; допускает ${ПЕРЕМЕННУЮ} окружения"},
-            "entrypoint": {"type": "string", "description": "local: module:function; mcp: имя инструмента"},
-            "auth": {"type": "object", "description": "audience или secretRef; никаких секретов"}
+            "endpoint": {"type": "string", "description": "http: address; allows an environment ${VARIABLE}"},
+            "entrypoint": {"type": "string", "description": "local: module:function; mcp: tool name"},
+            "auth": {"type": "object", "description": "audience or secretRef; no secrets"}
           }
         }
       }
@@ -1481,7 +1776,7 @@
       "required": ["version"],
       "additionalProperties": false,
       "properties": {
-        "version": {"type": "string", "minLength": 1, "maxLength": 50, "description": "Версию скилла задаёт пакет"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 50, "description": "The package sets the skill version"},
         "description": {"type": "string"},
         "protocol": {"enum": ["mcp", "http", "local", "opencode", "custom"]},
         "config": {"type": "object"},

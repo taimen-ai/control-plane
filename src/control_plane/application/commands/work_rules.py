@@ -30,17 +30,25 @@ from control_plane.application.commands.agents import revision_of
 from control_plane.application.commands.approval_outcomes import authority_snapshot
 from control_plane.application.commands.goals import require_linkable_goal
 from control_plane.application.commands.iam_bindings import validate_binding_permissions
+from control_plane.application.commands.role_references import (
+    is_role_reference,
+    require_declared_role,
+)
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.queries.package_settings import object_scope
 from control_plane.domain.enums import AgentStatus, Permission, SkillSideEffects
 from control_plane.domain.errors import ConflictError, NotFoundError, ValidationError
+from control_plane.domain.settings_refs import SettingsScope
 from control_plane.domain.work_rules import (
     RuleSpec,
     RuleStatus,
     TriggerKind,
+    check_settings_refs,
     normalize_description,
     normalize_rule_key,
     normalize_rule_spec,
+    settings_reads,
 )
 from control_plane.infrastructure.db.models import Agent, Skill, TaskType, WorkRule
 
@@ -62,7 +70,11 @@ async def get_tenant_rule(
     if for_update:
         stmt = stmt.with_for_update()
     rule = await session.scalar(stmt)
-    if rule is None:
+    # A workspace outside the caller's visibility answers exactly as a missing
+    # row, never as a missing workspace (CP-ADR-0082 §3.7).
+    if rule is None or (
+        rule.workspace_id is not None and not ctx.sees_workspace(rule.workspace_id)
+    ):
         raise NotFoundError("Rule not found", details={"ruleId": str(rule_id)})
     return rule
 
@@ -116,7 +128,18 @@ async def ensure_consumer_cursor(session: AsyncSession, tenant_id: uuid.UUID, na
 
 
 async def _check_references(session: AsyncSession, ctx: AuthContext, spec: RuleSpec) -> None:
-    """The task types and the skill a rule names exist now (typos fail early)."""
+    """The task types, the skill and the author agent a rule names exist now (typos fail early)."""
+    author = spec.trigger.get("agent")
+    if author is not None:
+        status = await session.scalar(
+            select(Agent.status).where(Agent.tenant_id == ctx.tenant_id, Agent.key == author)
+        )
+        if status != AgentStatus.ACTIVE:
+            raise ValidationError(
+                "unknown_agent",
+                f"No active agent {author!r} in the registry",
+                details={"field": "trigger.agent", "agent": author},
+            )
     allowed = spec.action.get("taskTypes")
     if allowed is not None:
         active = set(
@@ -150,6 +173,13 @@ async def _check_references(session: AsyncSession, ctx: AuthContext, spec: RuleS
                 f"Task type {type_key!r} is not registered",
                 details={"field": "action.taskType", "taskType": type_key},
             )
+    approver_role = (spec.action.get("fields") or {}).get("approverRole")
+    # A role of the package by slug (CP-ADR-0061, amendment 2026-10-01); a
+    # template is only known when it renders, and is checked then.
+    if is_role_reference(approver_role) and "{{" not in approver_role:
+        await require_declared_role(
+            session, ctx.tenant_id, approver_role, field="action.fields.approverRole"
+        )
     if spec.interpretation is not None:
         ref = spec.interpretation["skill"]
         name, version = ref.split("@", 1)
@@ -306,6 +336,26 @@ async def _require_free_key(session: AsyncSession, ctx: AuthContext, key: str) -
         )
 
 
+async def check_rule_settings(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    key: str,
+    spec: RuleSpec,
+    settings: SettingsScope | None,
+) -> None:
+    """The reads of ``settings`` against the schema of the rule's package (CP-ADR-0081 §6).
+
+    ``settings`` — given by the apply of a package; ``None`` — the active
+    revision of the package that installed ``key``. A rule not from a package
+    has no settings: ``settings_ref_unknown``.
+    """
+    if not settings_reads(spec):
+        return
+    if settings is None:
+        settings = await object_scope(session, tenant_id, "WorkRule", key)
+    check_settings_refs(spec, settings)
+
+
 async def create_rule(
     session: AsyncSession,
     ctx: AuthContext,
@@ -320,7 +370,9 @@ async def create_rule(
     goal_id: uuid.UUID | None = None,
     status: str = RuleStatus.ENABLED,
     identity: dict[str, Any] | None = None,
+    settings: SettingsScope | None = None,
 ) -> WorkRule:
+    """A new rule; ``settings`` — the settings of the package that installs it (its apply)."""
     from control_plane.application.commands.workspaces import require_active_workspace
 
     await authorize(ctx, Permission.RULES_WRITE, resource=rule_scope(workspace_id))
@@ -329,6 +381,7 @@ async def create_rule(
     spec = normalize_rule_spec(
         trigger=trigger, condition=condition, interpretation=interpretation, action=action
     )
+    await check_rule_settings(session, ctx.tenant_id, rule_key, spec, settings)
     rule_status = _validate_status(status)
     agent_key = _identity_key(identity)
     if workspace_id is not None:
@@ -387,6 +440,7 @@ async def update_rule(
     action: dict[str, Any] | Any = _UNSET,
     goal_id: uuid.UUID | Any | None = _UNSET,
     identity: dict[str, Any] | Any | None = _UNSET,
+    settings: SettingsScope | None = None,
 ) -> WorkRule:
     """Change what a rule does; the key and the workspace are what it is.
 
@@ -424,6 +478,7 @@ async def update_rule(
         interpretation=rule.interpretation if interpretation is _UNSET else interpretation,
         action=rule.action if action is _UNSET else action,
     )
+    await check_rule_settings(session, ctx.tenant_id, rule.key, spec, settings)
     changes: dict[str, Any] = {
         "trigger": spec.trigger,
         "condition": spec.condition,

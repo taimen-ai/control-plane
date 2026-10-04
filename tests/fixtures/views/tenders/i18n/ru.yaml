@@ -1,0 +1,9 @@
+tenders.board.title: Тендеры
+tenders.board.inProgress: Тендеров в работе
+tenders.board.totalPrice: Сумма НМЦК
+tenders.card.title: Тендер
+tenders.card.procurement: Закупка
+tenders.fields.procurement.number: Номер
+tenders.fields.procurement.law: Закон
+tenders.fields.procurement.maxPrice: НМЦК
+tenders.fields.procurement.customer: Заказчик

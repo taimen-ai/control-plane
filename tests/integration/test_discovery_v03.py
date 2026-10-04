@@ -339,3 +339,123 @@ async def test_unknown_parameter_is_refused_on_every_listing_not_only_the_queue(
     assert "items" not in response.json()
     locs = [e["loc"] for e in response.json()["error"]["details"]["errors"]]
     assert locs == ["query.projectID"]
+
+
+async def _publish_type(client: httpx.AsyncClient, key: str, type_key: str) -> dict[str, object]:
+    response = await client.post(
+        "/api/v1/task-types",
+        json={"key": type_key, "displayName": type_key.title()},
+        headers=auth(key),
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+async def test_type_key_narrows_the_queue_across_pages_and_versions(
+    client: httpx.AsyncClient,
+) -> None:
+    """CP-ADR-0056 Ж1: the filter is applied before the page, so the cursor walks only it."""
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    _, agent_key = await create_agent_with_key(client, admin_key)
+    await _publish_type(client, admin_key, "chore")
+    await _publish_type(client, admin_key, "errand")
+    old_chore = await create_task(client, admin_key, title="chore v1", typeKey="chore")
+    for n in range(3):
+        await create_task(client, admin_key, title=f"other {n}", priority="critical")
+    errand = await create_task(client, admin_key, title="errand", typeKey="errand")
+    second = await _publish_type(client, admin_key, "chore")
+    assert second["version"] == 2
+    new_chore = await create_task(client, admin_key, title="chore v2", typeKey="chore")
+
+    response = await client.get(
+        "/api/v1/work/available", params={"typeKey": "chore", "limit": 1}, headers=auth(agent_key)
+    )
+    assert response.status_code == 200, response.text
+    first = response.json()
+    assert [t["id"] for t in first["items"]] == [old_chore["id"]]
+    assert first["nextCursor"] is not None
+    # Every version of the key, in the queue order, and nothing else.
+    assert await _available_ids(client, agent_key, typeKey="chore", limit=1) == [
+        old_chore["id"],
+        new_chore["id"],
+    ]
+    # Repeated: either type.
+    assert await _available_ids(client, agent_key, typeKey=["chore", "errand"], limit=1) == [
+        old_chore["id"],
+        errand["id"],
+        new_chore["id"],
+    ]
+    # A key no type carries narrows to nothing, not to everything.
+    assert await _available_ids(client, agent_key, typeKey="nonexistent") == []
+
+
+async def test_type_key_combines_with_workspace_and_assignee(client: httpx.AsyncClient) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    agent, agent_key = await create_agent_with_key(client, admin_key)
+    await _publish_type(client, admin_key, "chore")
+    eng = await create_workspace(client, admin_key, "engineering")
+    backend = await create_workspace(client, admin_key, "backend", parent_id=eng["id"])
+    inside = await create_task(
+        client, admin_key, title="in", typeKey="chore", workspaceId=backend["id"]
+    )
+    mine = await create_task(
+        client,
+        admin_key,
+        title="mine",
+        typeKey="chore",
+        workspaceId=backend["id"],
+        assigneeId=agent["id"],
+    )
+    await create_task(client, admin_key, title="outside", typeKey="chore")
+    await create_task(client, admin_key, title="other type", workspaceId=backend["id"])
+
+    subtree = await _available_ids(
+        client, agent_key, typeKey="chore", workspaceId=eng["id"], includeDescendants="true"
+    )
+    assert subtree == [inside["id"], mine["id"]]
+    assert await _available_ids(
+        client,
+        agent_key,
+        typeKey="chore",
+        workspaceId=eng["id"],
+        includeDescendants="true",
+        assignedToMe="true",
+    ) == [mine["id"]]
+
+
+async def test_type_key_does_not_widen_eligibility(client: httpx.AsyncClient) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    _, agent_key = await create_agent_with_key(client, admin_key, permissions=ORG_AGENT_PERMISSIONS)
+    await _publish_type(client, admin_key, "chore")
+    await create_role(client, admin_key, "sre")
+    gated = await create_task(
+        client, admin_key, title="Needs role", typeKey="chore", requirements={"roles": ["sre"]}
+    )
+    plain = await create_task(client, admin_key, title="Anyone", typeKey="chore")
+    assert await _available_ids(client, agent_key, typeKey="chore") == [plain["id"]]
+    assert gated["id"] not in await _available_ids(client, agent_key)
+
+
+@pytest.mark.parametrize(
+    "type_keys",
+    [
+        pytest.param([""], id="blank"),
+        pytest.param(["  "], id="spaces"),
+        pytest.param([f"t{n}" for n in range(51)], id="too-many"),
+    ],
+)
+async def test_invalid_type_key_is_refused_not_ignored(
+    client: httpx.AsyncClient, type_keys: list[str]
+) -> None:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    await create_task(client, admin_key, title="Somebody's task")
+    response = await client.get(
+        "/api/v1/work/available", params={"typeKey": type_keys}, headers=auth(admin_key)
+    )
+    assert response.status_code == 422, response.text
+    assert "items" not in response.json()
+    assert response.json()["error"]["code"] == "invalid_type_key"

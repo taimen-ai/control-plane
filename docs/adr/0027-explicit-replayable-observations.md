@@ -43,8 +43,8 @@ core lock ordering (команда не трогает session→task→claim→
 ## Дополнение (ADR-0057)
 
 Внешние наблюдения несут `source`, `dedupKey`, `observedAt`, `supersedes`,
-`externalRef`; повтор пары `(source, dedupKey)` в tenant'е возвращает
-существующее наблюдение (`200`) без нового события. Для этого введена
+`externalRef`; повтор пары `(source, dedupKey)` тем же автором в tenant'е
+возвращает существующее наблюдение (`200`) без нового события. Для этого введена
 таблица ключей `observation_dedup_keys`; authoritative записью по-прежнему
 остаётся событие журнала — см. [ADR-0057](0057-external-observation-intake.md).
 

@@ -99,6 +99,24 @@ def test_the_schema_example_is_a_catalog() -> None:
     assert catalog.entries["platform-auth-sdk"].publish is False
 
 
+def test_a_catalog_of_the_layout_with_segments_is_taken() -> None:
+    """``services/``, ``sdk/``, ``apps/`` (TAI-ADR-0064); keys stay what they were."""
+    spec = _example()
+    layout = {
+        "control-plane": "services/control-plane",
+        "memory-service": "services/memory-service",
+        "platform-auth-sdk": "sdk/platform-auth-sdk",
+        "fleet": "services/fleet",
+    }
+    for key, directory in layout.items():
+        spec["repositories"][key]["directory"] = directory
+
+    catalog = RepositoryCatalog.from_spec(spec)
+
+    assert {key: catalog.entries[key].directory for key in layout} == layout
+    assert catalog.resolve("platform-auth-sdk") == catalog.entries["platform-auth-sdk"]
+
+
 @pytest.mark.parametrize(
     ("name", "key"),
     [
@@ -208,6 +226,40 @@ def _broken(change: Any) -> dict[str, Any]:
         (_broken(lambda s: s["repositories"]["fleet"].update(directory="")), "directory"),
         (_broken(lambda s: s["repositories"]["fleet"].update(directory="../up")), "directory"),
         (_broken(lambda s: s["repositories"]["fleet"].update(directory="Fleet")), "directory"),
+        # Paths with segments (TAI-ADR-0064): the rule of $defs.workingCopyPath.
+        *(
+            (
+                _broken(lambda s, d=d: s["repositories"]["fleet"].update(directory=d)),
+                "relative path",
+            )
+            for d in (
+                "services/../fleet",
+                "services//fleet",
+                "services/fleet/",
+                "/services/fleet",
+                "services\\fleet",
+                "services/fleet\n",
+                "services/.fleet",
+            )
+        ),
+        # One clone inside another: by a directory, or by a key without one.
+        (
+            _broken(lambda s: s["repositories"]["fleet"].update(directory="superproject/fleet")),
+            "lies inside",
+        ),
+        (
+            _broken(
+                lambda s: (
+                    s["repositories"]["fleet"].update(directory="services"),
+                    s["repositories"]["skill-sdk"].update(directory="services/skill-sdk"),
+                )
+            ),
+            "lies inside",
+        ),
+        (
+            _broken(lambda s: s["repositories"]["skill-sdk"].update(directory="fleet/skill-sdk")),
+            "lies inside",
+        ),
         (_broken(lambda s: s["repositories"]["fleet"].update(aliases=["a b"])), "aliases"),
         (_broken(lambda s: s["repositories"]["fleet"].update(aliases=[" old"])), "aliases"),
         # The address: https without credentials, query or fragment; one entry each.

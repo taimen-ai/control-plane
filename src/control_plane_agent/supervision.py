@@ -171,18 +171,28 @@ class RunSupervisor:
                 # Never sooner than a finished action would be stopped.
                 stop = max(stop, self.settings.action_max_seconds)
         if stop > 0 and idle >= stop:
+            if warn > 0 and not self._warned:
+                # One late look (a busy host, a machine that slept) can cross
+                # both thresholds at once: the stop still leaves the ``stall``
+                # checkpoint that names the last action, as it would have
+                # had the looks come on time.
+                await self._warn(idle, running, detail)
             return ExecutionStopped(NO_PROGRESS, detail)
         if warn > 0 and idle >= warn and not self._warned:
-            self._warned = True
-            logger.warning(
-                "run %s recorded no action for %ds%s",
-                self.run_id,
-                int(idle),
-                " (the last one is still running)" if running else "",
-            )
-            with contextlib.suppress(ControlPlaneError):
-                await self.client.create_checkpoint(self.run_id, kind=STALL_CHECKPOINT, data=detail)
+            await self._warn(idle, running, detail)
         return None
+
+    async def _warn(self, idle: float, running: bool, detail: dict[str, Any]) -> None:
+        """Leave the one ``stall`` checkpoint of this quiet spell."""
+        self._warned = True
+        logger.warning(
+            "run %s recorded no action for %ds%s",
+            self.run_id,
+            int(idle),
+            " (the last one is still running)" if running else "",
+        )
+        with contextlib.suppress(ControlPlaneError):
+            await self.client.create_checkpoint(self.run_id, kind=STALL_CHECKPOINT, data=detail)
 
     async def _new_actions(self) -> bool:
         """Has the run recorded an action, or finished its last one, since the last look?

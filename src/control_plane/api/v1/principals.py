@@ -1,6 +1,8 @@
 """Principals, API keys and IAM identity bindings."""
 
+import json
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
@@ -13,11 +15,14 @@ from control_plane.api.dependencies import (
     SettingsDep,
     get_iam_enforcement,
 )
+from control_plane.api.etag import format_etag, parse_if_match
 from control_plane.api.v1.schemas import (
     ERROR_RESPONSES,
     ApiKeyCreatedOut,
     ApiKeyCreateRequest,
     ApiKeyOut,
+    ErrorEnvelope,
+    FieldErrorResponse,
     IamBindingOut,
     IamBindingUpsertRequest,
     PageOut,
@@ -26,17 +31,21 @@ from control_plane.api.v1.schemas import (
     PrincipalEnabledOut,
     PrincipalEnableRequest,
     PrincipalOut,
+    PrincipalUpdateRequest,
     dump,
     page_body,
 )
 from control_plane.api.write_flow import execute_write
+from control_plane.application.authorization import authorize
 from control_plane.application.commands import iam_bindings, principal_disable, principal_enable
 from control_plane.application.commands import principals as commands
 from control_plane.application.queries import lists as queries
+from control_plane.domain.enums import Permission
 
 router = APIRouter(tags=["principals"])
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/principals",
     response_model=PrincipalOut,
@@ -71,6 +80,7 @@ async def create_principal(
     )
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.get("/principals", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_principals(
     ctx: AuthDep,
@@ -83,12 +93,120 @@ async def list_principals(
     return JSONResponse(page_body([dump(PrincipalOut, p) for p in page.items], page.next_cursor))
 
 
-@router.get("/principals/{principal_id}", response_model=PrincipalOut, responses=ERROR_RESPONSES)
+_ETAG_HEADER = {"ETag": {"schema": {"type": "string"}, "description": '"principal-<version>"'}}
+
+
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
+@router.get(
+    "/principals/{principal_id}",
+    response_model=PrincipalOut,
+    responses={**ERROR_RESPONSES, 200: {"headers": _ETAG_HEADER}},
+)
 async def get_principal(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     principal = await queries.get_principal(db, ctx, principal_id)
-    return JSONResponse(dump(PrincipalOut, principal))
+    return JSONResponse(
+        dump(PrincipalOut, principal),
+        headers={"ETag": format_etag("principal", principal.version)},
+    )
 
 
+# The route reads its body itself (CP-ADR-0082 §1.4): credential-shaped
+# material is refused before the shape is checked, and neither refusal is
+# the framework's ``400 invalid_request`` that would echo the input. The
+# request body and the If-Match header are documented here instead.
+_UPDATE_BODY_SCHEMA = {
+    key: value
+    for key, value in PrincipalUpdateRequest.model_json_schema(
+        by_alias=True, ref_template="#/components/schemas/{model}"
+    ).items()
+    if key != "$defs"
+}
+_UPDATE_OPENAPI: dict[str, Any] = {
+    "parameters": [
+        {
+            "name": "If-Match",
+            "in": "header",
+            "required": True,
+            "schema": {"type": "string", "examples": ['"principal-3"']},
+        },
+        {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string"},
+        },
+    ],
+    "requestBody": {
+        "required": True,
+        "content": {"application/json": {"schema": _UPDATE_BODY_SCHEMA}},
+    },
+}
+
+
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
+@router.patch(
+    "/principals/{principal_id}",
+    response_model=PrincipalOut,
+    responses={
+        **ERROR_RESPONSES,
+        200: {"headers": _ETAG_HEADER},
+        400: {"model": ErrorEnvelope, "description": "invalid_if_match"},
+        403: {"model": ErrorEnvelope, "description": "permission_denied (principals.write)"},
+        409: {
+            "model": ErrorEnvelope,
+            "description": "version_conflict | principal_managed_by_registry"
+            " | idempotency_key_reused",
+        },
+        422: {
+            "model": FieldErrorResponse,
+            "description": "validation_error | secret_material_rejected"
+            " (details.errors, no field values)",
+        },
+        428: {"model": ErrorEnvelope, "description": "if_match_required"},
+    },
+    summary="Change the display name and profile of a principal",
+    openapi_extra=_UPDATE_OPENAPI,
+)
+async def update_principal(
+    principal_id: uuid.UUID,
+    request: Request,
+    ctx: AuthDep,
+    settings: SettingsDep,
+    session_factory: SessionFactoryDep,
+) -> JSONResponse:
+    await authorize(ctx, Permission.PRINCIPALS_WRITE)
+    expected_version = parse_if_match(request.headers.get("If-Match"), "principal")
+    raw = await request.body()
+    try:
+        body: Any = json.loads(raw)
+    except (ValueError, RecursionError):
+        # Not JSON at all (or nested past the parser) is "the body is not an
+        # object" (path /) to the checks, without an echo of what was sent.
+        body = None
+
+    async def executor(db: AsyncSession) -> tuple[int, dict[str, object]]:
+        principal = await commands.update_principal(
+            db, ctx, principal_id=principal_id, expected_version=expected_version, body=body
+        )
+        return 200, dump(PrincipalOut, principal)
+
+    response = await execute_write(
+        request,
+        ctx,
+        settings,
+        session_factory,
+        canonical_body=f"if-match:{expected_version}\n" + raw.decode("utf-8", "replace"),
+        executor=executor,
+        # Takes the caller with the target principal, in id order.
+        lock_caller_first=False,
+    )
+    if response.status_code == 200:
+        version = json.loads(bytes(response.body))["version"]
+        response.headers["ETag"] = format_etag("principal", version)
+    return response
+
+
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/principals/{principal_id}:disable",
     response_model=PrincipalOut,
@@ -127,6 +245,7 @@ async def disable_principal(
     return response
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/principals/{principal_id}:enable",
     response_model=PrincipalEnabledOut,
@@ -167,6 +286,7 @@ async def enable_principal(
     return response
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/principals/{principal_id}/api-keys",
     response_model=ApiKeyCreatedOut,
@@ -205,6 +325,7 @@ async def create_api_key(
     )
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/api-keys/{api_key_id}:revoke",
     response_model=ApiKeyOut,
@@ -242,6 +363,7 @@ def forget_binding_cache(request: Request, issuer: str, iam_principal_id: uuid.U
         enforcement.bindings.invalidate(issuer, iam_principal_id)
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.get(
     "/principals/{principal_id}/iam-bindings",
     responses=ERROR_RESPONSES,
@@ -252,6 +374,7 @@ async def list_iam_bindings(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) ->
     return JSONResponse({"items": [dump(IamBindingOut, b) for b in bindings]})
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/principals/{principal_id}/iam-bindings",
     response_model=IamBindingOut,
@@ -276,6 +399,12 @@ async def upsert_iam_binding(
             iam_principal_id=payload.iam_principal_id,
             permissions=payload.permissions,
             trusted_issuer=settings.iam_issuer,
+            # Checked by the command after principals.write (CP-ADR-0082 B5).
+            visibility=(
+                payload.visibility
+                if "visibility" in payload.model_fields_set
+                else iam_bindings.VISIBILITY_UNSET
+            ),
         )
         return (201 if result.created else 200), dump(IamBindingOut, result.binding)
 
@@ -291,6 +420,7 @@ async def upsert_iam_binding(
     return response
 
 
+# visibility: tenant — principals, their keys and bindings are objects of the tenant
 @router.post(
     "/iam-bindings/{binding_id}:revoke",
     response_model=IamBindingOut,

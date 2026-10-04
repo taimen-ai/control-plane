@@ -34,7 +34,12 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.authorization import (
+    AuthContext,
+    ResourceRef,
+    authorize,
+    permits_task,
+)
 from control_plane.application.commands.approval_outcomes import (
     spawned_by_of,
     task_view,
@@ -58,6 +63,7 @@ from control_plane.application.context.graph import (
 )
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_principal_key_share
+from control_plane.application.visibility import task_visible
 from control_plane.config import Settings
 from control_plane.domain.context_schema import (
     AS_OF_NOW,
@@ -74,7 +80,7 @@ from control_plane.domain.context_schema import (
     step_profile,
 )
 from control_plane.domain.enums import Permission
-from control_plane.domain.errors import AuthorizationError, DomainError, NotFoundError
+from control_plane.domain.errors import DomainError, NotFoundError
 from control_plane.domain.work_graph import EvidenceKind
 from control_plane.infrastructure.context_provider import ContextProviderError, GraphProvider
 from control_plane.infrastructure.db.engine import transaction
@@ -187,13 +193,11 @@ async def _sources(
     if "spawnedBy" in schema.roots:
         spawned = await spawned_by_of(session, task)
         if spawned is not None:
-            try:
-                await authorize(
-                    ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(spawned.id))
-                )
+            # Of an invisible workspace it is not readable either (CP-ADR-0082 §3.7).
+            if await permits_task(ctx, Permission.TASKS_READ, task=spawned):
                 views["spawnedBy"] = task_view(spawned)
                 owners["spawnedBy"] = spawned
-            except AuthorizationError:
+            else:
                 warnings.append("the task this one was spawned by is not readable")
     artifacts: dict[tuple[str, str], dict[str, Any]] = {}
     wanted = {
@@ -618,11 +622,7 @@ async def _spawned_readable(session: AsyncSession, ctx: AuthContext, task_id: uu
     spawned = await spawned_by_of(session, task) if task is not None else None
     if spawned is None:
         return True
-    try:
-        await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(spawned.id)))
-    except AuthorizationError:
-        return False
-    return True
+    return await permits_task(ctx, Permission.TASKS_READ, task=spawned)
 
 
 def _without(record: dict[str, Any], hidden: set[str]) -> dict[str, Any]:
@@ -672,7 +672,8 @@ async def get_pack_record(
             TaskContextPack.id == pack_id, TaskContextPack.tenant_id == ctx.tenant_id
         )
     )
-    if record is None:
+    # A pack of invisible work answers as a missing pack (CP-ADR-0082 §4).
+    if record is None or not await task_visible(session, ctx, record.task_id):
         raise NotFoundError("Context pack not found", details={"contextPackId": str(pack_id)})
     await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(record.task_id)))
     return await visible_pack_record(session, ctx, record)

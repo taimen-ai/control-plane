@@ -52,7 +52,7 @@ of memory are read from it, memory is never asked.
 import json
 import logging
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -95,6 +95,12 @@ from control_plane.application.event_cursor import EventPosition
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_process_identities
 from control_plane.application.queries.events import JournalEvent, fetch_events_after
+from control_plane.application.queries.package_settings import (
+    History,
+    history,
+    object_scope,
+    snapshot,
+)
 from control_plane.application.queries.recall import (
     ProcessRecallFailed,
     fetch_process_recall,
@@ -115,6 +121,7 @@ from control_plane.domain.errors import (
     ValidationError,
 )
 from control_plane.domain.process_definition import references
+from control_plane.domain.settings_refs import NONE, SETTINGS, SettingsScope
 from control_plane.domain.work_item import WorkItemStatusCategory
 from control_plane.infrastructure.context_provider import GraphProvider
 from control_plane.infrastructure.db.engine import transaction
@@ -146,7 +153,9 @@ EXTERNAL_TYPE = "process_step"
 MAX_FOLLOW_UPS = 20
 # Checked definitions kept compiled, by version id (versions never change).
 _DEFINITION_CACHE_SIZE = 128
-_definitions: dict[uuid.UUID, engine.Definition] = {}
+_definitions: dict[tuple[uuid.UUID, str | None, int | None], engine.Definition] = {}
+# Whether a version names ``settings`` anywhere, by version id: one that does not reads none.
+_mentions: dict[uuid.UUID, bool] = {}
 _calendars: dict[uuid.UUID, Calendar] = {}
 
 # Intents that open work the engine then waits for: their refusal is an input.
@@ -184,12 +193,40 @@ _SKILL_ENDS = (
 # --- definitions, calendars, identity ------------------------------------------------
 
 
-async def definition_of(session: AsyncSession, row: ProcessDefinition) -> engine.Definition:
-    """The version compiled for the engine; a version is checked once per worker."""
-    cached = _definitions.get(row.id)
+async def settings_scope(session: AsyncSession, row: ProcessDefinition) -> SettingsScope:
+    """The settings ``settings`` of a version is typed by: the active revision of its package.
+
+    A version that does not name ``settings`` anywhere reads none: no lookup.
+    """
+    mentions = _mentions.get(row.id)
+    if mentions is None:
+        mentions = SETTINGS in json.dumps(row.spec)
+        if len(_mentions) >= _DEFINITION_CACHE_SIZE:
+            _mentions.pop(next(iter(_mentions)))
+        _mentions[row.id] = mentions
+    if not mentions:
+        return NONE
+    return await object_scope(session, row.tenant_id, PROCESS, row.key)
+
+
+async def definition_of(
+    session: AsyncSession, row: ProcessDefinition, scope: SettingsScope | None = None
+) -> engine.Definition:
+    """The version compiled for the engine; a version is checked once per worker.
+
+    ``scope`` — the revision of the settings schema ``settings`` is typed by
+    (CP-ADR-0081 §6): a step the one it reads, a replay the one a record
+    names; ``None`` — the active one. One compilation per version and revision.
+    """
+    if scope is None:
+        scope = await settings_scope(session, row)
+    cache_key = (row.id, scope.package, scope.revision)
+    cached = _definitions.get(cache_key)
     if cached is not None:
         return cached
-    catalog = await load_catalog(session, row.tenant_id, row.key, row.spec, None, retired=False)
+    catalog = await load_catalog(
+        session, row.tenant_id, row.key, row.spec, None, retired=False, settings=scope
+    )
     # A calendar that dropped its working hours after publication fails the
     # due it counts (process.sla_failed, CP-ADR-0078 §3), not the version.
     catalog = replace(catalog, calendars_with_hours=None)
@@ -222,7 +259,7 @@ async def definition_of(session: AsyncSession, row: ProcessDefinition) -> engine
         ) from exc
     if len(_definitions) >= _DEFINITION_CACHE_SIZE:
         _definitions.pop(next(iter(_definitions)))
-    _definitions[row.id] = definition
+    _definitions[cache_key] = definition
     return definition
 
 
@@ -406,7 +443,10 @@ async def take(
     )
     if taken:
         return False
-    definition = await definition_of(session, row)
+    # The settings are read once a step, in its transaction (CP-ADR-0081 §6).
+    scope = await settings_scope(session, row)
+    definition = await definition_of(session, row, scope)
+    seen = await snapshot(session, row.tenant_id, scope) if definition.reads_settings else None
     acting = await _acting(session, row, instance.id, trace_run_id)
     pending: list[tuple[str, Mapping[str, Any], str]] = [(kind, body, source_ref)]
     follow_ups = 0
@@ -419,6 +459,7 @@ async def take(
             body,
             str(actor_id) if actor_id else None,
             calendars,
+            settings=seen.values if seen is not None else None,
         )
         before = instance.state or None
         state, decisions, intents = engine.step(definition, before, given)
@@ -436,6 +477,8 @@ async def take(
             decisions=[decision.out() for decision in decisions],
             intents=[],
             calendars=versions,
+            settings_version=seen.version if seen is not None else None,
+            settings_schema_revision=seen.revision if seen is not None else None,
             created_at=utcnow(),
         )
         executor = _Executor(session, instance, row, acting, state, given.at, current=record)
@@ -694,7 +737,7 @@ class _Executor:
                         extra={
                             "instance_id": str(self.instance.id),
                             "intent": intent.kind,
-                            "code": exc.code,
+                            "error_code": exc.code,
                         },
                     )
             results.append(result)
@@ -986,6 +1029,10 @@ class _Executor:
             requirements=RequirementSpec(roles=roles) if roles else None,
             origin={"kind": "process", "ref": ref},
             assignee_field="assign",
+            # Filled from the case (CP-ADR-0074 §7, amendment 2026-10-01) and
+            # checked against the type's fieldSchema: a misfit is
+            # custom_fields_invalid, the intent fails.
+            custom_fields=dict(body.get("customFields") or {}) or None,
         )
         if body.get("context"):
             # The step's profile replaces the type's (CP-ADR-0076 §6).
@@ -1584,7 +1631,11 @@ async def get_instance(
     if for_update:
         stmt = stmt.with_for_update()
     instance: ProcessInstance | None = await session.scalar(stmt)
-    if instance is None:
+    # A workspace outside the caller's visibility answers exactly as a missing
+    # row, never as a missing workspace (CP-ADR-0082 §3.7).
+    if instance is None or (
+        instance.workspace_id is not None and not ctx.sees_workspace(instance.workspace_id)
+    ):
         raise NotFoundError("Process instance not found", details={"instanceId": str(instance_id)})
     if instance.workspace_id is not None:
         await authorize(ctx, permission, resource=process_scope(instance.workspace_id))
@@ -1789,6 +1840,8 @@ def journal_entries(row: ProcessInstanceEvent) -> list[dict[str, Any]]:
         calendars=row.calendars,
         decisions=row.decisions,
         intents=row.intents,
+        settings_version=row.settings_version,
+        settings_schema_revision=row.settings_schema_revision,
     )
 
 
@@ -1937,6 +1990,14 @@ async def _published(session: AsyncSession, tenant_id: uuid.UUID) -> list[_Proce
             continue
         out.append(_Process(row, definition, since, row.key in retired))
     return out
+
+
+async def _routing_settings(session: AsyncSession, process: _Process) -> dict[str, Any] | None:
+    """The settings a ``where`` or a key of a trigger reads, when the process reads them."""
+    if not process.definition.reads_settings:
+        return None
+    seen = await snapshot(session, process.row.tenant_id, process.definition.settings)
+    return seen.values if seen is not None else {}
 
 
 def _own(instance: ProcessInstance, event: JournalEvent) -> bool:
@@ -2164,8 +2225,9 @@ async def _deliver_triggers(
     for process in processes:
         if event.occurred_at < process.since or _outside_workspace(process.row, event):
             continue
-        started = engine.start_key(process.definition, document)
-        keys = engine.correlation_keys(process.definition, document)
+        settings = await _routing_settings(session, process)
+        started = engine.start_key(process.definition, document, settings)
+        keys = engine.correlation_keys(process.definition, document, settings)
         # A retired process starts nothing; the start event of an existing key
         # still reaches its instance, like a correlation.
         if (
@@ -2275,7 +2337,7 @@ async def process_tenant_events(
         except DomainError as exc:
             logger.warning(
                 "process input refused",
-                extra={"event_id": str(event.id), "code": exc.code, "tenant": str(tenant_id)},
+                extra={"event_id": str(event.id), "error_code": exc.code, "tenant": str(tenant_id)},
             )
     last = events[-1]
     cursor.tx_id = last.tx_id
@@ -2561,6 +2623,8 @@ async def journal_records(session: AsyncSession, instance_id: uuid.UUID) -> list
             "decisions": row.decisions,
             "intents": row.intents,
             "calendars": row.calendars,
+            "settingsVersion": row.settings_version,
+            "settingsSchemaRevision": row.settings_schema_revision,
         }
         for row in rows
     ]
@@ -2587,6 +2651,42 @@ async def journal_calendars(
     return calendars
 
 
+def settings_pairs(entries: Sequence[Mapping[str, Any]]) -> list[tuple[int, int]]:
+    """The pairs ``(version, schema revision)`` the records of a journal name."""
+    return [
+        (int(e["settingsVersion"]), int(e["settingsSchemaRevision"]))
+        for e in entries
+        if e.get("settingsVersion") is not None and e.get("settingsSchemaRevision") is not None
+    ]
+
+
+async def journal_settings(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    definition: engine.Definition,
+    entries: Sequence[Mapping[str, Any]],
+) -> History:
+    """The saved versions and schema revisions the records of a journal name (CP-ADR-0081 §6).
+
+    The package is the one of the version run: ``settings`` of its records are its settings.
+    """
+    return await history(session, tenant_id, definition.settings.package, settings_pairs(entries))
+
+
+async def revisions_of(
+    entries: Sequence[Mapping[str, Any]],
+    typed: Callable[[int], Awaitable[engine.Definition | None]],
+) -> dict[int, engine.Definition]:
+    """The definition typed by each schema revision the records name, as a replay asks them."""
+    out: dict[int, engine.Definition] = {}
+    for _, revision in settings_pairs(entries):
+        if revision not in out:
+            found = await typed(revision)
+            if found is not None:
+                out[revision] = found
+    return out
+
+
 async def replay_instance(
     session: AsyncSession, instance: ProcessInstance
 ) -> process_replay.Replay:
@@ -2601,7 +2701,24 @@ async def replay_instance(
     definition = await definition_of(session, row)
     entries = await journal_records(session, instance.id)
     calendars = await journal_calendars(session, instance.tenant_id, entries)
-    result = process_replay.replay(definition, entries, calendars)
+    settings = await journal_settings(session, instance.tenant_id, definition, entries)
+
+    async def typed(revision: int) -> engine.Definition | None:
+        scope = settings.scope(revision)
+        if scope is None:
+            return None
+        try:
+            return await definition_of(session, row, scope)
+        except ConflictError:
+            return None  # the version does not pass with that revision: its own types
+
+    result = process_replay.replay(
+        definition,
+        entries,
+        calendars,
+        settings=settings.values,
+        definitions=await revisions_of(entries, typed),
+    )
     if not result.discrepancies and result.state != (instance.state or None):
         result.discrepancies.append(
             process_replay.Discrepancy(len(entries), "state", instance.state, result.state)

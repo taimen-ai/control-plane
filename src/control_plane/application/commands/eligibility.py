@@ -67,7 +67,7 @@ def parse_skill_ref(ref: str) -> tuple[str, str | None]:
     return name, version
 
 
-async def _resolve_role(
+async def resolve_role(
     session: AsyncSession,
     ctx: AuthContext,
     slug: str,
@@ -118,7 +118,7 @@ async def set_task_requirements(
     now = utcnow()
 
     for slug in dict.fromkeys(spec.roles):  # de-dup, keep order
-        role = await _resolve_role(session, ctx, slug, scope_ids)
+        role = await resolve_role(session, ctx, slug, scope_ids)
         session.add(
             TaskRequirement(
                 id=new_uuid(),

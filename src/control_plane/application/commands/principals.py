@@ -12,19 +12,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.locking import lock_caller_and_principal_for_update
 from control_plane.domain.enums import (
     ALL_PERMISSIONS,
+    AgentStatus,
     Permission,
     PrincipalKind,
     PrincipalStatus,
 )
 from control_plane.domain.errors import (
     AuthorizationError,
+    ConflictError,
     NotFoundError,
     ValidationError,
 )
+from control_plane.domain.principal_profile import changed_fields, parse_update
 from control_plane.infrastructure.auth.api_keys import GeneratedKey, generate_api_key
-from control_plane.infrastructure.db.models import ApiKey, Principal
+from control_plane.infrastructure.db.models import Agent, ApiKey, Principal
 
 
 def ungranted_permissions(ctx: AuthContext, permissions: Iterable[str]) -> list[str]:
@@ -94,6 +98,90 @@ async def create_principal(
         correlation_id=ctx.correlation_id,
         trace_run_id=ctx.trace_run_id,
         payload={"kind": kind, "displayName": principal.display_name},
+    )
+    return principal
+
+
+async def update_principal(
+    session: AsyncSession,
+    ctx: AuthContext,
+    *,
+    principal_id: uuid.UUID,
+    expected_version: int,
+    body: Any,
+) -> Principal:
+    """``PATCH /principals/{id}``: the display name and the profile (CP-ADR-0082 §1).
+
+    ``body`` is the request body as sent: it is checked here, after the
+    principal is found, in the order of §1.4 — credential-shaped material,
+    then the shape, then the agent registry, then the version. The route has
+    already checked the permission and the form of ``If-Match``.
+    """
+    await authorize(ctx, Permission.PRINCIPALS_WRITE)
+    # FOR UPDATE on the target, taken with the caller in id order like
+    # ``:disable``: two concurrent PATCHes of one version meet here and the
+    # second one reads the version the first one wrote.
+    principal = await lock_caller_and_principal_for_update(session, ctx, principal_id)
+    if principal is None:
+        raise NotFoundError("Principal not found", details={"principalId": str(principal_id)})
+    update = parse_update(body)
+
+    agent_key = await session.scalar(
+        select(Agent.key).where(
+            Agent.tenant_id == ctx.tenant_id,
+            Agent.principal_id == principal.id,
+            Agent.status != AgentStatus.RETIRED,
+        )
+    )
+    if agent_key is not None:
+        # Its name comes from the agent revision (CP-ADR-0073): an edit past
+        # the registry would be overwritten by the next publication.
+        raise ConflictError(
+            "principal_managed_by_registry",
+            "The principal of a registered agent is changed by publishing the agent",
+            details={"principalId": str(principal.id), "agent": agent_key},
+        )
+    if principal.version != expected_version:
+        raise ConflictError(
+            "version_conflict",
+            "Principal version does not match If-Match",
+            details={
+                "principalId": str(principal.id),
+                "expectedVersion": expected_version,
+                "currentVersion": principal.version,
+            },
+        )
+
+    changes = changed_fields(
+        display_name=principal.display_name, profile=principal.profile, update=update
+    )
+    if not changes:
+        return principal
+    if update.display_name is not None:
+        principal.display_name = update.display_name
+    if update.profile is not None:
+        principal.profile = update.profile
+    principal.version += 1
+    principal.updated_at = utcnow()
+    await session.flush()
+
+    # Names of the fields, never their values: the journal, memory and
+    # subscribers read this event, and a person's email is not their data.
+    await record_event(
+        session,
+        tenant_id=ctx.tenant_id,
+        event_type="principal.updated",
+        entity_type="principal",
+        entity_id=principal.id,
+        actor_id=ctx.principal_id,
+        request_id=ctx.request_id,
+        correlation_id=ctx.correlation_id,
+        trace_run_id=ctx.trace_run_id,
+        payload={
+            "principalId": str(principal.id),
+            "version": principal.version,
+            "changes": changes,
+        },
     )
     return principal
 

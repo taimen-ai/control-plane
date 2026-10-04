@@ -15,7 +15,9 @@ from control_plane.domain.work_rules import (
     ConditionError,
     VarPath,
     action_roots,
+    author_matches,
     evaluate,
+    has_author_filter,
     normalize_action,
     normalize_condition,
     normalize_interpretation,
@@ -225,7 +227,7 @@ def test_actions() -> None:
     assert per_item["forEach"] == "skill.output.results"
     assert normalize_action(
         {"kind": "cancel_work", "dedupKeyTemplate": "k"}, interpreted=False
-    ) == {"kind": "cancel_work", "dedupKeyTemplate": "k", "fields": {}}
+    ) == {"kind": "cancel_work", "dedupKeyTemplate": "k"}
     cases: list[tuple[dict[str, Any], bool]] = [
         ({**ENSURE, "kind": "delete_everything"}, False),
         ({**ENSURE, "taskType": None}, False),
@@ -287,7 +289,7 @@ def test_rule_roots_names_what_a_rule_reads() -> None:
 def test_complete_work_takes_a_check_and_no_fields() -> None:
     assert normalize_action(
         {"kind": "complete_work", "dedupKeyTemplate": "k"}, interpreted=False
-    ) == {"kind": "complete_work", "dedupKeyTemplate": "k", "fields": {}}
+    ) == {"kind": "complete_work", "dedupKeyTemplate": "k"}
     assert (
         normalize_action(
             {"kind": "complete_work", "dedupKeyTemplate": "k", "check": "{{payload.data.check}}"},
@@ -375,9 +377,12 @@ def test_a_scheduled_rule_that_completes_work_must_have_a_fact_to_cite() -> None
         normalize_rule_spec(trigger=schedule, condition=None, interpretation=None, action=complete)
     assert exc.value.code == "invalid_rule"
     cancel = {"kind": "cancel_work", "dedupKeyTemplate": "k"}
-    assert normalize_rule_spec(
-        trigger=schedule, condition=None, interpretation=None, action=cancel
-    ).action == {**cancel, "fields": {}}
+    assert (
+        normalize_rule_spec(
+            trigger=schedule, condition=None, interpretation=None, action=cancel
+        ).action
+        == cancel
+    )
 
 
 def test_rule_roots_include_acceptance_and_check_templates() -> None:
@@ -459,3 +464,248 @@ def test_rule_roots_include_custom_field_templates() -> None:
         action={**ENSURE, "fields": {"title": "t", "customFields": {"g": "{{goal.id}}"}}},
     )
     assert "goal" in roots
+
+
+# --- amendment integrations-connections: target: task (Zh1/Zh2) -----------------
+
+OBSERVED = {"kind": "observation", "type": "sample.closed", "agent": "sample-observer"}
+BOUND = {"kind": "complete_work", "target": "task", "taskTypes": ["sample-review"]}
+
+
+@pytest.mark.parametrize("kind", ["complete_work", "cancel_work"])
+def test_a_closing_action_may_close_the_task_its_observation_is_bound_to(kind: str) -> None:
+    action = {**BOUND, "kind": kind}
+    assert normalize_action(action, interpreted=False) == action
+    spec = normalize_rule_spec(trigger=OBSERVED, condition=None, interpretation=None, action=action)
+    # No key: the fact names the work (Zh2).
+    assert "dedupKeyTemplate" not in spec.action
+    assert rule_roots(condition=True, interpretation=None, action=spec.action) == frozenset()
+
+
+def test_target_dedup_is_the_default_behaviour_spelled_out() -> None:
+    action = {"kind": "cancel_work", "target": "dedup", "dedupKeyTemplate": "k"}
+    assert normalize_action(action, interpreted=False) == action
+
+
+def test_complete_work_on_the_bound_task_takes_its_check() -> None:
+    action = normalize_action({**BOUND, "check": "closed-in-crm"}, interpreted=False)
+    assert action["check"] == "closed-in-crm"
+
+
+@pytest.mark.parametrize(
+    ("action", "field"),
+    [
+        ({**BOUND, "target": "anything"}, "action.target"),
+        ({**BOUND, "target": None}, "action.taskTypes"),
+        ({**BOUND, "target": 1}, "action.target"),
+        ({**ENSURE, "target": "task"}, "action.target"),
+        ({"kind": "update_work", "target": "dedup", "dedupKeyTemplate": "k"}, "action.target"),
+        ({"kind": "complete_work", "target": "task"}, "action.taskTypes"),
+        ({**BOUND, "taskTypes": []}, "action.taskTypes"),
+        ({**BOUND, "taskTypes": None}, "action.taskTypes"),
+        ({**BOUND, "taskTypes": ["a", "a"]}, "action.taskTypes"),
+        ({**BOUND, "taskTypes": ["Not A Key"]}, "action.taskTypes[0]"),
+        ({**BOUND, "taskTypes": [f"t{i}" for i in range(21)]}, "action.taskTypes"),
+        ({**BOUND, "dedupKeyTemplate": "k"}, "action.dedupKeyTemplate"),
+        ({**BOUND, "forEach": "payload.data.items"}, "action.forEach"),
+        ({**BOUND, "where": True}, "action.where"),
+        ({**BOUND, "fields": {"title": "x"}}, "action.fields"),
+        ({**BOUND, "kind": "cancel_work", "check": "ci"}, "action.check"),
+        # taskTypes of a closing action bound by its key: as before (G2).
+        ({"kind": "cancel_work", "dedupKeyTemplate": "k", "taskTypes": ["a"]}, "action.taskTypes"),
+        (
+            {
+                "kind": "complete_work",
+                "target": "dedup",
+                "dedupKeyTemplate": "k",
+                "taskTypes": ["a"],
+            },
+            "action.taskTypes",
+        ),
+    ],
+)
+def test_target_task_is_refused_in_the_wrong_form(action: dict[str, Any], field: str) -> None:
+    with pytest.raises(ValidationError) as exc:
+        normalize_action(action, interpreted=False)
+    assert exc.value.code == "invalid_rule_action", action
+    assert exc.value.details["field"] == field
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        {"kind": "event", "type": "task.completed"},
+        {"kind": "schedule", "type": "interval", "everySeconds": 3600},
+    ],
+)
+def test_only_an_observation_binds_the_task_a_rule_closes(trigger: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError) as exc:
+        normalize_rule_spec(
+            trigger=trigger,
+            condition=None,
+            interpretation={"skill": "check@1", "inputs": {}},
+            action=BOUND,
+        )
+    assert exc.value.code == "invalid_rule_action"
+    assert exc.value.details["field"] == "action.target"
+
+
+# --- amendment Zh6: the author of the facts a rule trusts -------------------------
+
+ACTOR = "5f1c7a52-0d0e-4f7b-9d1e-2b0c3a4d5e6f"
+
+
+@pytest.mark.parametrize(
+    ("extra", "normalized"),
+    [
+        ({"agent": "sample-observer"}, {"agent": "sample-observer"}),
+        ({"actorId": ACTOR.upper()}, {"actorId": ACTOR}),
+        (
+            {"agent": "sample-observer", "actorId": ACTOR, "source": "crm"},
+            {"agent": "sample-observer", "actorId": ACTOR, "source": "crm"},
+        ),
+        ({"agent": None, "actorId": None}, {}),
+    ],
+)
+def test_an_observation_trigger_may_name_its_author(
+    extra: dict[str, Any], normalized: dict[str, Any]
+) -> None:
+    trigger = {"kind": "observation", "type": "sample.closed", **extra}
+    assert normalize_trigger(trigger) == {
+        "kind": "observation",
+        "type": "sample.closed",
+        **normalized,
+    }
+
+
+@pytest.mark.parametrize(
+    ("extra", "field"),
+    [
+        ({"agent": ""}, "trigger.agent"),
+        ({"agent": "Sample"}, "trigger.agent"),
+        ({"agent": "a.b"}, "trigger.agent"),
+        ({"agent": ["sample"]}, "trigger.agent"),
+        ({"agent": True}, "trigger.agent"),
+        ({"actorId": ""}, "trigger.actorId"),
+        ({"actorId": "nobody"}, "trigger.actorId"),
+        ({"actorId": 42}, "trigger.actorId"),
+        ({"actorId": {"id": ACTOR}}, "trigger.actorId"),
+    ],
+)
+def test_a_malformed_author_is_refused(extra: dict[str, Any], field: str) -> None:
+    with pytest.raises(ValidationError) as exc:
+        normalize_trigger({"kind": "observation", "type": "sample.closed", **extra})
+    assert exc.value.code == "invalid_rule_trigger"
+    assert exc.value.details["field"] == field
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        {"kind": "event", "type": "task.completed", "actorId": ACTOR},
+        {"kind": "schedule", "type": "interval", "everySeconds": 60, "agent": "a"},
+    ],
+)
+def test_only_an_observation_trigger_names_an_author(trigger: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError) as exc:
+        normalize_trigger(trigger)
+    assert exc.value.code == "invalid_rule_trigger"
+
+
+@pytest.mark.parametrize("kind", ["complete_work", "cancel_work"])
+def test_a_bound_rule_without_an_author_is_refused(kind: str) -> None:
+    for trigger in (
+        {"kind": "observation", "type": "sample.closed"},
+        {"kind": "observation", "type": "sample.closed", "source": "crm"},
+    ):
+        with pytest.raises(ValidationError) as exc:
+            normalize_rule_spec(
+                trigger=trigger, condition=None, interpretation=None, action={**BOUND, "kind": kind}
+            )
+        assert exc.value.code == "invalid_rule_trigger"
+        assert exc.value.details["field"] == "trigger.agent"
+
+
+def test_a_rule_closing_by_its_key_needs_no_author() -> None:
+    spec = normalize_rule_spec(
+        trigger={"kind": "observation", "type": "sample.closed"},
+        condition=None,
+        interpretation=None,
+        action={"kind": "cancel_work", "dedupKeyTemplate": "k"},
+    )
+    assert not has_author_filter(spec.trigger)
+
+
+OTHER = "0b7e3f7a-3c55-4c29-8a3f-5d2c1e0f9a8b"
+AGENTS = {"sample-observer": ACTOR}
+
+
+@pytest.mark.parametrize(
+    ("trigger", "actor", "matches"),
+    [
+        ({}, None, True),
+        ({}, OTHER, True),
+        ({"actorId": ACTOR}, ACTOR, True),
+        ({"actorId": ACTOR}, OTHER, False),
+        ({"actorId": ACTOR}, None, False),
+        ({"agent": "sample-observer"}, ACTOR, True),
+        ({"agent": "sample-observer"}, OTHER, False),
+        ({"agent": "sample-observer"}, None, False),
+        # An agent without a principal (unlinked, retired, unknown) wrote nothing.
+        ({"agent": "sample-unlinked"}, ACTOR, False),
+        ({"agent": "sample-unlinked"}, None, False),
+        ({"agent": "sample-observer", "actorId": ACTOR}, ACTOR, True),
+        ({"agent": "sample-observer", "actorId": OTHER}, ACTOR, False),
+    ],
+)
+def test_the_author_filter(trigger: dict[str, Any], actor: str | None, matches: bool) -> None:
+    assert author_matches(trigger, actor, AGENTS) is matches
+
+
+# --- amendment TASK-001373: the canonical form has no empty fields (Z1) -------------------
+
+PER_ITEM_CLOSING = {
+    "kind": "complete_work",
+    "forEach": "skill.output.current",
+    "dedupKeyTemplate": "sample-check:{{item.component}}",
+}
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        PER_ITEM_CLOSING,
+        {**PER_ITEM_CLOSING, "kind": "cancel_work"},
+        {**BOUND, "check": "closed-outside"},
+        {"kind": "update_work", "dedupKeyTemplate": "k"},
+        {"kind": "update_work", "dedupKeyTemplate": "k", "fields": {"priority": "high"}},
+        {**ENSURE, "fields": {"title": "{{payload.title}}"}},
+    ],
+)
+def test_an_action_as_written_is_its_canonical_form(action: dict[str, Any]) -> None:
+    interpretation = {"skill": "sample.check@1", "inputs": {}}
+    spec = normalize_rule_spec(
+        trigger=OBSERVED, condition=None, interpretation=interpretation, action=action
+    )
+    assert spec.action == action
+    # Stored and normalized again (a PATCH of the stored form): the same document.
+    again = normalize_rule_spec(
+        trigger=OBSERVED, condition=None, interpretation=interpretation, action=spec.action
+    )
+    assert again.action == spec.action
+
+
+@pytest.mark.parametrize("kind", ["complete_work", "cancel_work", "update_work"])
+def test_empty_fields_are_no_member(kind: str) -> None:
+    action = {"kind": kind, "dedupKeyTemplate": "k"}
+    assert normalize_action({**action, "fields": {}}, interpreted=False) == action
+
+
+@pytest.mark.parametrize("fields", [None, [], "title", 0])
+def test_fields_that_are_not_an_object_are_still_refused(fields: Any) -> None:
+    with pytest.raises(ValidationError) as exc:
+        normalize_action(
+            {"kind": "complete_work", "dedupKeyTemplate": "k", "fields": fields},
+            interpreted=False,
+        )
+    assert exc.value.details["field"] == "action.fields"

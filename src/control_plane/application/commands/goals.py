@@ -11,13 +11,19 @@ may serve, and checking that evidence names facts that exist in this tenant.
 import uuid
 from typing import Any
 
-from sqlalchemy import select, union
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.authorization import (
+    AuthContext,
+    ResourceRef,
+    WorkspaceNotVisible,
+    authorize,
+)
 from control_plane.application.commands.principals import get_tenant_principal
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.visibility import artifact_condition, task_condition
 from control_plane.domain.enums import Permission, PrincipalKind
 from control_plane.domain.errors import (
     AuthorizationError,
@@ -39,8 +45,6 @@ from control_plane.domain.work_graph import (
 )
 from control_plane.infrastructure.db.models import (
     Artifact,
-    Event,
-    EventArchive,
     Goal,
     TaskContextPack,
 )
@@ -320,7 +324,11 @@ async def get_tenant_goal(
     if for_update:
         stmt = stmt.with_for_update()
     goal = await session.scalar(stmt)
-    if goal is None:
+    # A workspace outside the caller's visibility answers exactly as a missing
+    # row, never as a missing workspace (CP-ADR-0082 §3.7).
+    if goal is None or (
+        goal.workspace_id is not None and not ctx.sees_workspace(goal.workspace_id)
+    ):
         raise NotFoundError("Goal not found", details={"goalId": str(goal_id)})
     return goal
 
@@ -346,7 +354,7 @@ async def get_readable_goal(session: AsyncSession, ctx: AuthContext, goal_id: uu
     goal = await get_tenant_goal(session, ctx, goal_id)
     try:
         await authorize(ctx, Permission.GOALS_READ, resource=goal_scope(goal.workspace_id))
-    except AuthorizationError:
+    except (AuthorizationError, WorkspaceNotVisible):
         raise NotFoundError("Goal not found", details={"goalId": str(goal_id)}) from None
     return goal
 
@@ -380,25 +388,20 @@ async def require_linkable_goal(
 async def verify_evidence(
     session: AsyncSession, ctx: AuthContext, *documents: list[dict[str, Any]]
 ) -> None:
-    """Every observation, artifact and context pack named by evidence exists in this tenant.
+    """Every observation, artifact and context pack named by evidence exists in this tenant
+    and is visible to the caller.
 
-    Unknown and foreign ids are the same ``404``: evidence is a reference, and
-    a reference into another tenant would both be false and confirm that the
-    id exists there. Observations are journal events, possibly archived
-    (ADR-0038), so both tables are searched.
+    Unknown, foreign and invisible ids are the same ``404``: evidence is a
+    reference, and a reference into another tenant or an invisible workspace
+    would both be false and confirm that the id exists there (CP-ADR-0082
+    V6). Observations are journal events, possibly archived (ADR-0038), so
+    both tables are searched.
     """
     observation_ids, artifact_ids = evidence_targets(*documents)
     if observation_ids:
+        from control_plane.application.queries.events import recorded_observations
 
-        def recorded(table: type[Event] | type[EventArchive]) -> Any:
-            return select(table.entity_id).where(
-                table.tenant_id == ctx.tenant_id,
-                table.entity_type == "observation",
-                table.event_type == "observation.recorded",
-                table.entity_id.in_(observation_ids),
-            )
-
-        seen = set((await session.scalars(union(recorded(Event), recorded(EventArchive)))).all())
+        seen = await recorded_observations(session, ctx, set(observation_ids))
         missing = sorted(str(i) for i in observation_ids - seen)
         if missing:
             raise NotFoundError(
@@ -409,7 +412,9 @@ async def verify_evidence(
             (
                 await session.scalars(
                     select(Artifact.id).where(
-                        Artifact.tenant_id == ctx.tenant_id, Artifact.id.in_(artifact_ids)
+                        Artifact.tenant_id == ctx.tenant_id,
+                        Artifact.id.in_(artifact_ids),
+                        artifact_condition(ctx),
                     )
                 )
             ).all()
@@ -425,6 +430,7 @@ async def verify_evidence(
                     select(TaskContextPack.id).where(
                         TaskContextPack.tenant_id == ctx.tenant_id,
                         TaskContextPack.id.in_(pack_ids),
+                        task_condition(ctx, TaskContextPack.task_id),
                     )
                 )
             ).all()

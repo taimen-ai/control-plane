@@ -1,0 +1,830 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Screens of a package: spec of the kinds View and Component",
+  "$comment": "TAI-ADR-0066, CP-ADR-0080. The core holds this file; package-sdk keeps a byte copy. Every string a person sees is a key of the package dictionaries (i18n/<locale>.yaml), not a text.",
+  "$defs": {
+    "viewSpec": {
+      "type": "object",
+      "required": [
+        "title",
+        "source",
+        "layout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "blocks": {
+          "const": 1,
+          "description": "Version of the set of blocks the layout is written in"
+        },
+        "title": {
+          "$ref": "#/$defs/messageKey"
+        },
+        "description": {
+          "$ref": "#/$defs/messageKey"
+        },
+        "nav": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "group": {
+              "enum": [
+                "work",
+                "knowledge",
+                "packages"
+              ],
+              "description": "A group of the console menu (a closed list, not a key of the dictionaries); none: packages"
+            },
+            "icon": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+            },
+            "order": {
+              "type": "integer",
+              "minimum": -10000,
+              "maximum": 10000
+            }
+          }
+        },
+        "audience": {
+          "type": "object",
+          "required": [
+            "roles"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "roles": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 50,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/slug"
+              },
+              "description": "Roles of the organization (slugs): a holder of one of them sees the view"
+            }
+          }
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "params": {
+          "$ref": "#/$defs/params"
+        },
+        "layout": {
+          "$ref": "#/$defs/layout"
+        }
+      }
+    },
+    "componentSpec": {
+      "type": "object",
+      "required": [
+        "layout"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "$ref": "#/$defs/messageKey"
+        },
+        "params": {
+          "$ref": "#/$defs/componentParams"
+        },
+        "layout": {
+          "$ref": "#/$defs/layout"
+        }
+      },
+      "$comment": "A component is a description (TAI-ADR-0066 p.7.1): blocks of the same set with typed params, inlined into the view that names it and given its params with `with`. Components with code (p.7.2) do not exist: the field code is refused."
+    },
+    "source": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "process": {
+          "$ref": "#/$defs/key"
+        },
+        "filter": {
+          "$ref": "#/$defs/expression"
+        },
+        "instance": {
+          "type": "string",
+          "pattern": "^param\\.[A-Za-z_][A-Za-z0-9_]{0,63}$"
+        },
+        "tasks": {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "$ref": "#/$defs/key"
+            }
+          }
+        },
+        "knowledge": {
+          "type": "object",
+          "required": [
+            "kinds"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kinds": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/kind"
+              }
+            }
+          }
+        }
+      },
+      "description": "Exactly one of {process, filter?}, {process, instance: param.<name>}, {tasks: {type}}, {knowledge: {kinds}}"
+    },
+    "param": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "date",
+            "datetime",
+            "uuid"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "params": {
+      "type": "object",
+      "maxProperties": 20,
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/param"
+      }
+    },
+    "layout": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/block"
+      }
+    },
+    "block": {
+      "type": "object",
+      "required": [
+        "block"
+      ],
+      "properties": {
+        "block": {
+          "enum": [
+            "table",
+            "board",
+            "list",
+            "header",
+            "fields",
+            "timeline",
+            "artifacts",
+            "related",
+            "metrics",
+            "chart",
+            "steps",
+            "invoke",
+            "component"
+          ]
+        }
+      },
+      "description": "A block of the closed set of version 1 (TAI-ADR-0066 p.2), named by the key block",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "enum": [
+                  "table",
+                  "list"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "columns"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "columns": {
+                "$ref": "#/$defs/columns"
+              },
+              "open": {
+                "$ref": "#/$defs/open"
+              },
+              "filters": {
+                "$ref": "#/$defs/paths"
+              },
+              "sort": {
+                "$ref": "#/$defs/sort"
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "board"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "columns",
+              "card"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "columns": {
+                "const": "stages",
+                "description": "A column per stage of the process, in its order"
+              },
+              "card": {
+                "$ref": "#/$defs/card"
+              },
+              "open": {
+                "$ref": "#/$defs/open"
+              },
+              "filters": {
+                "$ref": "#/$defs/paths"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "header"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "title"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/path",
+                "description": "Path of the source the title of the record shows"
+              },
+              "status": {
+                "$ref": "#/$defs/path",
+                "description": "Path of the source its state shows (stage, status, slaState, data.*)"
+              },
+              "actions": {
+                "enum": [
+                  "steps"
+                ],
+                "description": "steps: the open steps of the instance as its actions"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "fields"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "items"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "section": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "items": {
+                "$ref": "#/$defs/columns"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "enum": [
+                  "timeline",
+                  "steps"
+                ]
+              }
+            }
+          },
+          "then": {
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "artifacts"
+              }
+            }
+          },
+          "then": {
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "types": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "uniqueItems": true,
+                "items": {
+                  "$ref": "#/$defs/key"
+                },
+                "description": "Artifact types shown; none: every type"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "related"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "knowledge"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "knowledge": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "key"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "$ref": "#/$defs/kind"
+                  },
+                  "key": {
+                    "$ref": "#/$defs/expression"
+                  }
+                },
+                "description": "The record of knowledge the block starts from: its kind and a CEL expression of its key"
+              },
+              "include": {
+                "$ref": "#/$defs/include"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "metrics"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "items"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "title",
+                    "value"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "key": {
+                      "$ref": "#/$defs/columnKey"
+                    },
+                    "title": {
+                      "$ref": "#/$defs/messageKey"
+                    },
+                    "value": {
+                      "$ref": "#/$defs/expression"
+                    },
+                    "format": {
+                      "$ref": "#/$defs/format"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "chart"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "chart",
+              "groupBy",
+              "value"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "chart": {
+                "enum": [
+                  "bar",
+                  "line",
+                  "donut"
+                ]
+              },
+              "groupBy": {
+                "$ref": "#/$defs/path"
+              },
+              "value": {
+                "$ref": "#/$defs/expression"
+              },
+              "label": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "format": {
+                "$ref": "#/$defs/format"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "invoke"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "label",
+              "skill"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "title": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "label": {
+                "$ref": "#/$defs/messageKey"
+              },
+              "skill": {
+                "type": "string",
+                "pattern": "^[^@\\s]+@[^@\\s]+$",
+                "maxLength": 300,
+                "description": "The skill called, name@version; its result is shown by its output schema"
+              },
+              "input": {
+                "$ref": "#/$defs/arguments"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "block": {
+                "const": "component"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "component"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "block": true,
+              "component": {
+                "$ref": "#/$defs/key"
+              },
+              "with": {
+                "$ref": "#/$defs/arguments"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "card": {
+      "type": "object",
+      "required": [
+        "title"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/path"
+        },
+        "subtitle": {
+          "$ref": "#/$defs/path"
+        },
+        "fields": {
+          "$ref": "#/$defs/columns"
+        },
+        "badge": {
+          "$ref": "#/$defs/path"
+        }
+      },
+      "description": "A card of a board: paths of the source for its title, subtitle and badge, and its fields"
+    },
+    "include": {
+      "type": "object",
+      "required": [
+        "relations"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "relations": {
+          "oneOf": [
+            {
+              "const": "*"
+            },
+            {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{0,62}$"
+              }
+            }
+          ],
+          "description": "Names of the relations shown, or * for every relation the packages of the namespace declare"
+        },
+        "direction": {
+          "enum": [
+            "out",
+            "in",
+            "both"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "description": "The links of the record shown (TAI-ADR-0066 p.6): the include of POST /knowledge/entities:query (CP-ADR-0060 C1)"
+    },
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/column"
+      }
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/columnKey"
+        },
+        "label": {
+          "$ref": "#/$defs/messageKey"
+        },
+        "field": {
+          "$ref": "#/$defs/path"
+        },
+        "value": {
+          "$ref": "#/$defs/expression"
+        },
+        "format": {
+          "$ref": "#/$defs/format"
+        }
+      },
+      "description": "What a cell shows: a path of the source (field) or a CEL expression (value), exactly one; label: none — the key <package>.fields.<path> of the dictionaries; key: none — the path"
+    },
+    "open": {
+      "type": "object",
+      "required": [
+        "view"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "view": {
+          "$ref": "#/$defs/key"
+        },
+        "id": {
+          "$ref": "#/$defs/expression"
+        },
+        "params": {
+          "$ref": "#/$defs/arguments"
+        }
+      },
+      "description": "A view of the same package or of a package it requires: id — CEL of the id of the record it opens, params — CEL of its params"
+    },
+    "arguments": {
+      "type": "object",
+      "maxProperties": 20,
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/expression"
+      }
+    },
+    "paths": {
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/path"
+      }
+    },
+    "sort": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": [
+          "field"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "field": {
+            "$ref": "#/$defs/path"
+          },
+          "dir": {
+            "enum": [
+              "asc",
+              "desc"
+            ]
+          }
+        }
+      }
+    },
+    "format": {
+      "enum": [
+        "text",
+        "number",
+        "money",
+        "percent",
+        "date",
+        "datetime",
+        "due",
+        "duration",
+        "principal",
+        "status",
+        "link"
+      ]
+    },
+    "path": {
+      "type": "string",
+      "maxLength": 300,
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+    },
+    "expression": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "messageKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$",
+      "description": "A key of the package dictionaries"
+    },
+    "key": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+    },
+    "componentParams": {
+      "type": "object",
+      "maxProperties": 20,
+      "propertyNames": {
+        "$ref": "#/$defs/name"
+      },
+      "additionalProperties": {
+        "if": {
+          "type": "object",
+          "required": [
+            "schema"
+          ]
+        },
+        "then": {
+          "$ref": "#/$defs/schemaParam"
+        },
+        "else": {
+          "$ref": "#/$defs/param"
+        },
+        "description": "A param typed by a type of the list, or by a JSON Schema (schema)"
+      }
+    },
+    "schemaParam": {
+      "type": "object",
+      "required": [
+        "schema"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "JSON Schema of the param: inline or {$ref: <file>#<pointer>} of a schema of the package; CEL reads param.<name> by it"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "description": "A param typed by a JSON Schema (TAI-ADR-0066 p.7.1)"
+    },
+    "columnKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_.]{0,199}$",
+      "description": "The key the values of a column come by in the data of a view"
+    }
+  }
+}

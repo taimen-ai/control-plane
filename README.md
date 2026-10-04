@@ -94,13 +94,14 @@ curl -f http://localhost:8000/health/ready
 `api` applies the migrations itself (`alembic upgrade head`) on startup. OpenAPI:
 <http://localhost:8000/docs>.
 
-The build context is the directory **above** the repository: the enforcement SDK lives in
-the neighbouring `platform-auth-sdk` repository and is wired in by path, because
+The build context is the root of the umbrella layout, two levels **above** the repository
+(`services/control-plane`, TAI-ADR-0064): the enforcement SDK lives in the
+`platform-auth-sdk` repository at `sdk/platform-auth-sdk` and is wired in by path, because
 the platform has no shared internal package index yet. Compose takes this into account
 by itself; manually the image is built like this:
 
 ```bash
-docker build -f control-plane/Dockerfile -t control-plane ..
+docker build -f services/control-plane/Dockerfile -t control-plane ../..
 ```
 
 ## Running locally (no container for the application)
@@ -562,7 +563,7 @@ Moving an identity from another principal takes an `admin` (`403
 permission_escalation`, `details.previousOwnerKind`). The principal of an active
 registry agent takes no identity through this route — `409 agent_identity_conflict`
 with `details.route` `/agents/{key}/identity`; only an `admin` may re-bind the
-identity the registry already records (CP-ADR-0073, amendment 2026-09-30, E4).
+identity the registry already records (CP-ADR-0073, amendment 2026-09-30, I4).
 
 Journal events: `iam_binding.created` / `updated` / `revoked` with
 `principalId`, `issuer`, `iamPrincipalId` and the permissions. After commit the router

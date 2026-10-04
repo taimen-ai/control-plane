@@ -11,6 +11,10 @@ A deadline is the ``due`` of a waiting step (``human``, ``approve``, ``call``,
   has them, the count starts at its next working interval;
 - ``{workhours: n}`` — ``n`` hours of working time (``cal.addWorkingTime``).
 
+``n`` of ``workdays`` and ``workhours``, of the deadline and of its
+``warnBefore`` alike, may be ``{expr: <cel>}``: a non-negative integer the
+engine computes once, when the step is entered (CP-ADR-0081, amendment 2026-10-03 G1).
+
 ``calendar`` names the calendar of the working units (the process's
 ``spec.calendar`` by default); ``warnBefore`` — a duration, ``{workdays}`` or
 ``{workhours}`` before the deadline, counted back from it on the same
@@ -18,7 +22,9 @@ calendar. Without ``warnBefore`` there is no warning.
 
 A *recipe* is how the engine stores a timer's moment in its state (plain
 JSON): ``{kind: duration, value}``, ``{kind: at, path}``, ``{kind: workdays,
-n, calendar}``, ``{kind: workhours, hours, calendar}``, ``{kind: before,
+n, calendar}``, ``{kind: workhours, hours, calendar}`` (``expr`` in place of
+``n``/``hours`` — the path of the expression — until the engine computes it,
+``from`` after: the path it was computed from), ``{kind: before,
 due, span}`` (the warning threshold) and the engine's own ``{kind: after,
 due, after}`` of escalations. The engine computes a recipe from a base
 moment; the working units are computed here, by the calendar version the
@@ -80,23 +86,85 @@ def due_recipe(value: Any, path: str, calendar: str | None) -> dict[str, Any]:
         return {"kind": "at", "path": path + "/at"}
     if "duration" in value:
         return {"kind": "duration", "value": value["duration"]}
-    return _working(value, value.get("calendar") or calendar)
+    return _working(value, value.get("calendar") or calendar, path)
 
 
-def warn_recipe(value: Any, due: Mapping[str, Any], calendar: str | None) -> dict[str, Any] | None:
-    """The recipe of the warning threshold of a ``due``; ``None`` without ``warnBefore``."""
+def warn_recipe(
+    value: Any, due: Mapping[str, Any], calendar: str | None, path: str = ""
+) -> dict[str, Any] | None:
+    """The recipe of the warning threshold of the ``due`` at ``path``; ``None`` without
+    ``warnBefore``."""
     if not isinstance(value, Mapping) or value.get("warnBefore") is None:
         return None
     span = value["warnBefore"]
     key = value.get("calendar") or calendar
-    back = {"kind": "duration", "value": span} if isinstance(span, str) else _working(span, key)
+    back = (
+        {"kind": "duration", "value": span}
+        if isinstance(span, str)
+        else _working(span, key, warn_path(path))
+    )
     return {"kind": "before", "due": dict(due), "span": back}
 
 
-def _working(value: Mapping[str, Any], calendar: str | None) -> dict[str, Any]:
-    if "workdays" in value:
-        return {"kind": "workdays", "n": int(value["workdays"]), "calendar": calendar}
-    return {"kind": "workhours", "hours": value["workhours"], "calendar": calendar}
+def warn_path(path: str) -> str:
+    """Where the ``warnBefore`` of the ``due`` at ``path`` stands."""
+    return path + "/warnBefore"
+
+
+def _working(value: Mapping[str, Any], calendar: str | None, path: str) -> dict[str, Any]:
+    unit = "workdays" if "workdays" in value else "workhours"
+    amount = value[unit]
+    if isinstance(amount, Mapping):
+        return {"kind": unit, "expr": f"{path}/{unit}/expr", "calendar": calendar}
+    if unit == "workdays":
+        return {"kind": unit, "n": int(amount), "calendar": calendar}
+    return {"kind": unit, "hours": amount, "calendar": calendar}
+
+
+# The largest amounts of the working units, as the schema bounds the numbers.
+MAX_AMOUNT = {"workdays": 1000, "workhours": 10000}
+
+
+def amount_of(value: Any, unit: str, path: str) -> int:
+    """The amount an ``{expr}`` of a working unit gave; :class:`DeadlineError` otherwise.
+
+    A non-negative integer no larger than a number of the unit may be; a
+    double with no fraction (a JSON number read untyped) counts as one.
+    """
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DeadlineError(
+            "expression_error",
+            f"{path}: {unit} must be a non-negative integer, the expression gave"
+            f" {type(value).__name__}",
+        )
+    if not 0 <= value <= MAX_AMOUNT[unit]:
+        raise DeadlineError(
+            "expression_error",
+            f"{path}: {unit} must be from 0 to {MAX_AMOUNT[unit]}, the expression gave {value}",
+        )
+    return value
+
+
+def computed(recipe: Mapping[str, Any], amount: int) -> dict[str, Any]:
+    """A working-unit recipe with the amount its expression gave in place of the expression."""
+    out = {k: v for k, v in recipe.items() if k != "expr"}
+    out["n" if recipe["kind"] == "workdays" else "hours"] = amount
+    out["from"] = recipe["expr"]
+    return out
+
+
+def computed_amounts(recipe: Mapping[str, Any] | None) -> dict[str, Any]:
+    """What the expressions of a recipe gave, by their paths: what the journal records."""
+    if not isinstance(recipe, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    if recipe.get("kind") in WORKING and recipe.get("from"):
+        out[str(recipe["from"])] = recipe["n" if recipe["kind"] == "workdays" else "hours"]
+    for part in ("due", "span", "after"):
+        out.update(computed_amounts(recipe.get(part)))
+    return out
 
 
 def working(

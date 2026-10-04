@@ -21,6 +21,8 @@ from control_plane_client import (
     ControlPlaneClient,
     ControlPlaneError,
     HeartbeatRunner,
+    IamCredential,
+    IamCredentialError,
     IdempotencyConflictError,
     NotFoundError,
     PermissionDeniedError,
@@ -107,6 +109,18 @@ def _fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
         (ControlPlaneError("http_error", "no status", status=0), False),
         (ValueError("not ours"), False),
         (TimeoutError(), False),
+        # The IAM exchange before a command: a restarting IAM is a blip...
+        (IamCredentialError("iam_exchange_failed", "IAM answered 502", status=502), True),
+        (IamCredentialError("iam_exchange_failed", "IAM answered 503", status=503), True),
+        (IamCredentialError("iam_exchange_failed", "IAM answered 504", status=504), True),
+        (IamCredentialError("iam_unreachable", "IAM is unreachable: ConnectError"), True),
+        # ...and its answer about the token is a verdict.
+        (IamCredentialError("iam_invalid_token", "rejected", status=401), False),
+        (IamCredentialError("iam_audience_not_allowed", "not allowed", status=403), False),
+        (IamCredentialError("iam_exchange_failed", "IAM answered 400", status=400), False),
+        (IamCredentialError("iam_exchange_failed", "IAM answered 500", status=500), False),
+        (IamCredentialError("iam_exchange_malformed", "malformed"), False),
+        (IamCredentialError("iam_not_authenticated", "no token"), False),
     ],
 )
 async def test_is_transient(exc: BaseException, expected: bool) -> None:
@@ -488,4 +502,97 @@ async def test_restart_clears_the_failures() -> None:
     await wait_for(lambda: len(script.seen(CLAIM_BEAT)) >= 2)
     assert runner.alive
     await runner.stop()
+    await client.aclose()
+
+
+# -- HeartbeatRunner behind an IAM credential ------------------------------------
+
+
+def iam_answers(answers: list[httpx.Response | Exception]) -> IamCredential:
+    """An IAM that answers the exchanges from ``answers``, then a token.
+
+    The token lives one second against a 30 s refresh margin: every beat
+    exchanges anew, as a beat after a long run does.
+    """
+    queue = list(answers)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if queue:
+            answer = queue.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        return httpx.Response(200, json={"accessToken": "at", "expiresIn": 1})
+
+    return IamCredential(
+        "http://iam.test",
+        "tenant",
+        platform_access_token="iam_pat_x_y",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def iam_runner_for(
+    credential: IamCredential, script: Script, *, outage_budget_seconds: float = 1.0
+) -> tuple[ControlPlaneClient, HeartbeatRunner]:
+    client = ControlPlaneClient(
+        "http://cp.test", credential, transport=httpx.MockTransport(script), retry_window=1.0
+    )
+    runner = HeartbeatRunner(
+        client,
+        session_id="s-1",
+        claim_id="c-1",
+        interval_seconds=0.01,
+        retry_seconds=0.01,
+        outage_budget_seconds=outage_budget_seconds,
+    )
+    return client, runner
+
+
+async def test_a_restart_of_iam_does_not_end_the_lease() -> None:
+    """Refused connections and a 503 of the same restart: both are a blip."""
+    credential = iam_answers(
+        [
+            httpx.ConnectError("refused"),
+            httpx.Response(503, text="unavailable"),
+            httpx.ConnectError("refused"),
+            httpx.Response(502, text="bad gateway"),
+        ]
+    )
+    script = Script({})
+    client, runner = iam_runner_for(credential, script)
+    runner.start()
+    await wait_for(lambda: len(script.seen(CLAIM_BEAT)) >= 2)
+    assert runner.error is None
+    assert runner.alive
+    await runner.stop()
+    await client.aclose()
+
+
+async def test_an_iam_unreachable_past_the_budget_ends_the_lease() -> None:
+    credential = iam_answers([httpx.ConnectError("refused")] * 1000)
+    script = Script({})
+    client, runner = iam_runner_for(credential, script, outage_budget_seconds=0.1)
+    runner.start()
+    await wait_for(lambda: not runner.alive)
+    assert isinstance(runner.error, IamCredentialError)
+    assert runner.error.code == "iam_unreachable"
+    assert runner.transport_failures >= 2
+    assert script.seen(SESSION_BEAT) == []
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(401, "iam_invalid_token"), (403, "iam_audience_not_allowed"), (400, "iam_exchange_failed")],
+)
+async def test_a_verdict_of_iam_ends_the_lease_at_once(status: int, code: str) -> None:
+    credential = iam_answers([httpx.Response(status, json={})])
+    script = Script({})
+    client, runner = iam_runner_for(credential, script, outage_budget_seconds=60.0)
+    runner.start()
+    await wait_for(lambda: not runner.alive)
+    assert isinstance(runner.error, IamCredentialError)
+    assert runner.error.code == code
+    assert runner.transport_failures == 0
     await client.aclose()

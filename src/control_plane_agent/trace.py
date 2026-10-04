@@ -15,6 +15,9 @@ Two rules keep this inside the existing artifact and audit contracts:
   it is kept; hidden reasoning (``thinking`` blocks, reasoning summaries) is
   counted but never stored. A transcript that still trips the portability
   guard is withheld as a whole rather than failing the run.
+- **The transcript carries no NUL.** The API rejects U+0000 anywhere in a JSON
+  body (CP-ADR-0083), so one tool that printed binary data would cost the whole
+  transcript; every string is cleaned with ``replace_nul`` before it is kept.
 - **Run actions carry references, not payloads** (ADR-0019). One action per
   tool call: its name, a short summary of the input and a pointer into the
   transcript. Inputs and outputs live in the artifact, not in ``run_actions``.
@@ -43,6 +46,9 @@ MAX_FINAL_CHARS = 60_000
 # without opening the transcript, not enough to be a second copy of it.
 MAX_ACTION_SUMMARY_CHARS = 160
 MAX_ACTION_NAME_CHARS = 200
+# U+0000 is stored nowhere and answered with 422 by the API (CP-ADR-0083): it
+# becomes the replacement character, as an undecodable byte would.
+NUL_REPLACEMENT = "\ufffd"
 # Tool names from the CLI are trusted to be identifiers, not free text.
 _TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_.:/-]+")
 
@@ -60,6 +66,16 @@ _CREDENTIAL_RES = (
     ),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
 )
+
+
+def replace_nul(text: str) -> str:
+    """``text`` with every U+0000 replaced by ``NUL_REPLACEMENT``."""
+    return text.replace("\x00", NUL_REPLACEMENT)
+
+
+def _label(value: Any, limit: int) -> str:
+    """An identifier-like field (tool, call id, model): text, no NUL, bounded."""
+    return replace_nul(str(value))[:limit]
 
 
 def redact_credentials(text: str) -> str:
@@ -91,8 +107,8 @@ def redact_paths_keep_name(text: str) -> str:
 
 
 def sanitize_text(text: str, limit: int) -> tuple[str, bool]:
-    """Redact paths and credentials, then cut to ``limit`` characters."""
-    clean = redact_credentials(redact_paths_keep_name(text))
+    """Replace NUL, redact paths and credentials, then cut to ``limit`` characters."""
+    clean = redact_credentials(redact_paths_keep_name(replace_nul(text)))
     if len(clean) <= limit:
         return clean, False
     return clean[:limit] + f"… [truncated {len(clean) - limit} chars]", True
@@ -200,9 +216,9 @@ class TranscriptBuilder:
 
     def system(self, *, model: str = "", tools: list[str] | None = None) -> None:
         if model:
-            self.model = model
+            self.model = _label(model, MAX_ACTION_NAME_CHARS)
         if tools:
-            self.tools = [str(t)[:MAX_ACTION_NAME_CHARS] for t in tools[:200]]
+            self.tools = [_label(t, MAX_ACTION_NAME_CHARS) for t in tools[:200]]
 
     def assistant_text(self, text: str, *, at: str | None = None) -> None:
         if not text.strip():
@@ -232,8 +248,8 @@ class TranscriptBuilder:
             {
                 "kind": "tool_call",
                 "call": ordinal,
-                "callId": str(call_id)[:120],
-                "tool": str(name)[:MAX_ACTION_NAME_CHARS],
+                "callId": _label(call_id, 120),
+                "tool": _label(name, MAX_ACTION_NAME_CHARS),
                 "input": rendered,
             },
             at=at,
@@ -251,7 +267,7 @@ class TranscriptBuilder:
         entry: dict[str, Any] = {
             "kind": "tool_result",
             "call": ordinal,
-            "callId": str(call_id)[:120],
+            "callId": _label(call_id, 120),
             "isError": bool(is_error),
         }
         truncated = False
@@ -287,7 +303,7 @@ class TranscriptBuilder:
         return {
             "schema": TRANSCRIPT_SCHEMA,
             "harnessType": self.harness_type,
-            "sessionId": self.session_id,
+            "sessionId": replace_nul(self.session_id),
             "model": self.model,
             "tools": list(self.tools),
             "entries": list(self.entries),
@@ -311,7 +327,7 @@ class TranscriptBuilder:
         if self.model:
             meta["model"] = self.model
         if self.session_id:
-            meta["sessionId"] = self.session_id
+            meta["sessionId"] = replace_nul(self.session_id)
         for key in ("inputTokens", "outputTokens", "costUsd"):
             if key in self.usage:
                 meta[key] = self.usage[key]
@@ -377,9 +393,9 @@ class TraceRecorder:
                 self.run_id,
                 action=tool_action_name(name),
                 status="started",
-                external_reference=f"{self.reference_prefix}#call/{ordinal}",
+                external_reference=replace_nul(f"{self.reference_prefix}#call/{ordinal}"),
                 metadata={
-                    "tool": str(name)[:MAX_ACTION_NAME_CHARS],
+                    "tool": _label(name, MAX_ACTION_NAME_CHARS),
                     "call": ordinal,
                     "summary": action_summary(input),
                 },

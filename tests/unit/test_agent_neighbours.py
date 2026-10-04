@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from control_plane_agent.catalog import CatalogError, RepositoryCatalog, RepositoryPools
+from control_plane_agent.checks import checks_at_base, run_check
 from control_plane_agent.conventions import (
     RUNNER_CONFIG_INVALID,
     CatalogConventions,
@@ -38,9 +39,12 @@ from control_plane_agent.mirrors import (
     sweep_stale_clones,
 )
 from control_plane_agent.revision import AgentRevision, RevisionError, mirror, workspace_pool_of
+from control_plane_agent.setup_command import run_setup, setup_at_base
 from control_plane_agent.workspace import (
     NEIGHBOUR_MODIFIED,
+    NEIGHBOUR_POINTER_REGRESSED,
     ExecutionWorkspacePool,
+    NeighbourCheck,
     Workspace,
     WorkspaceBlocked,
     WorkspaceError,
@@ -97,6 +101,7 @@ class World:
         superproject_config: str | None = None,
         superproject: bool = True,
         beta_path: str = "beta",
+        directories: dict[str, str] | None = None,
     ) -> None:
         forge = tmp_path / "forge"
         files = {"AGENTS.md": "# alpha\n"}
@@ -122,6 +127,8 @@ class World:
         }
         if superproject:
             spec["superproject"] = "superproject"
+        for key, directory in (directories or {}).items():
+            spec["repositories"][key]["directory"] = directory
         self.root = tmp_path / "w"
         self.mirrors = self.root / ".mirrors"
         pools = workspace_pool_of(
@@ -434,6 +441,110 @@ def test_success_takes_the_neighbours_with_the_copy(tmp_path: Path) -> None:
     assert not workspace.container.exists()
     listed = _git(world.mirrors / "neighbours" / "beta.git", "worktree", "list", "--porcelain")
     assert "TASK-1" not in listed
+
+
+# --- the layout with segments (TAI-ADR-0064) -----------------------------------
+
+# The service reaches the SDK two levels up, as in the superproject after the move.
+SEGMENTS = {"alpha": "services/alpha", "beta": "sdk/beta"}
+RUNNER_YAML_OF_ALPHA = (
+    "version: 1\n"
+    "neighbours: [beta]\n"
+    "setup: cat {dependency}/README.md > installed\n"
+    "checks:\n"
+    "  - {{name: tests, run: cat {dependency}/README.md installed}}\n"
+)
+# (directories of the catalog, where beta sits in the superproject, path dependency)
+CATALOG_LAYOUTS = [
+    pytest.param({}, "beta", "../beta", id="flat"),
+    pytest.param(SEGMENTS, "sdk/beta", "../../sdk/beta", id="segments"),
+]
+
+
+@pytest.mark.parametrize(("directories", "beta_path", "dependency"), CATALOG_LAYOUTS)
+async def test_a_catalog_run_works_on_both_layouts(
+    tmp_path: Path, directories: dict[str, str], beta_path: str, dependency: str
+) -> None:
+    """Neighbour, setup and checks of runner.yaml, then the container goes whole."""
+    world = World(
+        tmp_path,
+        alpha=RUNNER_YAML_OF_ALPHA.format(dependency=dependency),
+        beta_path=beta_path,
+        directories=directories,
+    )
+    pool = world.pool("alpha")
+
+    workspace = pool.acquire("TASK-1")
+
+    assert workspace.path == world.root / "TASK-1" / directories.get("alpha", "alpha")
+    assert workspace.container == world.root / "TASK-1"
+    sibling = workspace.path / dependency
+    assert _git(sibling, "rev-parse", "HEAD") == world.pin
+    assert sibling.resolve() == (workspace.container / directories.get("beta", "beta")).resolve()
+    assert workspace.checkpoint_data["neighbours"] == {"beta": world.pin}
+    assert workspace.neighbour_changes() == {}
+
+    plan = setup_at_base(workspace)
+    assert plan is not None
+    assert (await run_setup(plan, workspace)).passed
+    (check,) = checks_at_base(workspace).checks
+    result = await run_check(check, workspace)
+    assert result.passed
+    assert result.output.splitlines() == ["beta", "beta"]
+
+    (sibling / "README.md").write_text("changed\n")
+    assert workspace.neighbour_changes() == {"beta": "has changed or new files"}
+    (sibling / "README.md").write_text("beta\n")
+
+    (workspace.path / "installed").unlink()
+    (workspace.path / "result.txt").write_text("result\n")
+    assert workspace.commit("TASK-1: work") is not None
+    pool.release(workspace, "succeeded")
+
+    assert not workspace.container.exists()
+    listed = _git(world.mirrors / "neighbours" / "beta.git", "worktree", "list", "--porcelain")
+    assert "TASK-1" not in listed
+
+
+@pytest.mark.parametrize(("directories", "beta_path", "dependency"), CATALOG_LAYOUTS)
+def test_a_failed_catalog_copy_is_taken_again_on_both_layouts(
+    tmp_path: Path, directories: dict[str, str], beta_path: str, dependency: str
+) -> None:
+    world = World(tmp_path, beta_path=beta_path, directories=directories)
+    pool = world.pool("alpha")
+    workspace = pool.acquire("TASK-1")
+    (workspace.path / "wip.txt").write_text("half-done\n")
+    pool.release(workspace, "failed")
+    _pin(world.superproject, beta_path, world.beta_tip)
+
+    again = pool.acquire("TASK-1")
+
+    assert again.reused is True and again.path == workspace.path
+    assert (again.path / "wip.txt").read_text() == "half-done\n"
+    assert _git(again.path / dependency, "rev-parse", "HEAD") == world.beta_tip
+
+
+def test_a_task_that_moved_repository_leaves_no_directory_of_the_layout_behind(
+    tmp_path: Path,
+) -> None:
+    """``discard`` of a clean copy at ``services/alpha`` takes ``services/`` and ``sdk/`` too."""
+    world = World(tmp_path, beta_path="sdk/beta", directories=SEGMENTS)
+    pool = world.pool("alpha")
+    workspace = pool.acquire("TASK-1")
+    pool.release(workspace, "failed")
+
+    assert pool.discard("TASK-1") is None
+
+    assert not (world.root / "TASK-1").exists()
+
+
+def test_files_where_a_neighbour_goes_with_segments_are_not_overwritten(tmp_path: Path) -> None:
+    world = World(tmp_path, beta_path="sdk/beta", directories=SEGMENTS)
+    (world.root / "TASK-1" / "sdk" / "beta").mkdir(parents=True)
+    (world.root / "TASK-1" / "sdk" / "beta" / "notes.txt").write_text("mine\n")
+    with pytest.raises(WorkspaceBlocked, match="no copy of neighbour beta"):
+        world.acquire("alpha")
+    assert (world.root / "TASK-1" / "sdk" / "beta" / "notes.txt").read_text() == "mine\n"
 
 
 # --- a task of the superproject -------------------------------------------------
@@ -1278,3 +1389,421 @@ def test_a_missing_pointer_of_the_task_after_a_merge_is_still_the_task_s(
 
     assert "set the pointer back" in blocked.value.reason
     assert "fix the base" not in blocked.value.reason
+
+
+# --- the base moves a pointer during the run (TASK-001387) -------------------------
+
+
+def _update_submodule(workspace: Workspace, revision: str) -> None:
+    """What ``git submodule update`` does to a placed neighbour: a detached checkout."""
+    _git(workspace.path / "beta", "checkout", "-q", "--detach", revision)
+
+
+def test_a_neighbour_checked_out_at_the_merged_pointer_is_no_change(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    # An operator or the submodule-lag rule moves the pin while the run goes on;
+    # the task merges its base and updates its submodules, as the conventions say.
+    _merge_moved_base(world, workspace)
+    _update_submodule(workspace, world.beta_tip)
+    (workspace.path / "notes.md").write_text("work\n")
+
+    assert workspace.neighbour_changes() == {}
+    head = workspace.commit("TASK-5: notes")
+    assert head is not None and _pointer(workspace.path, head) == world.beta_tip
+
+
+def test_a_base_moved_during_the_run_and_not_merged_is_no_change(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _pin(world.superproject, "beta", world.beta_tip)
+    (workspace.path / "notes.md").write_text("work\n")
+
+    assert workspace.neighbour_changes() == {}
+    # The checkout follows the base's pointer of the moment of hand-in.
+    _update_submodule(workspace, world.beta_tip)
+    assert workspace.neighbour_changes() == {}
+    head = workspace.commit("TASK-5: notes")
+    assert head is not None and _pointer(workspace.path, head) == world.pin
+
+
+def test_a_pointer_equal_to_the_base_at_hand_in_is_no_change(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    # The branch and the base point at one commit at hand-in: merging the base
+    # changes nothing there, whoever wrote the pointer first.
+    _git(workspace.path, "update-index", "--cacheinfo", f"160000,{world.beta_tip},beta")
+    _git(workspace.path, "commit", "-qm", "same pin as the base")
+    _update_submodule(workspace, world.beta_tip)
+    _pin(world.superproject, "beta", world.beta_tip)
+
+    assert workspace.neighbour_changes() == {}
+
+
+def test_a_pointer_the_task_moved_while_the_base_moved_is_a_changed_neighbour(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    own = _commit(world.beta, {"README.md": "own\n"}, "own")
+    _merge_moved_base(world, workspace)
+    # The executor moves the pointer itself, past what the base pins.
+    _git(workspace.path / "beta", "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _update_submodule(workspace, own)
+    _git(workspace.path, "update-index", "--cacheinfo", f"160000,{own},beta")
+    _git(workspace.path, "commit", "-qm", "move the pin")
+
+    assert own[:12] in workspace.neighbour_changes()["beta"]
+
+
+def test_a_checkout_off_every_pointer_of_the_base_is_a_moved_neighbour(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    own = _commit(world.beta, {"README.md": "own\n"}, "own")
+    _merge_moved_base(world, workspace)
+    _git(workspace.path / "beta", "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _update_submodule(workspace, own)
+
+    changes = workspace.neighbour_changes()
+
+    assert changes["beta"] == f"moved from {world.pin[:12]} to {own[:12]}"
+
+
+def test_a_stale_local_base_does_not_excuse_a_rolled_back_pointer(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    pool = world.pool("superproject")
+    workspace = pool.acquire("TASK-5")
+    _merge_moved_base(world, workspace)
+    # The local base of the mirror still has the old pin; the forge's has the new.
+    assert _pointer(pool.origin, "refs/heads/main") == world.pin
+    _git(workspace.path, "update-index", "--cacheinfo", f"160000,{world.pin},beta")
+    _git(workspace.path, "commit", "-qm", "roll the pin back")
+
+    assert "pointer" in workspace.neighbour_changes()["beta"]
+
+
+# --- a pointer the base moved on, rolled back by the hand-in (TASK-001396) ---------
+
+
+def _commit_all(workspace: Workspace, how: str) -> None:
+    """The executor's own commit of everything, the submodule's old checkout included."""
+    (workspace.path / "notes.md").write_text("work\n")
+    if how == "commit -a":
+        _git(workspace.path, "add", "notes.md")
+        _git(workspace.path, "commit", "-qam", "work")
+    else:
+        _git(workspace.path, "add", "-A")
+        _git(workspace.path, "commit", "-qm", "work")
+
+
+@pytest.mark.parametrize("how", ["commit -a", "add -A"])
+def test_a_merge_of_the_base_then_commit_all_is_a_rolled_back_pointer(
+    tmp_path: Path, how: str
+) -> None:
+    """TASK-001346: the base moved the pin, the checkout stayed, ``commit -a`` took it."""
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _merge_moved_base(world, workspace)
+    assert _git(workspace.path, "status", "--porcelain") == "M beta"
+    _commit_all(workspace, how)
+    assert _pointer(workspace.path, "HEAD") == world.pin
+
+    check = workspace.neighbour_check()
+
+    assert check.changes == {}
+    regression = check.regressions["beta"]
+    assert (regression.expected, regression.actual) == (world.beta_tip, world.pin)
+    reason = regression.reason()
+    assert world.beta_tip in reason and world.pin in reason
+    assert "git checkout origin/main -- beta" in reason
+    assert str(tmp_path) not in reason
+    # Told the same in words, and the same when asked again.
+    assert "pointer" in workspace.neighbour_changes()["beta"]
+    assert workspace.neighbour_check() == check
+
+
+def test_a_rolled_back_pointer_only_staged_is_told_too(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _merge_moved_base(world, workspace)
+    _git(workspace.path, "add", "-A")
+
+    check = workspace.neighbour_check()
+
+    assert check.changes == {}
+    assert check.regressions["beta"].actual == world.pin
+
+
+def test_the_hint_of_a_rolled_back_pointer_fixes_it(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _merge_moved_base(world, workspace)
+    _commit_all(workspace, "commit -a")
+    assert workspace.neighbour_check().regressions
+
+    # What the reason says: the base's pointer back, the checkout after it.
+    _git(workspace.path, "checkout", "origin/main", "--", "beta")
+    _git(workspace.path / "beta", "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _update_submodule(workspace, world.beta_tip)
+    _git(workspace.path, "commit", "-qm", "the base's pointer")
+
+    assert workspace.neighbour_check().regressions == {}
+    assert workspace.neighbour_changes() == {}
+    assert _pointer(workspace.path, workspace.head()) == world.beta_tip
+
+
+def test_a_merge_with_the_checkout_updated_then_commit_all_hands_in(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _merge_moved_base(world, workspace)
+    _update_submodule(workspace, world.beta_tip)
+    _commit_all(workspace, "commit -a")
+
+    assert workspace.neighbour_check().regressions == {}
+    assert workspace.neighbour_changes() == {}
+    assert _pointer(workspace.path, "HEAD") == world.beta_tip
+
+
+def test_a_base_not_merged_is_held_to_the_pointer_the_branch_was_cut_at(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    # The base pins the later commit when the copy is cut.
+    _pin(world.superproject, "beta", world.beta_tip)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _git(workspace.path, "update-index", "--cacheinfo", f"160000,{world.pin},beta")
+    _git(workspace.path, "commit", "-qm", "an older pin")
+
+    check = workspace.neighbour_check()
+
+    assert check.changes == {}
+    regression = check.regressions["beta"]
+    assert (regression.expected, regression.actual) == (world.beta_tip, world.pin)
+
+
+def test_a_pointer_the_task_moved_forward_is_not_a_rolled_back_one(tmp_path: Path) -> None:
+    """A move of the pointer by the task stays what it was: a change of the neighbour."""
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _git(workspace.path / "beta", "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _update_submodule(workspace, world.beta_tip)
+    _git(workspace.path, "add", "beta")
+    _git(workspace.path, "commit", "-qm", "move the pin forward")
+
+    check = workspace.neighbour_check()
+
+    assert check.regressions == {}
+    assert check.changes["beta"] == f"moved from {world.pin[:12]} to {world.beta_tip[:12]}"
+
+
+def test_neighbours_outside_the_copy_have_no_pointer_to_roll_back(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    workspace = world.acquire("alpha")
+    _pin(world.superproject, "beta", world.beta_tip)
+    (workspace.path / "notes.md").write_text("work\n")
+
+    assert workspace.neighbour_check().regressions == {}
+    assert workspace.neighbour_changes() == {}
+
+
+def test_the_daemon_s_commit_takes_no_staged_pointer(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    _merge_moved_base(world, workspace)
+    _git(workspace.path, "add", "-A")
+    assert _git(workspace.path, "diff", "--cached", "--name-only") == "beta"
+    (workspace.path / "notes.md").write_text("work\n")
+
+    head = workspace.commit("TASK-5: notes")
+
+    assert head is not None and _pointer(workspace.path, head) == world.beta_tip
+    assert "notes.md" in _git(workspace.path, "ls-tree", "--name-only", head).split()
+
+
+def test_the_rolled_back_pointer_has_a_reason_of_its_own() -> None:
+    assert NEIGHBOUR_POINTER_REGRESSED == "neighbour_pointer_regressed"
+    assert NEIGHBOUR_POINTER_REGRESSED != NEIGHBOUR_MODIFIED
+
+
+# --- a submodule runner.yaml does not name (package-sdk), TASK-001396 review -------
+
+
+class Sdk:
+    """A submodule of the superproject outside ``neighbours``, as package-sdk is."""
+
+    def __init__(self, world: World, tmp_path: Path) -> None:
+        self.forge = _repo(tmp_path / "forge" / "sdk", {})
+        self.pin = _git(self.forge, "rev-parse", "HEAD")
+        self.tip = _commit(self.forge, {"README.md": "later\n"}, "later")
+        self.world = world
+        _pin(world.superproject, "sdk", self.pin, url="https://forge.example/org/sdk.git")
+
+    def check_out(self, workspace: Workspace, revision: str) -> None:
+        """The executor's own checkout of the submodule, nothing the pool placed."""
+        target = workspace.path / "sdk"
+        if not (target / ".git").exists():
+            _git(workspace.path, "clone", "-q", "--no-checkout", str(self.forge), "sdk")
+        _git(target, "checkout", "-q", "--detach", revision)
+
+    def merge_moved_base(self, workspace: Workspace) -> None:
+        """The base moves the pin of the SDK; the task merges its base."""
+        _pin(self.world.superproject, "sdk", self.tip)
+        _git(workspace.path, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        _git(workspace.path, "merge", "-q", "--no-edit", "origin/main")
+
+
+def _sdk_task(tmp_path: Path) -> tuple[World, Sdk, Workspace]:
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    sdk = Sdk(world, tmp_path)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    sdk.check_out(workspace, sdk.pin)
+    return world, sdk, workspace
+
+
+def test_the_daemon_s_commit_after_a_merge_keeps_the_base_s_pointer_of_an_undeclared_submodule(
+    tmp_path: Path,
+) -> None:
+    """9b30f86, 54d149a: the daemon's ``add -A`` took the old checkout of package-sdk."""
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.merge_moved_base(workspace)
+    assert _git(workspace.path, "status", "--porcelain") == "M sdk"
+    (workspace.path / "notes.md").write_text("work\n")
+
+    assert workspace.neighbour_check() == NeighbourCheck()
+    head = workspace.commit("TASK-5: notes")
+
+    assert head is not None and _pointer(workspace.path, head, "sdk") == sdk.tip
+    assert "notes.md" in _git(workspace.path, "ls-tree", "--name-only", head).split()
+
+
+def test_the_daemon_s_wip_keeps_the_base_s_pointer_of_an_undeclared_submodule(
+    tmp_path: Path,
+) -> None:
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.merge_moved_base(workspace)
+    (workspace.path / "notes.md").write_text("work\n")
+
+    head = workspace.commit_wip("TASK-5: wip")
+
+    assert head is not None and _pointer(workspace.path, head, "sdk") == sdk.tip
+
+
+@pytest.mark.parametrize("how", ["commit -a", "add -A"])
+def test_commit_all_over_an_undeclared_submodule_is_a_rolled_back_pointer(
+    tmp_path: Path, how: str
+) -> None:
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.merge_moved_base(workspace)
+    _commit_all(workspace, how)
+    assert _pointer(workspace.path, "HEAD", "sdk") == sdk.pin
+
+    check = workspace.neighbour_check()
+
+    assert check.changes == {}
+    regression = check.regressions["sdk"]
+    assert (regression.path, regression.expected, regression.actual) == ("sdk", sdk.tip, sdk.pin)
+    assert "git checkout origin/main -- sdk" in regression.reason()
+    assert str(tmp_path) not in regression.reason()
+    # The daemon's commit over it does not hide it: the branch already has it.
+    assert workspace.neighbour_check() == check
+
+
+def test_a_rolled_back_pointer_of_an_undeclared_submodule_without_a_checkout_is_told(
+    tmp_path: Path,
+) -> None:
+    """Without the SDK's history, the pointer of the cut point is the rollback."""
+    world = World(tmp_path, superproject_config=SUPERPROJECT_NEIGHBOURS)
+    sdk = Sdk(world, tmp_path)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    sdk.merge_moved_base(workspace)
+    _git(workspace.path, "update-index", "--cacheinfo", f"160000,{sdk.pin},sdk")
+    _git(workspace.path, "commit", "-qm", "the old pin")
+
+    check = workspace.neighbour_check()
+
+    assert check.changes == {}
+    assert (check.regressions["sdk"].expected, check.regressions["sdk"].actual) == (
+        sdk.tip,
+        sdk.pin,
+    )
+
+
+def test_a_submodule_update_after_the_merge_hands_in(tmp_path: Path) -> None:
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.merge_moved_base(workspace)
+    sdk.check_out(workspace, sdk.tip)
+    assert _git(workspace.path, "status", "--porcelain") == ""
+    _commit_all(workspace, "commit -a")
+
+    assert workspace.neighbour_check() == NeighbourCheck()
+    assert _pointer(workspace.path, "HEAD", "sdk") == sdk.tip
+
+
+def test_the_hint_fixes_a_rolled_back_pointer_of_an_undeclared_submodule(tmp_path: Path) -> None:
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.merge_moved_base(workspace)
+    _commit_all(workspace, "commit -a")
+    assert workspace.neighbour_check().regressions
+
+    _git(workspace.path, "checkout", "origin/main", "--", "sdk")
+    sdk.check_out(workspace, sdk.tip)
+    _git(workspace.path, "commit", "-qm", "the base's pointer")
+
+    assert workspace.neighbour_check() == NeighbourCheck()
+
+
+def test_an_undeclared_submodule_the_base_moved_and_the_task_did_not_merge_is_no_change(
+    tmp_path: Path,
+) -> None:
+    world, sdk, workspace = _sdk_task(tmp_path)
+    _pin(world.superproject, "sdk", sdk.tip)
+    _commit_all(workspace, "commit -a")
+
+    assert workspace.neighbour_check() == NeighbourCheck()
+
+
+def test_an_undeclared_submodule_moved_by_the_task_is_a_changed_neighbour(tmp_path: Path) -> None:
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.check_out(workspace, sdk.tip)
+    _commit_all(workspace, "commit -a")
+
+    check = workspace.neighbour_check()
+
+    assert check.regressions == {}
+    assert "pointer" in check.changes["sdk"]
+
+
+def test_an_undeclared_submodule_pointer_only_staged_is_told(tmp_path: Path) -> None:
+    _, sdk, workspace = _sdk_task(tmp_path)
+    sdk.merge_moved_base(workspace)
+    _git(workspace.path, "add", "-A")
+
+    check = workspace.neighbour_check()
+
+    assert check.regressions["sdk"].actual == sdk.pin
+    # The daemon's commit drops it all the same.
+    (workspace.path / "notes.md").write_text("work\n")
+    head = workspace.commit("TASK-5: notes")
+    assert head is not None and _pointer(workspace.path, head, "sdk") == sdk.tip
+
+
+def test_a_superproject_without_neighbours_has_its_submodules_checked(tmp_path: Path) -> None:
+    world = World(tmp_path, superproject_config=None)
+    sdk = Sdk(world, tmp_path)
+    workspace = world.pool("superproject").acquire("TASK-5")
+    sdk.check_out(workspace, sdk.pin)
+    sdk.merge_moved_base(workspace)
+    _commit_all(workspace, "commit -a")
+
+    assert workspace.neighbour_check().regressions["sdk"].actual == sdk.pin
+
+
+def test_a_repository_that_is_not_the_superproject_keeps_its_submodules_to_itself(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path)
+    workspace = world.acquire("alpha")
+    _git(workspace.path, "update-index", "--add", "--cacheinfo", f"160000,{world.pin},vendored")
+    _git(workspace.path, "commit", "-qm", "vendor")
+
+    assert workspace.neighbour_check() == NeighbourCheck()

@@ -10,7 +10,7 @@
       "items": {
         "$ref": "#/$defs/assignee"
       },
-      "description": "Кандидаты по порядку: берётся первый разрешимый"
+      "description": "Candidates in order: the first resolvable one is taken"
     },
     "assignee": {
       "type": "object",
@@ -49,7 +49,7 @@
         },
         "expr": {
           "$ref": "#/$defs/cel",
-          "description": "CEL → id principal, agent:<key> или role:<slug>"
+          "description": "CEL → principal id, agent:<key> or role:<slug>"
         }
       }
     },
@@ -60,13 +60,13 @@
       "items": {
         "$ref": "#/$defs/processStep"
       },
-      "description": "Последовательность шагов (блок do)"
+      "description": "Sequence of steps (do block)"
     },
     "cel": {
       "type": "string",
       "minLength": 1,
       "maxLength": 4000,
-      "description": "Выражение CEL в профиле taimen/1: переменные data, event, step, task, instance; функции cal.*; без текущего времени. Типы и лимит стоимости проверяет ядро",
+      "description": "CEL expression in the taimen/1 profile: variables data, event, step, task, instance; cal.* functions; no current time. The core checks types and the cost limit",
       "$comment": "CP-ADR-0075"
     },
     "celMap": {
@@ -78,7 +78,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/cel"
       },
-      "description": "Путь в данных экземпляра → выражение CEL"
+      "description": "Path in the instance data → CEL expression"
     },
     "decisionTable": {
       "type": "object",
@@ -90,7 +90,7 @@
         "rules"
       ],
       "additionalProperties": false,
-      "description": "Таблица решений (DMN по смыслу). Ячейка условия: '-' (любое), литерал, список 'a,b', диапазон '[a..b)'",
+      "description": "Decision table (DMN in spirit). Condition cell: '-' (any), a literal, a list 'a,b', a range '[a..b)'",
       "properties": {
         "id": {
           "$ref": "#/$defs/processElementId"
@@ -211,10 +211,10 @@
     "duration": {
       "type": "string",
       "pattern": "^P(?!$)(\\d+Y)?(\\d+M)?(\\d+W)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+S)?)?$",
-      "description": "Длительность ISO 8601, например P3D, PT4H"
+      "description": "ISO 8601 duration, e.g. P3D, PT4H"
     },
     "durationOrCel": {
-      "description": "Длительность ISO 8601 или выражение CEL, дающее момент времени (timestamp) или длительность",
+      "description": "ISO 8601 duration or a CEL expression yielding a point in time (timestamp) or a duration",
       "oneOf": [
         {
           "$ref": "#/$defs/duration"
@@ -236,7 +236,7 @@
     "envOrUuid": {
       "type": "string",
       "pattern": "^(\\$\\{[A-Z][A-Z0-9_]*\\}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
-      "description": "UUID или ${ПЕРЕМЕННАЯ} установки (топология окружения в пакет не пишется)"
+      "description": "UUID or an installation ${VARIABLE} (environment topology is not written into the package)"
     },
     "escalation": {
       "type": "object",
@@ -255,7 +255,7 @@
               "$ref": "#/$defs/durationOrCel"
             }
           ],
-          "description": "due — в момент срока; длительность — после срока"
+          "description": "due means at the due moment; a duration means after the due"
         },
         "action": {
           "enum": [
@@ -276,7 +276,7 @@
     "governedBy": {
       "type": "array",
       "maxItems": 20,
-      "description": "Регламенты базы знаний, которым подчиняется элемент: естественный ключ документа памяти и, при необходимости, пункт",
+      "description": "Knowledge base regulations the element is subject to: the natural key of the memory document and, if needed, a clause",
       "$comment": "TAI-ADR-0054 Р17",
       "items": {
         "type": "object",
@@ -299,7 +299,7 @@
     },
     "jsonSchema": {
       "type": "object",
-      "description": "JSON Schema документа (draft 2020-12). Удалённые $ref ядро отвергает."
+      "description": "Document JSON Schema (draft 2020-12). The core rejects remote $ref."
     },
     "memoryAnchor": {
       "type": "object",
@@ -317,7 +317,7 @@
           ]
         }
       ],
-      "description": "Якорь обхода графа: узел дела экземпляра или сущность по естественному ключу (CEL от данных)",
+      "description": "Graph traversal anchor: the instance's case node or an entity by natural key (CEL over data)",
       "properties": {
         "case": {
           "const": true
@@ -341,7 +341,7 @@
         "case"
       ],
       "additionalProperties": false,
-      "description": "Проекция дела в граф памяти: доставляется событиями, в граф идут только объявленные поля",
+      "description": "Projection of the case into the memory graph: delivered by events, only declared fields go into the graph",
       "$comment": "TAI-ADR-0054 Р15",
       "properties": {
         "case": {
@@ -366,7 +366,7 @@
         },
         "facts": {
           "$ref": "#/$defs/celMap",
-          "description": "Имя факта дела → значение; изменение закрывает прежний факт сроком действия"
+          "description": "Case fact name → value; a change closes the previous fact with a validity end"
         },
         "entities": {
           "type": "array",
@@ -399,7 +399,7 @@
               },
               "many": {
                 "type": "boolean",
-                "description": "key даёт список: по сущности на элемент"
+                "description": "key yields a list: one entity per element"
               }
             }
           }
@@ -423,7 +423,7 @@
     "memoryTraverse": {
       "type": "array",
       "maxItems": 10,
-      "description": "Шаги обхода от якорей — та же форма, что traverse в contextSchema",
+      "description": "Traversal steps from the anchors, the same shape as traverse in contextSchema",
       "$comment": "CP-ADR-0064",
       "items": {
         "type": "object",
@@ -466,7 +466,7 @@
       "type": "array",
       "minItems": 1,
       "maxItems": 20,
-      "description": "Фильтры по атрибутам узлов: применяются к узлам результата и к якорям-кандидатам смыслового добора; условия соединяются через И",
+      "description": "Filters on node attributes: applied to result nodes and to candidate anchors of semantic expansion; conditions are joined with AND",
       "$comment": "TAI-ADR-0056 Р7, MEM-ADR-020",
       "items": {
         "type": "object",
@@ -479,7 +479,7 @@
           "attr": {
             "type": "string",
             "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
-            "description": "Имя атрибута узла (плоское), например okpd2 или validUntil; атрибут-список выполняет условие, если его выполняет хоть один элемент",
+            "description": "Node attribute name (flat), e.g. okpd2 or validUntil; a list attribute satisfies the condition if any of its elements does",
             "$comment": "MEM-ADR-020"
           },
           "op": {
@@ -491,10 +491,10 @@
               "gte",
               "exists"
             ],
-            "description": "prefix сравнивает коды по сегментам через точку: 62.01 совпадает с 62.01.11, но не с 62.011; lte/gte — даты RFC 3339 или числа"
+            "description": "prefix compares codes by dot-separated segments: 62.01 matches 62.01.11 but not 62.011; lte/gte are RFC 3339 dates or numbers"
           },
           "value": {
-            "description": "CEL-выражение от данных экземпляра (строковый литерал — в кавычках CEL: \"'62.01'\"); для in — CEL-список или список выражений; для exists — true или false",
+            "description": "CEL expression over the instance data (a string literal goes in CEL quotes: \"'62.01'\"); for in, a CEL list or a list of expressions; for exists, true or false",
             "anyOf": [
               {
                 "$ref": "#/$defs/cel"
@@ -537,7 +537,7 @@
       }
     },
     "processDue": {
-      "description": "Срок (SLA) шага или процесса: длительность ISO 8601, {at} — момент или длительность от данных, либо ровно одно из duration, workdays, workhours с необязательными calendar и warnBefore",
+      "description": "Due (SLA) of a step or process: an ISO 8601 duration, {at}, a point in time or a duration from data, or exactly one of duration, workdays, workhours with optional calendar and warnBefore",
       "$comment": "CP-ADR-0078 §1",
       "oneOf": [
         {
@@ -568,18 +568,18 @@
               "$ref": "#/$defs/duration"
             },
             "workdays": {
-              "$ref": "#/$defs/workdayCount"
+              "$ref": "#/$defs/workdayAmount"
             },
             "workhours": {
-              "$ref": "#/$defs/workhourCount"
+              "$ref": "#/$defs/workhourAmount"
             },
             "calendar": {
               "$ref": "#/$defs/typeKey",
-              "description": "Календарь рабочих единиц; по умолчанию spec.calendar процесса"
+              "description": "Calendar of the working units; defaults to the process's spec.calendar"
             },
             "warnBefore": {
               "$ref": "#/$defs/workingSpan",
-              "description": "Порог предупреждения до срока; без него предупреждения нет"
+              "description": "Warning threshold before the due; without it there is no warning"
             }
           }
         }
@@ -588,7 +588,7 @@
     "processElementId": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]{0,62}$",
-      "description": "Стабильный id элемента процесса: на него ссылаются раскладка схемы, карты миграции, журнал и граф памяти. Переименование — только картой migrations"
+      "description": "Stable process element id: the schema layout, migration maps, the journal and the memory graph refer to it. Renaming only via the migrations map"
     },
     "processError": {
       "type": "object",
@@ -596,7 +596,7 @@
         "type"
       ],
       "additionalProperties": false,
-      "description": "Ошибка в форме RFC 7807",
+      "description": "Error in RFC 7807 form",
       "properties": {
         "type": {
           "type": "string",
@@ -618,7 +618,7 @@
         "schema"
       ],
       "additionalProperties": false,
-      "description": "Форма шага: JSON Schema данных и uischema JSON Forms представления",
+      "description": "Step form: JSON Schema of the data and JSON Forms uischema of the view",
       "properties": {
         "schema": {
           "$ref": "#/$defs/jsonSchema"
@@ -630,7 +630,7 @@
     },
     "processSpec": {
       "type": "object",
-      "description": "Процесс: кейс со стадиями и блоками исполнения, данные по схеме, выражения CEL, проекция в память. Исполняет ядро",
+      "description": "Process: a case with stages and execution blocks, data by schema, CEL expressions, projection into memory. Executed by the core",
       "$comment": "TAI-ADR-0054, CP-ADR-0074",
       "required": [
         "version",
@@ -644,7 +644,7 @@
         "version": {
           "type": "integer",
           "minimum": 1,
-          "description": "Версия определения: опубликованная версия неизменяема"
+          "description": "Definition version: a published version is immutable"
         },
         "displayName": {
           "$ref": "#/$defs/displayName"
@@ -663,7 +663,7 @@
             "agent"
           ],
           "additionalProperties": false,
-          "description": "От чьего имени действует процесс: описание агента вида service или agent",
+          "description": "On whose behalf the process acts: an agent description of kind service or agent",
           "properties": {
             "agent": {
               "$ref": "#/$defs/slug"
@@ -672,21 +672,21 @@
         },
         "owner": {
           "$ref": "#/$defs/assignChain",
-          "description": "Владелец процесса — ему адресуются задачи о процессе: расхождение с регламентом, ошибки экземпляров. Не обязателен; проверка пакета предупреждает, если его нет",
-          "$comment": "TAI-ADR-0054 п.5, амендмент 2026-09-27"
+          "description": "Process owner: tasks about the process are addressed to them (divergence from the regulation, instance errors). Optional; the package check warns if it is missing",
+          "$comment": "TAI-ADR-0054 item 5, amendment 2026-09-27"
         },
         "calendar": {
           "$ref": "#/$defs/typeKey",
-          "description": "Календарь по умолчанию для cal.*"
+          "description": "Default calendar for cal.*"
         },
         "due": {
           "$ref": "#/$defs/processDue",
-          "description": "Срок процесса целиком от старта экземпляра",
+          "description": "Due of the whole process from the instance start",
           "$comment": "CP-ADR-0078 §1"
         },
         "data": {
           "$ref": "#/$defs/jsonSchema",
-          "description": "JSON Schema данных экземпляра; {$ref: <файл пакета>} раскрывает package-sdk"
+          "description": "JSON Schema of the instance data; package-sdk expands {$ref: <package file>}"
         },
         "start": {
           "type": "object",
@@ -701,7 +701,7 @@
             },
             "key": {
               "$ref": "#/$defs/cel",
-              "description": "Ключ экземпляра: повтор события с тем же ключом — correlate, а не новый экземпляр"
+              "description": "Instance key: a repeated event with the same key is a correlate, not a new instance"
             },
             "set": {
               "$ref": "#/$defs/celMap"
@@ -785,7 +785,7 @@
             "assign"
           ],
           "additionalProperties": false,
-          "description": "Разбор закрытого дела: агент предлагает уроки, человек подтверждает",
+          "description": "Review of a closed case: the agent proposes lessons, a human confirms",
           "$comment": "TAI-ADR-0054 Р18",
           "properties": {
             "skill": {
@@ -806,7 +806,7 @@
                 "type": "string",
                 "pattern": "^[a-z][a-z0-9_]*$"
               },
-              "description": "Виды сущностей, к которым привязываются уроки"
+              "description": "Entity kinds lessons are attached to"
             },
             "when": {
               "$ref": "#/$defs/cel"
@@ -860,7 +860,7 @@
         "steps"
       ],
       "additionalProperties": false,
-      "description": "Стадия кейса (CMMN): вход и выход по сторожам, вехи, обязательная и необязательная работа",
+      "description": "Case stage (CMMN): entry and exit by guards, milestones, required and optional work",
       "properties": {
         "id": {
           "$ref": "#/$defs/processElementId"
@@ -870,7 +870,7 @@
         },
         "entry": {
           "$ref": "#/$defs/cel",
-          "description": "Сторож входа; stage.<id>.completed, milestone.<id> и data доступны в выражении"
+          "description": "Entry guard; stage.<id>.completed, milestone.<id> and data are available in the expression"
         },
         "exit": {
           "$ref": "#/$defs/cel"
@@ -890,7 +890,7 @@
           "items": {
             "$ref": "#/$defs/processStep"
           },
-          "description": "Работа, которую человек добавляет по решению"
+          "description": "Work a human adds at their discretion"
         },
         "milestones": {
           "type": "array",
@@ -923,7 +923,7 @@
         "id"
       ],
       "additionalProperties": false,
-      "description": "Шаг процесса: ровно один вид (human, approve, call, decide, recall, remember, listen, wait, set, raise, compensate, fork, try, do, suspend, resume, complete) плюс общие поля",
+      "description": "Process step: exactly one kind (human, approve, call, decide, recall, remember, listen, wait, set, raise, compensate, fork, try, do, suspend, resume, complete) plus common fields",
       "oneOf": [
         {
           "required": [
@@ -1020,7 +1020,7 @@
         },
         "when": {
           "$ref": "#/$defs/cel",
-          "description": "Сторож: шаг выполняется, только если истинно"
+          "description": "Guard: the step runs only if it is true"
         },
         "input": {
           "type": "object",
@@ -1039,7 +1039,7 @@
               "$ref": "#/$defs/celMap"
             }
           },
-          "description": "Запись результата шага (step.result) в данные экземпляра"
+          "description": "Writing the step result (step.result) into the instance data"
         },
         "export": {
           "type": "object",
@@ -1055,7 +1055,7 @@
         },
         "onCompensate": {
           "$ref": "#/$defs/blocks",
-          "description": "Компенсация сделанного шага: выполняется при compensate в обратном порядке"
+          "description": "Compensation of a completed step: runs on compensate in reverse order"
         },
         "human": {
           "type": "object",
@@ -1070,6 +1070,18 @@
             },
             "title": {
               "$ref": "#/$defs/cel"
+            },
+            "customFields": {
+              "type": "object",
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/cel"
+              },
+              "description": "Prefill of the created task's fields with case data: a field of the type's fieldSchema → CEL; checked against fieldSchema on publication and on task creation, null leaves the field to the human",
+              "$comment": "CP-ADR-0074 §7, amendment 2026-10-01"
             },
             "form": {
               "$ref": "#/$defs/processForm"
@@ -1157,7 +1169,7 @@
             },
             "separationOfDuties": {
               "$ref": "#/$defs/cel",
-              "description": "CEL → список principal, которым голосовать нельзя; проверяет ядро при решении"
+              "description": "CEL → list of principals who may not vote; the core checks it at decision time"
             },
             "due": {
               "$ref": "#/$defs/processDue"
@@ -1247,7 +1259,7 @@
             "anchors"
           ],
           "additionalProperties": false,
-          "description": "Запрос к памяти через ядро; ответ — событие журнала (детерминированный replay)",
+          "description": "Memory query through the core; the answer is a journal event (deterministic replay)",
           "properties": {
             "anchors": {
               "type": "array",
@@ -1262,7 +1274,7 @@
             },
             "query": {
               "$ref": "#/$defs/cel",
-              "description": "Текст смыслового добора"
+              "description": "Semantic expansion text"
             },
             "kinds": {
               "type": "array",
@@ -1306,7 +1318,7 @@
               ]
             }
           ],
-          "description": "Запись в память наблюдением ядра от identity процесса, со ссылкой на дело",
+          "description": "Write to memory as a core observation from the process identity, with a reference to the case",
           "properties": {
             "entity": {
               "type": "object",
@@ -1359,7 +1371,7 @@
             },
             "facts": {
               "$ref": "#/$defs/celMap",
-              "description": "Имя факта дела → значение"
+              "description": "Case fact name → value"
             }
           }
         },
@@ -1369,7 +1381,7 @@
             "any"
           ],
           "additionalProperties": false,
-          "description": "Ожидание первого из событий (отложенный выбор); timeout — таймер",
+          "description": "Waiting for the first of the events (deferred choice); timeout is a timer",
           "properties": {
             "any": {
               "type": "array",
@@ -1404,7 +1416,7 @@
         },
         "wait": {
           "$ref": "#/$defs/durationOrCel",
-          "description": "Пауза: длительность или момент; срока (due) у wait нет — пауза сама задаёт время"
+          "description": "Pause: a duration or a point in time; wait has no due, the pause itself sets the time"
         },
         "set": {
           "$ref": "#/$defs/celMap"
@@ -1425,7 +1437,7 @@
               }
             }
           ],
-          "description": "Выполнить onCompensate сделанных шагов в обратном порядке"
+          "description": "Run onCompensate of completed steps in reverse order"
         },
         "fork": {
           "type": "object",
@@ -1504,7 +1516,7 @@
                     "type": "string",
                     "pattern": "^[a-z][a-z0-9_.-]*$"
                   },
-                  "description": "Типы ошибок для повтора; по умолчанию все"
+                  "description": "Error types to retry; all by default"
                 }
               }
             },
@@ -1581,7 +1593,7 @@
     "processTimers": {
       "type": "array",
       "maxItems": 20,
-      "description": "Граничные таймеры: срабатывают, пока стадия (процесс) открыта; at от данных пересчитывается при их изменении",
+      "description": "Boundary timers: fire while the stage (process) is open; at from data is recalculated when the data changes",
       "items": {
         "type": "object",
         "required": [
@@ -1610,7 +1622,7 @@
     "processTrigger": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Источник события: событие журнала ядра или наблюдение. where — фильтр CEL над event",
+      "description": "Event source: a core journal event or an observation. where is a CEL filter over event",
       "oneOf": [
         {
           "required": [
@@ -1653,7 +1665,7 @@
       "required": [
         "anchors"
       ],
-      "description": "Профиль контекста исполнителя шага из памяти: явные связи первыми, смысловой добор с пометкой inferred",
+      "description": "Context profile of the step executor from memory: explicit relations first, semantic expansion marked inferred",
       "$comment": "TAI-ADR-0054 Р16",
       "properties": {
         "anchors": {
@@ -1669,7 +1681,7 @@
         },
         "semantic": {
           "type": "boolean",
-          "description": "Добор по смыслу (inferred); по умолчанию true"
+          "description": "Semantic expansion (inferred); true by default"
         },
         "budgetTokens": {
           "type": "integer",
@@ -1683,22 +1695,56 @@
       "minLength": 1,
       "maxLength": 63,
       "pattern": "^[a-z0-9][a-z0-9_-]*$",
-      "description": "Ключ типа: латиница в нижнем регистре, цифры, _ и -"
+      "description": "Type key: lowercase Latin letters, digits, _ and -"
+    },
+    "workdayAmount": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/workdayCount"
+        },
+        {
+          "$ref": "#/$defs/workingAmountExpr"
+        }
+      ]
     },
     "workdayCount": {
       "type": "integer",
       "minimum": 1,
       "maximum": 1000,
-      "description": "Рабочие дни по календарю: то же время суток через n рабочих дней (cal.addWorkdays)"
+      "description": "Workdays by the calendar: the same time of day n workdays later (cal.addWorkdays)"
+    },
+    "workhourAmount": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/workhourCount"
+        },
+        {
+          "$ref": "#/$defs/workingAmountExpr"
+        }
+      ]
     },
     "workhourCount": {
       "type": "number",
       "exclusiveMinimum": 0,
       "maximum": 10000,
-      "description": "Часы рабочего времени по календарю с рабочими часами (cal.addWorkingTime)"
+      "description": "Working-time hours by a calendar with working hours (cal.addWorkingTime)"
+    },
+    "workingAmountExpr": {
+      "type": "object",
+      "required": [
+        "expr"
+      ],
+      "additionalProperties": false,
+      "description": "Number of work units as a CEL expression: a non-negative integer, evaluated once on entering the step (settings.* are the package settings); after that the due date is computed as from a number",
+      "$comment": "CP-ADR-0081 Г1",
+      "properties": {
+        "expr": {
+          "$ref": "#/$defs/cel"
+        }
+      }
     },
     "workingSpan": {
-      "description": "Промежуток: длительность ISO 8601 (астрономическое время), {workdays} или {workhours} по календарю срока",
+      "description": "Interval: an ISO 8601 duration (astronomical time), {workdays} or {workhours} by the due calendar",
       "oneOf": [
         {
           "$ref": "#/$defs/duration"
@@ -1711,7 +1757,7 @@
           "additionalProperties": false,
           "properties": {
             "workdays": {
-              "$ref": "#/$defs/workdayCount"
+              "$ref": "#/$defs/workdayAmount"
             }
           }
         },
@@ -1723,7 +1769,7 @@
           "additionalProperties": false,
           "properties": {
             "workhours": {
-              "$ref": "#/$defs/workhourCount"
+              "$ref": "#/$defs/workhourAmount"
             }
           }
         }

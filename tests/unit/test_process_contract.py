@@ -44,14 +44,15 @@ from control_plane.api.v1.schemas import (
 from control_plane.domain.enums import Permission
 from control_plane.domain.event_catalog import event_types, get_event_type
 from control_plane.domain.package_plan import PLANNED_KINDS
-from tests.package_sdk import PINNED_NAMES, live_schema_path, schema_path
+from tests.package_sdk import PINNED_NAMES, UMBRELLA, live_schema_path, schema_path
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures"
 PINNED = FIXTURES / "superproject"
 EXAMPLES = FIXTURES / "processes"
-# In the superproject control-plane is a submodule at its root (flat layout).
-SUPERPROJECT = ROOT.parent
+# The superproject control-plane is a submodule of, by its layout (TAI-ADR-0064):
+# services/control-plane, or control-plane at the root in the flat one.
+SUPERPROJECT = UMBRELLA
 SUPERPROJECT_EXAMPLES = SUPERPROJECT / "tools" / "tests" / "fixtures" / "process"
 # The skill of a process's retrospective (package process-knowledge, CP-ADR-0076 §6).
 SUPERPROJECT_RETROSPECTIVE = (
@@ -69,8 +70,8 @@ def _yaml12_loader() -> type[yaml.SafeLoader]:
     """SafeLoader with the booleans of YAML 1.2 only (TAI-ADR-0054 p.11).
 
     PyYAML follows YAML 1.1 and reads ``on``/``off``/``yes``/``no`` as bools:
-    the key ``on`` of a trigger would become ``True``. The superproject reads
-    packages the same way (``tools/cp_packages.py``)."""
+    the key ``on`` of a trigger would become ``True``. package-sdk reads
+    packages the same way."""
 
     class Loader(yaml.SafeLoader):
         pass

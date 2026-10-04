@@ -36,6 +36,7 @@ from control_plane.application.commands.process_instances import (
     get_instance,
     journal_calendars,
     journal_records,
+    journal_settings,
 )
 from control_plane.domain import process_engine as engine
 from control_plane.domain import process_replay
@@ -160,9 +161,13 @@ async def replay_one(
     """Replay the journal of ``instance`` on ``definition`` under the instance's version."""
     entries = await journal_records(db, instance.id)
     calendars = await journal_calendars(db, instance.tenant_id, entries)
+    # The values each record saw; the candidate keeps the types it was checked with.
+    settings = await journal_settings(db, instance.tenant_id, definition, entries)
     revision = await engine_revision_of(db, instance, revisions)
     candidate = process_replay.as_version(definition, instance.definition_version, revision)
-    result = process_replay.replay(candidate, entries, calendars, stop=True)
+    result = process_replay.replay(
+        candidate, entries, calendars, stop=True, settings=settings.values
+    )
     last = int(entries[-1]["seq"]) if entries else 0
     divergence = process_replay.first_divergence(result, instance.state, last)
     return InstanceReplay(instance, result.steps, divergence)

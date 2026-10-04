@@ -50,6 +50,7 @@ def normalize_media_type(value: str | None) -> str:
     return match.group(1).lower() + (f"; {params.lstrip(';').strip()}" if params else "")
 
 
+# visibility: tenant — an upload is its uploader's until an artifact (the seam) uses it
 @router.put(
     "/artifact-contents",
     response_model=ArtifactContentOut,

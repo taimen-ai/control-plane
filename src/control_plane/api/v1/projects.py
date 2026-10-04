@@ -45,6 +45,7 @@ from control_plane.application.queries.package_links import (
     attach_packages,
     in_package,
 )
+from control_plane.application.visibility import workspace_condition
 from control_plane.domain.enums import Permission
 from control_plane.infrastructure.db.models import (
     ProjectConfigRevision,
@@ -96,6 +97,17 @@ async def _project_bodies(
         else {}
     )
     parents = await queries.parent_project_ids(db, ctx.tenant_id, projects)
+    if ctx.visible_workspaces is not None and parents:
+        # A parent project of an invisible workspace is not named (CP-ADR-0082 §3.9).
+        seen = set(
+            await db.scalars(
+                select(ProjectProfile.id).where(
+                    ProjectProfile.id.in_(set(parents.values())),
+                    workspace_condition(ctx, ProjectProfile.workspace_id),
+                )
+            )
+        )
+        parents = {child: parent for child, parent in parents.items() if parent in seen}
     bodies = []
     for project in projects:
         template = templates.get(project.template_id)
@@ -120,6 +132,7 @@ async def _project_bodies(
 # --- project templates --------------------------------------------------------
 
 
+# visibility: tenant — project templates are objects of the tenant
 @router.post(
     "/project-templates",
     response_model=ProjectTemplateOut,
@@ -162,6 +175,7 @@ async def create_project_template(
     )
 
 
+# visibility: tenant — project templates are objects of the tenant
 @router.get("/project-templates", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_project_templates(
     ctx: AuthDep,
@@ -202,6 +216,7 @@ async def list_project_templates(
     return JSONResponse(page_body(items, next_cursor))
 
 
+# visibility: tenant — project templates are objects of the tenant
 @router.get(
     "/project-templates/{template_id}",
     response_model=ProjectTemplateOut,
@@ -214,6 +229,7 @@ async def get_project_template(template_id: uuid.UUID, ctx: AuthDep, db: DbDep) 
     return JSONResponse(await attach_package(db, ctx.tenant_id, "ProjectTemplate", body))
 
 
+# visibility: tenant — project templates are objects of the tenant
 @router.post(
     "/project-templates/{template_id}:deprecate",
     response_model=ProjectTemplateOut,

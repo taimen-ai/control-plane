@@ -34,15 +34,20 @@ from control_plane.application.commands._child_ceiling import (
 )
 from control_plane.application.commands.eligibility import parse_skill_ref
 from control_plane.application.commands.relations import resolve_task
+from control_plane.application.commands.skill_outputs import record_task_outputs
 from control_plane.application.commands.task_types import task_type_of
 from control_plane.application.common import clamp_ttl, new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_principal_key_share
-from control_plane.application.queries.approval_gates import pending_gate_approvals
+from control_plane.application.queries.approval_gates import (
+    pending_gate_approvals,
+    require_open_gates,
+)
 from control_plane.application.queries.tool_policy import (
     decide_for_skill,
     resolve_effective_tool_policy,
 )
+from control_plane.application.visibility import task_condition, task_visible
 from control_plane.config import Settings
 from control_plane.domain import process_engine
 from control_plane.domain.canonical import canonical_bytes
@@ -70,6 +75,7 @@ from control_plane.domain.project import guard_json_document
 from control_plane.domain.skill_contract import schema_errors
 from control_plane.domain.tool_discovery import REASON_CHILD_GRANT
 from control_plane.domain.work_item import TERMINAL_CATEGORIES
+from control_plane.infrastructure.content_store import ContentStore
 from control_plane.infrastructure.db.models import (
     Approval,
     Artifact,
@@ -316,13 +322,7 @@ async def _execution_basis(
 
 async def _require_open_gates(session: AsyncSession, ctx: AuthContext, task: Task) -> None:
     """An execution basis holds only while no gate approval holds the task."""
-    pending = await pending_gate_approvals(session, ctx.tenant_id, task.id)
-    if pending:
-        raise ConflictError(
-            "approval_required",
-            "Task is waiting for a pending gate approval",
-            details={"taskId": str(task.id), "pendingApprovals": pending},
-        )
+    await require_open_gates(session, ctx, task.id)
 
 
 def _require_open_task(task: Task) -> None:
@@ -498,7 +498,7 @@ async def invoke_skill(
         run = await session.scalar(
             select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
         )
-        if run is None:
+        if run is None or not await task_visible(session, ctx, run.task_id):
             raise NotFoundError("Run not found", details={"runId": str(run_id)})
         if run.principal_id != ctx.principal_id:
             raise AuthorizationError(
@@ -656,6 +656,12 @@ def _same_call(
 # --- read ---------------------------------------------------------------------
 
 
+async def _invocation_visible(
+    session: AsyncSession, ctx: AuthContext, invocation: SkillInvocation
+) -> bool:
+    return invocation.task_id is None or await task_visible(session, ctx, invocation.task_id)
+
+
 async def get_skill_invocation(
     session: AsyncSession, ctx: AuthContext, invocation_id: uuid.UUID
 ) -> tuple[SkillInvocation, Skill]:
@@ -680,10 +686,12 @@ async def get_skill_invocation(
             "Skill invocation not found", details={"invocationId": str(invocation_id)}
         )
     invocation, skill = row
+    # A call on invisible work is a missing call; one without work is an
+    # object of the tenant (CP-ADR-0082 §4).
     if not (
         ctx.principal_id in (invocation.authority_principal_id, invocation.executor_principal_id)
         or ctx.has(Permission.SKILLS_EXECUTE)
-    ):
+    ) or not await _invocation_visible(session, ctx, invocation):
         raise NotFoundError(
             "Skill invocation not found", details={"invocationId": str(invocation_id)}
         )
@@ -1092,6 +1100,9 @@ async def claim_skill_invocation(
                 SkillInvocation.status == SkillInvocationStatus.PENDING,
                 SkillInvocation.available_at <= now,
                 or_(*protocol_filter),
+                # An executor narrowed to its workspaces takes no call on
+                # work outside them (CP-ADR-0082 §4).
+                task_condition(ctx, SkillInvocation.task_id, tenant_level=True),
             )
             .order_by(SkillInvocation.available_at, SkillInvocation.created_at, SkillInvocation.id)
             .limit(1)
@@ -1250,7 +1261,7 @@ async def _locked_own_lease(
         )
         .with_for_update()
     )
-    if invocation is None:
+    if invocation is None or not await _invocation_visible(session, ctx, invocation):
         raise NotFoundError(
             "Skill invocation not found", details={"invocationId": str(invocation_id)}
         )
@@ -1328,8 +1339,13 @@ async def complete_skill_invocation(
     output: dict[str, Any],
     cost: dict[str, Any] | None = None,
     session_id: uuid.UUID | None = None,
+    store: ContentStore | None = None,
 ) -> tuple[SkillInvocation, Skill]:
-    """Accept a result — after checking it against the contract ourselves."""
+    """Accept a result — after checking it against the contract ourselves.
+
+    The execution call of a task also hands in the task's typed outputs
+    (``record_task_outputs``) before the ``skill_result`` that reports them.
+    """
     invocation, skill = await _locked_own_lease(
         session, ctx, invocation_id, fencing_token, session_id, lock_authority=True
     )
@@ -1369,9 +1385,10 @@ async def complete_skill_invocation(
     invocation.finished_at = now
     invocation.updated_at = now
 
+    outputs = await record_task_outputs(session, ctx, store, invocation, skill, output=output)
     if invocation.task_id is not None:
         invocation.artifact_id = await _record_result_artifact(
-            session, ctx, invocation, skill, output=output
+            session, ctx, invocation, skill, output=output, outputs=outputs
         )
 
     await record_event(
@@ -1393,6 +1410,7 @@ async def complete_skill_invocation(
             "runId": str(invocation.run_id) if invocation.run_id else None,
             "artifactId": str(invocation.artifact_id) if invocation.artifact_id else None,
             "cost": cost,
+            "outputs": outputs,
         },
     )
     return invocation, skill
@@ -1459,8 +1477,12 @@ async def cancel_skill_invocation(
         )
         .with_for_update()
     )
-    if invocation is None or not (
-        invocation.authority_principal_id == ctx.principal_id or ctx.has(Permission.ORG_MANAGE)
+    if (
+        invocation is None
+        or not (
+            invocation.authority_principal_id == ctx.principal_id or ctx.has(Permission.ORG_MANAGE)
+        )
+        or not await _invocation_visible(session, ctx, invocation)
     ):
         raise NotFoundError(
             "Skill invocation not found", details={"invocationId": str(invocation_id)}
@@ -1673,11 +1695,14 @@ async def _record_result_artifact(
     skill: Skill,
     *,
     output: dict[str, Any],
+    outputs: list[dict[str, Any]],
 ) -> uuid.UUID:
     """Evidence on the Work item: a ``skill_result`` artifact (ADR-0056 §2).
 
     Authored by the invocation's authority, not the executor: the executor is
-    a transport and the result belongs to whoever acted.
+    a transport and the result belongs to whoever acted. ``metadata.outputs``
+    says what became of the task's typed outputs (empty unless this is the
+    task's execution call).
     """
     task = await session.get(Task, invocation.task_id)
     assert task is not None
@@ -1703,6 +1728,7 @@ async def _record_result_artifact(
             "skillId": str(skill.id),
             "invocationId": str(invocation.id),
             "executorPrincipalId": str(ctx.principal_id),
+            "outputs": outputs,
         },
         created_at=utcnow(),
     )

@@ -17,19 +17,14 @@ from fastapi import APIRouter, Header, Query, Response
 from fastapi.responses import JSONResponse
 
 from control_plane.api.dependencies import AuthDep, DbDep
+from control_plane.api.etag import none_match
 from control_plane.api.v1.schemas import ERROR_RESPONSES
 from control_plane.application.queries import tool_policy as tool_queries
 
 router = APIRouter(tags=["tools"])
 
 
-def _matches(if_none_match: str | None, view_hash: str) -> bool:
-    if not if_none_match:
-        return False
-    candidates = (value.strip().removeprefix("W/").strip('"') for value in if_none_match.split(","))
-    return view_hash in candidates
-
-
+# visibility: tenant — tools are objects of the tenant
 @router.get(
     "/tools",
     responses=ERROR_RESPONSES,
@@ -48,7 +43,7 @@ async def search_tools(
         db, ctx, query=query, run_id=run_id, limit=limit, cursor=cursor
     )
     view_hash = page["view"]["viewHash"]
-    if _matches(if_none_match, view_hash):
+    if none_match(if_none_match, view_hash):
         # The projection is unchanged only because BOTH revisions are unchanged
         # — the hash covers catalog, policy and the query itself, so a 304 can
         # never mean "we did not check".
@@ -56,6 +51,7 @@ async def search_tools(
     return JSONResponse(page, headers={"ETag": f'"{view_hash}"'})
 
 
+# visibility: tenant — tools are objects of the tenant
 @router.get(
     "/tools/{tool_ref:path}",
     responses=ERROR_RESPONSES,

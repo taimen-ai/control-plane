@@ -249,7 +249,7 @@ async def test_validate_answers_like_publish_and_writes_nothing(
 
 
 async def test_the_executor_image_is_data_of_the_revision(client: httpx.AsyncClient) -> None:
-    """Amendment E1-E3: ``executor.image`` is stored, hashed and handed out with the spec."""
+    """CP-ADR-0073 Z1-Z3: ``executor.image`` is stored, hashed and handed out with the spec."""
     admin_key, workspace = await _tenant(client)
     spec = coder_spec(workspace["id"])
     assert "image" not in spec["executor"]
@@ -306,6 +306,56 @@ async def test_the_executor_image_is_data_of_the_revision(client: httpx.AsyncCli
     assert (await client.get("/api/v1/agents/coder", headers=auth(admin_key))).json()[
         "currentRevision"
     ] == 3
+
+
+async def test_fractional_cpus_are_refused_by_the_shape_with_the_path_of_the_field(
+    client: httpx.AsyncClient,
+) -> None:
+    """Amendment 2026-10-03 of CP-ADR-0073: not ``non_canonical_value`` of the whole spec."""
+    admin_key, workspace = await _tenant(client)
+    spec = coder_spec(workspace["id"])
+    for cpus in (0.5, 1.5):
+        bad = {**spec, "placement": {**spec["placement"], "resources": {"cpus": cpus}}}
+        for path in ("/api/v1/agents:validate", "/api/v1/agents"):
+            response = await client.post(
+                path, json={"key": "coder", "spec": bad}, headers=auth(admin_key)
+            )
+            assert response.status_code == 400, response.text
+            assert response.json()["error"]["code"] == "invalid_request"
+            [error] = response.json()["error"]["details"]["errors"]
+            assert error["loc"] == "body.spec.placement.resources.cpus"
+            assert "whole number" in error["message"]
+    assert (await client.get("/api/v1/agents/coder", headers=auth(admin_key))).status_code == 404
+
+    # A whole float is the integer it names: the same revision, published once.
+    whole = {**spec, "placement": {**spec["placement"], "resources": {"cpus": 2}}}
+    first = await _publish(client, admin_key, whole)
+    assert first.status_code == 201, first.text
+    as_float = {**spec, "placement": {**spec["placement"], "resources": {"cpus": 2.0}}}
+    again = await _publish(client, admin_key, as_float)
+    assert again.status_code == 200, again.text
+    assert again.json()["currentRevision"] == 1
+    stored = again.json()["revision"]["spec"]["placement"]["resources"]["cpus"]
+    assert stored == 2 and type(stored) is int
+
+
+async def test_the_scope_ceiling_takes_dotted_iam_scopes(client: httpx.AsyncClient) -> None:
+    """The connector's ``iam:identities.link`` (iam-service ADR-0004) is published."""
+    admin_key, workspace = await _tenant(client)
+    spec = coder_spec(workspace["id"])
+    iam = {"audiences": ["iam"], "scopeCeiling": ["iam:people", "iam:identities.link"]}
+    spec["identity"] = {**spec["identity"], "iam": iam}
+
+    published = await _publish(client, admin_key, spec)
+    assert published.status_code == 201, published.text
+    assert published.json()["revision"]["spec"]["identity"]["iam"] == iam
+
+    for scope in ("iam:identities.", "iam:identities..link", "iam.identities.link"):
+        bad = {**spec, "identity": {**spec["identity"], "iam": {**iam, "scopeCeiling": [scope]}}}
+        response = await _publish(client, admin_key, bad)
+        assert response.status_code == 400, response.text
+    listed = await client.get("/api/v1/agents/coder/revisions", headers=auth(admin_key))
+    assert [item["revision"] for item in listed.json()["items"]] == [1]
 
 
 async def test_references_and_secrets_are_checked(client: httpx.AsyncClient) -> None:
@@ -811,3 +861,32 @@ async def test_a_principal_that_is_not_an_agent_names_no_revision(
     started = await _start(client, runner_key, task, claim)
     assert started.status_code == 201, started.text
     assert started.json()["agentRevisionId"] is None
+
+
+async def test_the_settings_of_a_skills_executor_are_stored_and_shown(
+    client: httpx.AsyncClient,
+) -> None:
+    """``executor.params.env`` of kind ``skills`` (CP-ADR-0073, amendment 2026-10-01).
+
+    Data of the kind: the core stores it as given and shows it with the
+    revision, so an operator reads the portal address the skills use from the
+    description, not from the node's environment; a credential is still refused.
+    """
+    key = (await do_bootstrap(client))["apiKey"]["key"]
+    spec = copy.deepcopy(_fixture("skills-executor.yaml")["spec"])
+    spec.pop("state", None)
+    spec["executor"]["params"] = {"env": {"PORTAL_URL": "https://portal.example.test"}}
+    published = await _publish(client, key, spec, agent="skills-executor")
+    assert published.status_code == 201, published.text
+
+    shown = await client.get("/api/v1/agents/skills-executor", headers=auth(key))
+    assert shown.status_code == 200, shown.text
+    assert shown.json()["revision"]["spec"]["executor"]["params"] == {
+        "env": {"PORTAL_URL": "https://portal.example.test"}
+    }
+
+    # A setting named as a credential is refused by the core's scan of the params.
+    spec["executor"]["params"] = {"env": {"PORTAL_TOKEN": "x"}}
+    refused = await _publish(client, key, spec, agent="skills-executor")
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["code"] == "secret_material_rejected"

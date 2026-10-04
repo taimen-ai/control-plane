@@ -70,6 +70,9 @@ class Permission(StrEnum):
     TASKS_CLAIM = "tasks.claim"
     CLAIMS_MANAGE = "claims.manage"
     EVENTS_READ = "events.read"
+    # Bulk export of the journal for a period (CP-ADR-0068, export amendment). Apart
+    # from events.read: seeing the journal does not include taking it away.
+    EVENTS_EXPORT = "events.export"
     # v0.2 organization model
     WORKSPACES_READ = "workspaces.read"
     WORKSPACES_MANAGE = "workspaces.manage"
@@ -131,11 +134,27 @@ class Permission(StrEnum):
     PROCESSES_OPERATE = "processes.operate"
     PACKAGES_TEST = "packages.test"
     PACKAGES_PLAN = "packages.plan"
+    # package-settings (CP-ADR-0081 §5): reading and changing the settings of a
+    # package are rights apart from planning it — installing the code of a
+    # package and changing its thresholds are different roles (FR-009).
+    PACKAGES_SETTINGS_READ = "packages.settings.read"
+    PACKAGES_SETTINGS_MANAGE = "packages.settings.manage"
     CALENDARS_WRITE = "calendars.write"
     # company-knowledge (CP-ADR-0060 amendment 2026-09-28). A tenant registers
     # the ontology packs of its own kinds; the shared registry stays with the
     # platform administrators, so this right never reaches a shared pack.
     KNOWLEDGE_PACKS_MANAGE = "knowledge.packs.manage"
+    # integrations-connections (CP-ADR-0079 §12). Reading the tenant's
+    # connections and publishing what a connection needs are different roles:
+    # a person who sees a connection does not reshape its type.
+    CONNECTIONS_READ = "connections.read"
+    CONNECTIONS_MANAGE = "connections.manage"
+    # The connector's report that a connection stopped working (§3): neither
+    # right includes the other, a person does not report for the connector.
+    CONNECTIONS_STATUS_WRITE = "connections.status.write"
+    # An agent's secrets by name (§11): the values go to the secret store, so
+    # setting them is a right of its own, apart from describing the agent.
+    AGENTS_SECRETS_MANAGE = "agents.secrets.manage"
     ADMIN = "admin"
 
 
@@ -167,6 +186,30 @@ class TaskTypeStatus(StrEnum):
 class ArtifactTypeStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
+
+
+class ConnectionTypeStatus(StrEnum):
+    """A version of a connection type (CP-ADR-0079 §2), moved like a skill version."""
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+    DISABLED = "disabled"
+
+
+class ConnectionStatus(StrEnum):
+    """Where a connection stands (CP-ADR-0079 §3); a revoked one connects again."""
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
+class ConnectionAuth(StrEnum):
+    """How a connection is authorized now (CP-ADR-0079 §3)."""
+
+    OAUTH2 = "oauth2"
+    TOKEN = "token"
 
 
 class AgentStatus(StrEnum):

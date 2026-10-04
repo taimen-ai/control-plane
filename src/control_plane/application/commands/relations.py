@@ -8,6 +8,7 @@ inserts cannot assemble a cycle together.
 """
 
 import uuid
+from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
+from control_plane.application.visibility import task_condition
 from control_plane.domain.enums import (
     BLOCKING_RELATION_TYPES,
     Permission,
@@ -37,7 +39,9 @@ async def resolve_task(session: AsyncSession, ctx: AuthContext, task_ref: str) -
     except ValueError:
         conditions.append(Task.public_id == task_ref.upper())
     task = await session.scalar(select(Task).where(*conditions))
-    if task is None:
+    # Work of a workspace outside the caller's visibility answers exactly as
+    # missing work, for everything under it too (CP-ADR-0082 §3.7).
+    if task is None or not ctx.sees_workspace(task.workspace_id):
         raise NotFoundError("Task not found", details={"task": task_ref})
     return task
 
@@ -201,6 +205,9 @@ async def remove_relation(
             TaskRelation.id == relation_id,
             TaskRelation.tenant_id == ctx.tenant_id,
             (TaskRelation.from_task_id == task.id) | (TaskRelation.to_task_id == task.id),
+            # A relation to invisible work is not listed, nor removed (CP-ADR-0082 §3.7).
+            task_condition(ctx, TaskRelation.from_task_id),
+            task_condition(ctx, TaskRelation.to_task_id),
         )
         .with_for_update()
     )
@@ -228,21 +235,39 @@ async def remove_relation(
     )
 
 
-async def unmet_prerequisites(
-    session: AsyncSession, tenant_id: uuid.UUID, task_id: uuid.UUID
-) -> list[dict[str, str]]:
-    """Blocking prerequisites of a task that are not completed.
+def _blocker(row: Any) -> dict[str, str]:
+    return {
+        "taskId": str(row[0]),
+        "publicId": row[1],
+        "status": row[2],
+        "systemStatusCategory": row[3],
+    }
 
-    Prerequisites are: targets of the task's ``depends_on`` edges and sources
-    of ``blocks`` edges pointing at the task. Only the ``terminal_success``
-    CATEGORY satisfies a prerequisite (ADR-0048); a cancelled prerequisite
-    keeps blocking until the relation is removed — deliberate, documented
-    behavior.
+
+async def shown_prerequisites(
+    session: AsyncSession, ctx: AuthContext, task_id: uuid.UUID
+) -> tuple[list[dict[str, str]], int]:
+    """The unmet prerequisites as the caller may see them, and how many it may not.
+
+    A prerequisite of an invisible workspace still blocks — readiness is the
+    same for everyone — but is not named: neither its id nor its status
+    (CP-ADR-0082 V4). Only the count of such blockers tells why the work waits.
     """
+    shown: list[dict[str, str]] = []
+    hidden = 0
+    for row in await _unmet_rows(session, ctx.tenant_id, task_id):
+        if ctx.sees_workspace(row[4]):
+            shown.append(_blocker(row))
+        else:
+            hidden += 1
+    return shown, hidden
+
+
+async def _unmet_rows(session: AsyncSession, tenant_id: uuid.UUID, task_id: uuid.UUID) -> list[Any]:
     rows = await session.execute(
         text(
             """
-            SELECT t.id, t.public_id, t.status, t.system_status_category
+            SELECT t.id, t.public_id, t.status, t.system_status_category, t.workspace_id
             FROM task_relations r
             JOIN tasks t ON t.id = CASE
                 WHEN r.relation_type = 'depends_on' AND r.from_task_id = :task
@@ -258,15 +283,7 @@ async def unmet_prerequisites(
         ),
         {"tenant": tenant_id, "task": task_id},
     )
-    return [
-        {
-            "taskId": str(row[0]),
-            "publicId": row[1],
-            "status": row[2],
-            "systemStatusCategory": row[3],
-        }
-        for row in rows
-    ]
+    return list(rows.all())
 
 
 async def check_task_readiness(session: AsyncSession, ctx: AuthContext, task: Task) -> None:
@@ -276,10 +293,13 @@ async def check_task_readiness(session: AsyncSession, ctx: AuthContext, task: Ta
     transaction: an uncommitted prerequisite completion is invisible here, so
     a dependent task can never be claimed before the completion has committed.
     """
-    blocking = await unmet_prerequisites(session, ctx.tenant_id, task.id)
-    if blocking:
+    blocking, hidden = await shown_prerequisites(session, ctx, task.id)
+    if blocking or hidden:
+        details: dict[str, Any] = {"taskId": str(task.id), "blockedBy": blocking}
+        if hidden:
+            details["hiddenBlockers"] = hidden
         raise ConflictError(
             "task_not_ready",
             "Task has incomplete blocking dependencies",
-            details={"taskId": str(task.id), "blockedBy": blocking},
+            details=details,
         )

@@ -6,6 +6,7 @@ the same thing the old six-value enumeration meant. Downgrade is lossy, and
 the test pins exactly HOW it is lossy rather than pretending it is not.
 """
 
+import uuid
 from collections.abc import Iterator
 
 import httpx
@@ -14,6 +15,7 @@ from alembic import command as alembic_command
 from alembic.config import Config
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 from tests.helpers import (
     auth,
@@ -29,12 +31,11 @@ V07_HEAD = "f5b91c3e7a24"
 V08_TYPES = "c8a51d70b394"
 # Second revision of the v0.8 line: custom fields and planned dates (ADR-0049).
 V08_FIELDS = "a1c7e94b2f60"
-# The current head of the chain the v0.8 tests upgrade back to (the last
-# revision retires process and calendar keys, CP-ADR-0074 amendment Zh1, on top
-# of the merge of the engine revision, step attempts and SLA deadlines of
-# processes, CP-ADR-0078, with the package links of every catalog kind,
-# CP-ADR-0074 amendment of 2026-09-29).
-V08_HEAD = "c3e8f1a6d2b4"
+# The current head of the chain the v0.8 tests upgrade back to: the merge of
+# the event-journal filter indexes (CP-ADR-0068, amendment B) with main (a rule
+# action stores no empty fields, CP-ADR-0063 amendment Z1, on top of the merge
+# of the people-access line, CP-ADR-0082, with main).
+V08_HEAD = "b7e3d9a1c4f2"
 # The revision right before the agent registry.
 BEFORE_AGENT_REGISTRY = "c3f8a2d6e1b7"
 # The revision right before attention feedback (CP-ADR-0068 approval workspaces).
@@ -267,6 +268,124 @@ async def test_observation_dedup_revision_is_additive_and_reversible(
     repeat = await client.post("/api/v1/observations", json=body, headers=auth(admin_key))
     assert repeat.status_code == 200
     assert repeat.json()["id"] == again.json()["id"]
+
+
+# The author joins the observation dedup key (CP-ADR-0057, 2026-10-01).
+DEDUP_KEY_AUTHOR = "f4d2b8e6a1c3"
+BEFORE_DEDUP_KEY_AUTHOR = "a3f7c1e9d5b2"
+
+
+def _dedup_rows(sync_engine: Engine) -> list[tuple[str, str]]:
+    with sync_engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT dedup_key, CAST(observation_id AS text) FROM observation_dedup_keys")
+        ).all()
+    return sorted((row[0], row[1]) for row in rows)
+
+
+async def test_dedup_key_author_revision_roundtrips_shared_keys(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """Downgrade keeps the earliest author of a shared key; upgrade takes the
+    author from the journal and drops a key whose event is gone."""
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    _, first_key = await create_agent_with_key(client, admin_key, name="first")
+    _, second_key = await create_agent_with_key(client, admin_key, name="second")
+    body = {"kind": "external_fact", "content": "x", "source": "ci", "dedupKey": "shared"}
+    first = await client.post("/api/v1/observations", json=body, headers=auth(first_key))
+    second = await client.post("/api/v1/observations", json=body, headers=auth(second_key))
+    assert (first.status_code, second.status_code) == (201, 201)
+    assert first.json()["id"] != second.json()["id"]
+    assert len(_dedup_rows(sync_engine)) == 2
+
+    alembic_command.downgrade(v08_alembic_config, BEFORE_DEDUP_KEY_AUTHOR)
+    inspector = inspect(sync_engine)
+    assert inspector.get_pk_constraint("observation_dedup_keys")["constrained_columns"] == [
+        "tenant_id",
+        "source",
+        "dedup_key",
+    ]
+    assert _dedup_rows(sync_engine) == [("shared", first.json()["id"])]
+    # A key whose journal event is gone has no provable author.
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO observation_dedup_keys (tenant_id, source, dedup_key, "
+                "observation_id, event_id, kind, recorded_at) "
+                "VALUES (:tenant, 'ci', 'orphan', gen_random_uuid(), gen_random_uuid(), "
+                "'external_fact', now())"
+            ),
+            {"tenant": boot["tenant"]["id"]},
+        )
+
+    alembic_command.upgrade(v08_alembic_config, DEDUP_KEY_AUTHOR)
+    inspector = inspect(sync_engine)
+    assert inspector.get_pk_constraint("observation_dedup_keys")["constrained_columns"] == [
+        "tenant_id",
+        "source",
+        "dedup_key",
+        "actor_id",
+    ]
+    assert _dedup_rows(sync_engine) == [("shared", first.json()["id"])]
+    alembic_command.upgrade(v08_alembic_config, "head")
+
+    # The kept author still dedups; the dropped one records anew, then dedups.
+    repeat = await client.post("/api/v1/observations", json=body, headers=auth(first_key))
+    assert (repeat.status_code, repeat.json()["id"]) == (200, first.json()["id"])
+    again = await client.post("/api/v1/observations", json=body, headers=auth(second_key))
+    assert again.status_code == 201
+    twice = await client.post("/api/v1/observations", json=body, headers=auth(second_key))
+    assert (twice.status_code, twice.json()["id"]) == (200, again.json()["id"])
+
+
+# The names of agents' secrets (CP-ADR-0079 §11, §16; I012).
+AGENT_SECRET_NAMES = "b7e3d1f9c4a2"
+
+
+async def test_agent_secret_names_revision_is_additive_and_reversible(
+    client: httpx.AsyncClient, sync_engine: Engine, v08_alembic_config: Config
+) -> None:
+    """The revision only adds the table; its CHECK keeps a name a name; downgrade drops it."""
+    boot = await do_bootstrap(client)
+    alembic_command.downgrade(v08_alembic_config, DEDUP_KEY_AUTHOR)
+    assert "agent_secret_names" not in inspect(sync_engine).get_table_names()
+    alembic_command.upgrade(v08_alembic_config, AGENT_SECRET_NAMES)
+    inspector = inspect(sync_engine)
+    assert inspector.get_pk_constraint("agent_secret_names")["constrained_columns"] == [
+        "agent_id",
+        "name",
+    ]
+    assert {column["name"] for column in inspector.get_columns("agent_secret_names")} == {
+        "agent_id",
+        "name",
+        "tenant_id",
+        "created_by",
+        "created_at",
+        "updated_by",
+        "updated_at",
+    }
+    insert = text(
+        "INSERT INTO agents (id, tenant_id, key, display_name, status, state, replicas, "
+        "current_revision, version, created_by, created_at, updated_at) "
+        "VALUES (:id, :tenant, 'runner', 'Runner', 'active', 'stopped', 0, 1, 1, :admin, "
+        "now(), now())"
+    )
+    name = text(
+        "INSERT INTO agent_secret_names (agent_id, name, tenant_id, created_by, created_at, "
+        "updated_by, updated_at) VALUES (:agent, :name, :tenant, :admin, now(), :admin, now())"
+    )
+    agent_id = uuid.uuid4()
+    ids = {"tenant": boot["tenant"]["id"], "admin": boot["adminPrincipal"]["id"]}
+    with sync_engine.begin() as conn:
+        conn.execute(insert, {"id": agent_id, **ids})
+        conn.execute(name, {"agent": agent_id, "name": "gh-token", **ids})
+    for bad in ("Upper", "a/b", "-x", "a" * 64):
+        with pytest.raises(IntegrityError), sync_engine.begin() as conn:
+            conn.execute(name, {"agent": agent_id, "name": bad, **ids})
+    alembic_command.downgrade(v08_alembic_config, DEDUP_KEY_AUTHOR)
+    assert "agent_secret_names" not in inspect(sync_engine).get_table_names()
+    alembic_command.upgrade(v08_alembic_config, "head")
 
 
 async def test_attention_feedback_revision_is_additive_and_reversible(
@@ -517,8 +636,13 @@ async def test_running_invocations_gain_an_attempt_start_on_upgrade(
     assert attempt_started == started
 
     # A row the backfill missed still gets a bounded lease instead of a 500.
+    # The API reads the schema of the code: back to the head first.
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
     with sync_engine.begin() as connection:
         connection.execute(text("UPDATE skill_invocations SET attempt_started_at = NULL"))
+    # The API reads the current schema on every request (the visibility of a
+    # binding, CP-ADR-0082): it is called on the head, the row stays as left.
+    alembic_command.upgrade(v08_alembic_config, V08_HEAD)
     beat = await client.post(
         f"/api/v1/skill-invocations/{created['id']}:heartbeat",
         json={"fencingToken": lease["fencingToken"], "leaseSeconds": 3600},

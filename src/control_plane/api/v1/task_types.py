@@ -18,6 +18,8 @@ from control_plane.api.v1.schemas import (
     PACKAGE_FILTER_DESCRIPTION,
     PageOut,
     TaskTypeCreateRequest,
+    TaskTypeExecutorOut,
+    TaskTypeExecutorsOut,
     TaskTypeMigrateTasksOut,
     TaskTypeMigrateTasksRequest,
     TaskTypeOut,
@@ -29,6 +31,7 @@ from control_plane.api.write_flow import execute_write
 from control_plane.application.authorization import authorize
 from control_plane.application.commands import task_type_migration as migration_commands
 from control_plane.application.commands import task_types as commands
+from control_plane.application.commands.workspaces import effective_task_types, get_tenant_workspace
 from control_plane.application.common import make_created_cursor, parse_created_cursor
 from control_plane.application.queries.lists import clamp_limit
 from control_plane.application.queries.package_links import (
@@ -36,12 +39,14 @@ from control_plane.application.queries.package_links import (
     attach_packages,
     in_package,
 )
+from control_plane.application.queries.task_type_executors import list_task_type_executors
 from control_plane.domain.enums import Permission
 from control_plane.infrastructure.db.models import TaskType
 
 router = APIRouter(tags=["task-types"])
 
 
+# visibility: tenant — task types are objects of the tenant
 @router.post(
     "/task-types",
     response_model=TaskTypeOut,
@@ -72,6 +77,7 @@ async def create_task_type(
             completion_schema=payload.completion_schema,
             artifact_schema=payload.artifact_schema,
             acceptance=work_document(payload.acceptance),
+            executor_roles=payload.executor_roles,
         )
         return 201, await attach_package(
             db, ctx.tenant_id, "TaskType", dump(TaskTypeOut, task_type)
@@ -87,6 +93,7 @@ async def create_task_type(
     )
 
 
+# visibility: tenant — task types are objects of the tenant
 @router.get("/task-types", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_task_types(
     ctx: AuthDep,
@@ -96,10 +103,22 @@ async def list_task_types(
     key: str | None = Query(default=None),
     status: str | None = Query(default=None),
     package: str | None = Query(default=None, description=PACKAGE_FILTER_DESCRIPTION),
+    workspace_id: uuid.UUID | None = Query(
+        default=None,
+        alias="workspaceId",
+        description="Only the types allowed in this workspace: its effectiveTaskTypes "
+        "(CP-ADR-0008, amendment 2026-10-03 A2)",
+    ),
 ) -> JSONResponse:
     await authorize(ctx, Permission.TASK_TYPES_READ)
     effective_limit = clamp_limit(limit)
     stmt = select(TaskType).where(TaskType.tenant_id == ctx.tenant_id)
+    if workspace_id is not None:
+        # A workspace of another tenant is as absent as a missing one: 404.
+        await get_tenant_workspace(db, ctx, workspace_id)
+        allowed = await effective_task_types(db, ctx.tenant_id, workspace_id)
+        if allowed is not None:
+            stmt = stmt.where(TaskType.key.in_(allowed))
     if key is not None:
         stmt = stmt.where(TaskType.key == key)
     if status is not None:
@@ -123,6 +142,7 @@ async def list_task_types(
     return JSONResponse(page_body(items, next_cursor))
 
 
+# visibility: tenant — task types are objects of the tenant
 @router.get("/task-types/{type_id}", response_model=TaskTypeOut, responses=ERROR_RESPONSES)
 async def get_task_type(type_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     await authorize(ctx, Permission.TASK_TYPES_READ)
@@ -130,6 +150,27 @@ async def get_task_type(type_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResp
     return JSONResponse(await attach_package(db, ctx.tenant_id, "TaskType", body))
 
 
+@router.get(
+    "/task-types/{type_id}/executors",
+    response_model=TaskTypeExecutorsOut,
+    responses=ERROR_RESPONSES,
+    summary="Who may take this task type version in a workspace (ADR-0048, 2026-10-03 A2)",
+)
+async def list_executors(
+    type_id: uuid.UUID,
+    ctx: AuthDep,
+    db: DbDep,
+    workspace_id: uuid.UUID = Query(alias="workspaceId"),
+) -> JSONResponse:
+    executors = await list_task_type_executors(db, ctx, type_id, workspace_id)
+    items = [
+        TaskTypeExecutorOut.model_validate(e).model_dump(mode="json", by_alias=True)
+        for e in executors
+    ]
+    return JSONResponse({"items": items})
+
+
+# visibility: tenant — task types are objects of the tenant
 @router.post(
     "/task-types/{type_id}:deprecate", response_model=TaskTypeOut, responses=ERROR_RESPONSES
 )

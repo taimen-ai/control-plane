@@ -31,6 +31,7 @@ from control_plane.application.commands.tasks import create_task, enforce_claim_
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_principals_key_share
+from control_plane.application.queries.child_runs import handle_visible
 from control_plane.domain.child_handle import (
     MAX_ARTIFACT_REFS,
     Grant,
@@ -624,7 +625,7 @@ async def revoke_child_handle(
         .where(RunChildHandle.id == handle_id, RunChildHandle.tenant_id == ctx.tenant_id)
         .with_for_update()
     )
-    if handle is None:
+    if handle is None or not await handle_visible(session, ctx, handle):
         raise NotFoundError("Child handle not found", details={"childHandleId": str(handle_id)})
 
     if not ctx.has(Permission.CLAIMS_MANAGE):

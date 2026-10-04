@@ -26,6 +26,7 @@ from control_plane.application.commands.tasks import resolve_task_for_update
 from control_plane.application.common import clamp_ttl, new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_caller
+from control_plane.application.visibility import task_visible
 from control_plane.config import Settings
 from control_plane.domain.enums import ClaimStatus, Permission, SessionStatus
 from control_plane.domain.errors import (
@@ -264,7 +265,8 @@ async def _get_tenant_claim(
     claim = await session.scalar(
         select(TaskClaim).where(TaskClaim.id == claim_id, TaskClaim.tenant_id == ctx.tenant_id)
     )
-    if claim is None:
+    # A claim on invisible work is a missing claim (CP-ADR-0082 §3.7).
+    if claim is None or not await task_visible(session, ctx, claim.task_id):
         raise NotFoundError("Claim not found", details={"claimId": str(claim_id)})
     return claim
 
@@ -283,7 +285,7 @@ async def heartbeat_claim(
         .where(TaskClaim.id == claim_id, TaskClaim.tenant_id == ctx.tenant_id)
         .with_for_update()
     )
-    if claim is None:
+    if claim is None or not await task_visible(session, ctx, claim.task_id):
         raise NotFoundError("Claim not found", details={"claimId": str(claim_id)})
     if claim.holder_id != ctx.principal_id and not ctx.has(Permission.CLAIMS_MANAGE):
         raise AuthorizationError("Claim is held by another principal", code="claim_holder_mismatch")

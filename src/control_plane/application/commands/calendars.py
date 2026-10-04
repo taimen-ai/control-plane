@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.authorization import AuthContext, authorize, permits
 from control_plane.application.commands.catalog_retirements import (
     CALENDAR,
     PROCESS,
@@ -33,7 +33,6 @@ from control_plane.domain.calendar import Calendar, CalendarError, normalized_sp
 from control_plane.domain.canonical import canonicalize, content_hash
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import (
-    AuthorizationError,
     ConflictError,
     NotFoundError,
     ValidationError,
@@ -293,13 +292,9 @@ async def _readable_processes(
     out = []
     for row, count in rows:
         if row.workspace_id not in allowed:
-            try:
-                await authorize(
-                    ctx, Permission.PROCESSES_READ, resource=process_scope(row.workspace_id)
-                )
-                allowed[row.workspace_id] = True
-            except AuthorizationError:
-                allowed[row.workspace_id] = False
+            allowed[row.workspace_id] = await permits(
+                ctx, Permission.PROCESSES_READ, resource=process_scope(row.workspace_id)
+            )
         if allowed[row.workspace_id]:
             out.append((row, count))
     return out

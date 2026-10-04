@@ -32,7 +32,7 @@ from control_plane.application.commands.principal_disable import DISABLEABLE_KIN
 from control_plane.application.commands.principals import ungranted_permissions
 from control_plane.application.common import utcnow
 from control_plane.application.events import event_reason, record_event
-from control_plane.domain.enums import Permission, PrincipalStatus
+from control_plane.domain.enums import AgentStatus, Permission, PrincipalStatus
 from control_plane.domain.errors import AuthorizationError, ConflictError, ValidationError
 from control_plane.infrastructure.db.models import ApiKey, IamPrincipalBinding, Principal
 
@@ -104,7 +104,13 @@ async def enable_gate(
         # Idempotent. It also covers the caller itself: a caller that is not
         # active has already been refused by its own lock.
         return EnableGate(principal=principal, changed=False, live_api_keys=len(live_keys))
-    if principal.kind not in ENABLEABLE_KINDS:
+    # The registry owns the identity of its agents: a retired agent's
+    # principal is its history and comes back only as a new key. A live
+    # agent's principal is enabled here — no other call makes it active again
+    # (publishing does not touch the status), and its bindings come back
+    # through ``PUT /agents/{key}/identity`` (CP-ADR-0073, I5).
+    live_agent = next((a for a in agents if a.status != AgentStatus.RETIRED), None)
+    if live_agent is None and principal.kind not in ENABLEABLE_KINDS:
         raise ValidationError(
             "principal_kind_not_enableable",
             "Only a human or an agent principal can be enabled",
@@ -139,11 +145,8 @@ async def enable_gate(
             details={"missing": missing},
         )
     # After the escalation check, as in ``:disable``: the refusal names the agent.
-    agent = agents[0] if agents else None
+    agent = agents[0] if agents and live_agent is None else None
     if agent is not None:
-        # The registry owns the identity of its agents: a live agent's
-        # principal follows its record, and a retired agent's principal is
-        # its history — the agent comes back only as a new key.
         raise ConflictError(
             "use_agent_publish",
             "The principal belongs to a registered agent: publish the agent instead",

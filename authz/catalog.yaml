@@ -82,6 +82,9 @@ actions:
     resource: workspace
   events.read:
     resource: workspace
+  # выгрузка журнала за период (CP-ADR-0068, амендмент В): GET /events:export
+  events.export:
+    resource: workspace
   projects.read:
     resource: project_profile
     derived: "owner or projects.read@scope"
@@ -122,12 +125,30 @@ actions:
     resource: tenant
   packages.plan:
     resource: tenant
+  # --- настройки пакетов (CP-ADR-0081 §5): чтение и смена значений —
+  # отдельно от packages.plan ---
+  packages.settings.read:
+    resource: tenant
+  packages.settings.manage:
+    resource: tenant
   calendars.write:
     resource: tenant
   # --- база знаний (CP-ADR-0060, амендмент 2026-09-28): регистрация пакета
   # онтологии арендатора (scope: tenant); общие пакеты — только
   # администраторы платформы, это право их не касается ---
   knowledge.packs.manage:
+    resource: tenant
+  # --- подключения (CP-ADR-0079 §12): учёт и типы подключений — уровень
+  # tenant ---
+  connections.read:
+    resource: tenant
+  connections.manage:
+    resource: tenant
+  # отчёт коннектора о статусе подключения; connections.manage его не включает
+  connections.status.write:
+    resource: tenant
+  # секреты агентов по имени (п.11): PUT и DELETE /agents/{key}/secrets/{name}
+  agents.secrets.manage:
     resource: tenant
   project_templates.read:
     resource: tenant

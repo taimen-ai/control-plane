@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.authorization import AuthContext, WorkspaceNotVisible, authorize
 from control_plane.application.commands.artifacts import (
     artifact_resource,
     get_readable_artifact,
@@ -18,6 +18,13 @@ from control_plane.application.commands.task_inputs import resolve_task_inputs
 from control_plane.application.common import decode_cursor, encode_cursor
 from control_plane.application.queries.instructions import instructions_for_task
 from control_plane.application.queries.lists import Page, _paginate, clamp_limit
+from control_plane.application.visibility import (
+    approval_condition,
+    approval_visible,
+    artifact_condition,
+    task_condition,
+    task_visible,
+)
 from control_plane.domain.enums import ApprovalStatus, Permission, RunStatus
 from control_plane.domain.errors import NotFoundError, ValidationError
 from control_plane.infrastructure.db.models import (
@@ -111,6 +118,10 @@ async def list_task_relations(
         .where(
             TaskRelation.tenant_id == ctx.tenant_id,
             (TaskRelation.from_task_id == task.id) | (TaskRelation.to_task_id == task.id),
+            # A relation to invisible work is not shown: it would name that
+            # work (CP-ADR-0082 §3.7).
+            task_condition(ctx, TaskRelation.from_task_id),
+            task_condition(ctx, TaskRelation.to_task_id),
         )
         .order_by(TaskRelation.created_at, TaskRelation.id)
     )
@@ -167,7 +178,7 @@ async def list_runs(
     await authorize(ctx, Permission.TASKS_READ)
     if status is not None and status not in set(RunStatus):
         raise ValidationError("invalid_status", f"Unknown run status: {status}")
-    stmt = select(Run).where(Run.tenant_id == ctx.tenant_id)
+    stmt = select(Run).where(Run.tenant_id == ctx.tenant_id, task_condition(ctx, Run.task_id))
     if task_id is not None:
         stmt = stmt.where(Run.task_id == task_id)
     if claim_id is not None:
@@ -198,7 +209,8 @@ async def list_runs(
 async def get_run(session: AsyncSession, ctx: AuthContext, run_id: uuid.UUID) -> Run:
     await authorize(ctx, Permission.TASKS_READ)
     run = await session.scalar(select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id))
-    if run is None:
+    # A run of invisible work answers as a missing run (CP-ADR-0082 §3.7).
+    if run is None or not await task_visible(session, ctx, run.task_id):
         raise NotFoundError("Run not found", details={"runId": str(run_id)})
     return run
 
@@ -216,10 +228,14 @@ async def list_artifacts(
 ) -> Page[Artifact]:
     # A listing narrowed to one task (or workspace) is decided there, like a
     # single artifact (CP-ADR-0072 §5); an unfiltered one at tenant level.
-    await authorize(
-        ctx, Permission.ARTIFACTS_READ, resource=artifact_resource(task_id, workspace_id)
-    )
-    stmt = select(Artifact).where(Artifact.tenant_id == ctx.tenant_id)
+    try:
+        await authorize(
+            ctx, Permission.ARTIFACTS_READ, resource=artifact_resource(task_id, workspace_id)
+        )
+    except WorkspaceNotVisible:
+        # The empty page of a workspace that does not exist (CP-ADR-0082 §3.7).
+        return Page(items=[], next_cursor=None)
+    stmt = select(Artifact).where(Artifact.tenant_id == ctx.tenant_id, artifact_condition(ctx))
     if task_id is not None:
         stmt = stmt.where(Artifact.task_id == task_id)
     if run_id is not None:
@@ -371,6 +387,7 @@ async def get_run_context(
             .where(
                 Approval.task_id == task.id,
                 Approval.status == ApprovalStatus.PENDING,
+                approval_condition(ctx),
             )
             .order_by(Approval.created_at.desc())
         )
@@ -411,7 +428,7 @@ async def get_run_context(
 
     instructions = await instructions_for_task(session, ctx.tenant_id, task)
     # CP-ADR-0072 §8: what the task's type declares it takes in, resolved now.
-    inputs = await resolve_task_inputs(session, ctx.tenant_id, task)
+    inputs = await resolve_task_inputs(session, ctx, task)
 
     run_session = await session.get(Session, run.session_id)
     skills = await resolve_executable_skills(
@@ -552,7 +569,8 @@ async def list_approvals(
     await authorize(ctx, Permission.APPROVALS_READ)
     if status is not None and status not in set(ApprovalStatus):
         raise ValidationError("invalid_status", f"Unknown approval status: {status}")
-    stmt = select(Approval).where(Approval.tenant_id == ctx.tenant_id)
+    # Approvals of invisible workspaces and work are not listed (CP-ADR-0082 §4).
+    stmt = select(Approval).where(Approval.tenant_id == ctx.tenant_id, approval_condition(ctx))
     if status is not None:
         stmt = stmt.where(Approval.status == status)
     if task_id is not None:
@@ -572,6 +590,7 @@ async def get_approval(session: AsyncSession, ctx: AuthContext, approval_id: uui
     approval = await session.scalar(
         select(Approval).where(Approval.id == approval_id, Approval.tenant_id == ctx.tenant_id)
     )
-    if approval is None:
+    # An invisible approval answers as a missing one (CP-ADR-0082 §3.7).
+    if approval is None or not await approval_visible(session, ctx, approval):
         raise NotFoundError("Approval not found", details={"approvalId": str(approval_id)})
     return approval

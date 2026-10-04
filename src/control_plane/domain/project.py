@@ -25,6 +25,7 @@ from jsonschema.exceptions import SchemaError
 
 from control_plane.domain.agent_instructions import PROJECT_SETTING, validate_instructions
 from control_plane.domain.errors import ValidationError
+from control_plane.domain.redaction import secret_material
 
 # --- payload guards -----------------------------------------------------------
 
@@ -108,17 +109,21 @@ _SECRET_KEY_HINTS = (
 _SECRET_KEY_ALLOWED = frozenset({"secretref", "secret_ref"})
 
 
+def secret_key_name(name: str) -> bool:
+    """Whether a member name looks like it carries a secret (``secretRef`` is fine)."""
+    compact = name.lower().replace("-", "_").replace("_", "")
+    return compact not in _SECRET_KEY_ALLOWED and any(
+        hint.replace("_", "") in compact for hint in _SECRET_KEY_HINTS
+    )
+
+
 def reject_secret_material(value: Any, *, label: str, path: str = "") -> None:
     """Raise if a key looks like it carries a secret (``secretRef`` is fine)."""
     if isinstance(value, dict):
         for key, item in value.items():
             key_text = str(key)
-            normalized = key_text.lower().replace("-", "_")
-            compact = normalized.replace("_", "")
             child_path = f"{path}.{key_text}" if path else key_text
-            if compact not in _SECRET_KEY_ALLOWED and any(
-                hint.replace("_", "") in compact for hint in _SECRET_KEY_HINTS
-            ):
+            if secret_key_name(key_text):
                 raise ValidationError(
                     "secret_material_rejected",
                     "Secrets must not be stored here; use an opaque secretRef instead",
@@ -128,6 +133,48 @@ def reject_secret_material(value: Any, *, label: str, path: str = "") -> None:
     elif isinstance(value, list):
         for index, item in enumerate(value):
             reject_secret_material(item, label=label, path=f"{path}[{index}]")
+
+
+def secret_findings(value: Any, *, names: bool = True) -> list[dict[str, str]]:
+    """Secret material in a JSON document, ``{path, match}`` each.
+
+    The one search behind ``secret_material_rejected`` with ``details.errors``
+    (CP-ADR-0079, the amendment of 2026-10-03):
+    the ``settings`` of a connection, the ``spec`` of a connection type and the
+    settings values of a package (CP-ADR-0081 4.3). A finding is credential
+    material (``secret_material``) in any string, the names of members
+    included, and, with ``names``, a member name like a secret
+    (``secret_key_name``, ``match = "secret_name"``). ``path`` is the JSON
+    Pointer of the string; for a name, of the object it stands in (``/`` is
+    the root). The material is never in a finding, and nothing under a refused
+    name is looked at, so no path carries it.
+    """
+    found: list[dict[str, str]] = []
+    _secret_findings(value, "", names, found)
+    return found
+
+
+def _pointer_join(path: str, part: str | int) -> str:
+    return f"{path}/{str(part).replace('~', '~0').replace('/', '~1')}"
+
+
+def _secret_findings(value: Any, path: str, names: bool, found: list[dict[str, str]]) -> None:
+    if isinstance(value, str):
+        kind = secret_material(value)
+        if kind is not None:
+            found.append({"path": path or "/", "match": kind})
+    elif isinstance(value, dict):
+        for name, item in value.items():
+            kind = secret_material(str(name)) or (
+                "secret_name" if names and secret_key_name(str(name)) else None
+            )
+            if kind is not None:
+                found.append({"path": path or "/", "match": kind})
+                continue
+            _secret_findings(item, _pointer_join(path, str(name)), names, found)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _secret_findings(item, _pointer_join(path, index), names, found)
 
 
 # --- JSON Schema --------------------------------------------------------------

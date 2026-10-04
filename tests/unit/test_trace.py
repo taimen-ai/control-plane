@@ -21,6 +21,9 @@ from control_plane_agent.trace import (
     TranscriptBuilder,
     action_summary,
     redact_credentials,
+    replace_nul,
+    sanitize_text,
+    sanitize_value,
     text_of_blocks,
     tool_action_name,
 )
@@ -232,6 +235,67 @@ def test_document_the_guard_still_rejects_is_withheld_not_raised() -> None:
     assert spec.metadata["withheld"] is True
     assert "entries" not in spec.content
     assert_portable({"content": spec.content, "metadata": spec.metadata})
+
+
+def _has_nul(value: Any) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_has_nul(k) or _has_nul(v) for k, v in value.items())
+    if isinstance(value, list | tuple):
+        return any(_has_nul(v) for v in value)
+    return False
+
+
+@pytest.mark.parametrize(
+    ("text", "clean"),
+    [
+        ("", ""),
+        ("plain", "plain"),
+        ("\x00", "\ufffd"),
+        ("a\x00b\x00\x00", "a\ufffdb\ufffd\ufffd"),
+        ("\\u0000", "\\u0000"),  # an escaped backslash is text, not NUL
+    ],
+)
+def test_replace_nul(text: str, clean: str) -> None:
+    assert replace_nul(text) == clean
+    assert replace_nul(replace_nul(text)) == clean  # idempotent
+
+
+def test_sanitize_replaces_nul_before_redaction_and_limit() -> None:
+    # A NUL inside a secret does not hide it from the redactor.
+    text, truncated = sanitize_text("token=abc\x00defgh tail", 1000)
+    assert text == "token=<redacted> tail" and not truncated
+    text, truncated = sanitize_text("\x00" * 10, 4)
+    assert text.startswith("\ufffd" * 4) and truncated
+    rendered, _ = sanitize_value({"out": "bin\x00ary"}, 1000)
+    assert "\x00" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_binary_tool_output_does_not_cost_the_transcript() -> None:
+    client = FakeClient()
+    recorder = recorder_for(client)
+    recorder.builder.session_id = "s\x001"
+    recorder.builder.system(model="m\x00", tools=["Bash\x00"])
+    recorder.builder.user_text("go\x00")
+    recorder.builder.assistant_text("reading\x00 a file")
+    await recorder.tool_started("c\x001", "Read\x00", {"file_path": "a.bin\x00", "n": "\x00"})
+    await recorder.tool_finished("c\x001", "\x7fELF\x02\x01\x01\x00\x00\x00")
+    await recorder.tool_started("c2", "Bash", "raw\x00input")
+    await recorder.tool_finished("c2", [{"type": "text", "text": "\x00"}], is_error=True)
+    recorder.builder.final_answer("done\x00")
+
+    spec = recorder.artifact(name="t")
+    assert spec is not None
+    assert "withheld" not in spec.content
+    assert not _has_nul(spec.content) and not _has_nul(spec.metadata)
+    assert not _has_nul(client.recorded)
+    entries = spec.content["entries"]
+    assert entries[3]["output"] == "\x7fELF\x02\x01\x01\ufffd\ufffd\ufffd"
+    assert entries[2]["tool"] == "Read\ufffd" and entries[3]["call"] == 1
+    assert spec.content["final"]["text"] == "done\ufffd"
+    assert client.recorded[0]["metadata"]["summary"] == "a.bin\ufffd"
 
 
 def test_helpers() -> None:

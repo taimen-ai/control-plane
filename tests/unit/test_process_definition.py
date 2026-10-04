@@ -487,3 +487,71 @@ def test_a_call_of_a_retired_process_is_a_warning() -> None:
     assert [(p.code, p.path, p.error) for p in checked.problems] == [
         ("process_retired", "/spec/stages/1/steps/0/call/process", False)
     ]
+
+
+# --- human.customFields: the task filled from the case (amendment 2026-10-01) ----------
+
+
+def _prefilled(custom_fields: Any, task_type: str = "review") -> dict[str, Any]:
+    return {
+        "version": 1,
+        "displayName": "Prefilled",
+        "identity": {"agent": "sample-process"},
+        "owner": [{"role": "lead"}],
+        "data": {
+            "type": "object",
+            "properties": {
+                "number": {"type": "string"},
+                "amount": {"type": "integer"},
+                "decision": {"type": "string"},
+            },
+        },
+        "start": {
+            "on": {"observation": "sample.opened"},
+            "key": "event.payload.number",
+            "set": {"number": "'1'"},
+        },
+        "stages": [
+            {
+                "id": "work",
+                "steps": [
+                    {
+                        "id": "decide",
+                        "human": {
+                            "taskType": task_type,
+                            "assign": [{"role": "lead"}],
+                            "customFields": custom_fields,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_the_fields_a_human_step_fills_are_checked_against_the_type() -> None:
+    assert _check(_prefilled({"decision": "data.number + '-draft'"})).errors == []
+    found = _codes(_check(_prefilled({"decison": "data.number", "decision": "data.amount"})))
+    here = "/spec/stages/0/steps/0/human/customFields"
+    assert {
+        ("unknown_custom_field", f"{here}/decison"),
+        ("custom_field_type_mismatch", f"{here}/decision"),
+    } <= found
+
+
+def test_a_field_expression_is_checked_as_an_expression() -> None:
+    found = _codes(_check(_prefilled({"decision": "data.nowhere"})))
+    assert any(p.endswith("/human/customFields/decision") for _, p in found), found
+
+
+def test_a_type_without_an_object_schema_takes_any_field() -> None:
+    catalog = replace(CATALOG, task_types={**CATALOG.task_types, "free": {}})
+    assert _check(_prefilled({"anything": "data.number"}, "free"), catalog).errors == []
+
+
+@pytest.mark.parametrize(
+    "custom_fields", [{"bad-name": "data.number"}, {"a.b": "data.number"}, {"x": 1}, []]
+)
+def test_the_shape_of_the_fields_is_the_schemas(custom_fields: Any) -> None:
+    found = {code for code, _ in _codes(_check(_prefilled(custom_fields)))}
+    assert "schema_violation" in found, found

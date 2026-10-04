@@ -55,6 +55,7 @@ from control_plane.application.queries.task_context import (
     task_profile,
     unavailable,
 )
+from control_plane.application.visibility import task_visible
 from control_plane.config import Settings
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import NotFoundError, ValidationError
@@ -137,7 +138,7 @@ async def _task_focus(session: AsyncSession, ctx: AuthContext, task_ref: str) ->
             for a in artifacts
         ],
         # CP-ADR-0072 §8: the same inputs as in GET /runs/{id}/context.
-        "inputs": await resolve_task_inputs(session, ctx.tenant_id, task),
+        "inputs": await resolve_task_inputs(session, ctx, task),
     }
 
 
@@ -227,7 +228,9 @@ async def prepare_working_context(
         run = await session.scalar(
             select(Run).where(Run.id == run_id, Run.tenant_id == ctx.tenant_id)
         )
-        if run is None:
+        # A run of invisible work is a missing run, not its missing task
+        # (CP-ADR-0082 §3.7).
+        if run is None or not await task_visible(session, ctx, run.task_id):
             raise NotFoundError("Run not found", details={"runId": str(run_id)})
         scopes.append(f"run:{run.id}")
         anchors.append(f"run:{run.id}")
@@ -253,6 +256,9 @@ async def prepare_working_context(
         # Memory are computed here, never taken from the client (ADR-0035).
         await authorize(ctx, Permission.PROJECTS_READ)
         project = await get_tenant_project(session, ctx, project_id)
+        if not ctx.sees_workspace(project.workspace_id):
+            # The project's own 404, not its workspace's (CP-ADR-0082 §3.7).
+            raise NotFoundError("Project not found", details={"projectId": str(project_id)})
         template = await session.get(ProjectTemplate, project.template_id)
         effective = await effective_config_for(session, ctx.tenant_id, project)
         parent_id = await parent_project_id(session, ctx.tenant_id, project)
@@ -295,7 +301,8 @@ async def prepare_working_context(
                 Workspace.id == workspace_id, Workspace.tenant_id == ctx.tenant_id
             )
         )
-        if workspace is None:
+        # One invisible to the caller answers alike (CP-ADR-0082 §3.7).
+        if workspace is None or not ctx.sees_workspace(workspace.id):
             raise NotFoundError("Workspace not found", details={"workspaceId": str(workspace_id)})
         scopes.append(f"workspace:{workspace.id}")
         anchors.append(f"workspace:{workspace.id}")
@@ -435,10 +442,17 @@ async def prepare_working_context(
 async def memory_visibility(
     ctx: AuthContext, settings: Settings
 ) -> tuple[list[str], list[str]] | None:
-    """Namespaces and scopes the principal may read in Memory (policy mode only)."""
+    """Namespaces and scopes the principal may read in Memory.
+
+    Policy mode: what the PDP lists. A human in ``members`` mode
+    (CP-ADR-0082 §3.4) in any mode: the workspaces of the visible set, and of
+    workspace namespaces only those of the trees the set lies in.
+    """
     namespaces = await visible_objects(ctx, "memory.read", "memory_namespace")
     if namespaces is None:
-        return None
+        if ctx.visible_workspaces is None:
+            return None
+        namespaces = {f"tenant-{ctx.tenant_id}", *(f"ws-{root}" for root in ctx.visible_roots)}
     workspaces = await visible_objects(ctx, "memory.read", "workspace") or set()
     prefix = settings.context_namespace_prefix
     tenant = str(ctx.tenant_id)
@@ -446,6 +460,8 @@ async def memory_visibility(
     for obj in sorted(namespaces):
         kind, _, ident = obj.partition("-")
         if kind == "ws" and ident:
+            if ctx.visible_workspaces is not None and ident not in ctx.visible_roots:
+                continue
             names.append(f"{prefix}{tenant}:ws:{ident}")
         elif kind == "principal" and ident:
             names.append(f"{prefix}{tenant}:principal:{ident}")

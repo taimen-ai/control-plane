@@ -239,6 +239,31 @@ def _typed_object(schema: JsonSchema) -> bool:
     )
 
 
+def typed_leaf(schema: JsonSchema | None, segments: Sequence[str]) -> str | None:
+    """The JSON type a path of ``schema`` is read as when every step is a typed field.
+
+    ``string`` (not a timestamp or a duration), ``number``, ``integer``,
+    ``boolean`` or ``object`` (a message); ``None`` when a step is no field of
+    a message (a map, a list, an untyped value) — a path the environment types
+    otherwise than its JSON value, as :class:`_Builder` lays it out.
+    """
+    node: Any = schema or {}
+    for segment in segments:
+        if not (isinstance(node, Mapping) and _single_type(node) == "object"):
+            return None
+        if not _typed_object(node) or segment not in node["properties"]:
+            return None
+        node = node["properties"][segment]
+    if not isinstance(node, Mapping):
+        return None
+    kind = _single_type(node)
+    if kind == "string" and node.get("format") in ("date-time", "duration"):
+        return None
+    if kind == "object":
+        return "object" if _typed_object(node) else None
+    return kind if kind in ("string", "number", "integer", "boolean") else None
+
+
 def _map_of_messages(schema: JsonSchema) -> JsonSchema | None:
     extra = schema.get("additionalProperties")
     if "properties" not in schema and isinstance(extra, Mapping) and _typed_object(extra):
@@ -560,6 +585,27 @@ def _working_time_between(a: datetime, b: datetime, key: str | None = None) -> t
     return result
 
 
+# A number in decimal notation, as amounts are kept in data: "1500000.00", "-3", "1e3".
+_DECIMAL = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _decimal(value: Any) -> float:
+    """``decimal(x)``: the number a string of decimal notation (or a number) holds, a double."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).strip()
+    number = float(text) if _DECIMAL.match(text) else math.nan
+    if not math.isfinite(number):
+        raise _fail(
+            ExpressionError(
+                EXPRESSION_ERROR,
+                f"decimal: {text[:50]!r} is not a number in decimal notation",
+                details={"reason": "invalid_decimal"},
+            )
+        )
+    return number
+
+
 def _flatten(items: list[Any]) -> list[Any]:
     flat: list[Any] = []
     for item in items:
@@ -589,7 +635,7 @@ def _slice(items: list[Any], start: int, end: int) -> list[Any]:
 
 
 _T, _I, _B, _S = cel.Type.TIMESTAMP, cel.Type.INT, cel.Type.BOOL, cel.Type.STRING
-_D = cel.Type.DURATION
+_D, _DOUBLE = cel.Type.DURATION, cel.Type.DOUBLE
 _LIST = cel.Type.List(cel.Type.DYN)
 
 
@@ -616,6 +662,14 @@ def _functions(with_default_calendar: bool) -> list[Any]:
         cel.FunctionDecl("cal.workdaysBetween", between),
         cel.FunctionDecl("cal.addWorkingTime", add_time),
         cel.FunctionDecl("cal.workingTimeBetween", time_between),
+        cel.FunctionDecl(
+            "decimal",
+            [
+                cel.Overload("decimal_string", _DOUBLE, [_S], impl=_decimal),
+                cel.Overload("decimal_int", _DOUBLE, [_I], impl=_decimal),
+                cel.Overload("decimal_double", _DOUBLE, [_DOUBLE], impl=_decimal),
+            ],
+        ),
         cel.FunctionDecl(
             "slice", [cel.Overload("list_slice", _LIST, [_LIST, _I, _I], impl=_slice, **member)]
         ),
@@ -1293,13 +1347,16 @@ class Program:
         *,
         calendars: Mapping[str, Calendar] | None = None,
         cost_limit: int = DEFAULT_COST_LIMIT,
+        activation: Mapping[str, Any] | None = None,
     ) -> Result:
         """Evaluate on plain JSON-like ``values`` of the variables.
 
         ``calendars`` — the calendar versions recorded for this evaluation, by
         key. :class:`ExpressionError` with ``expression_cost_exceeded`` before
         anything runs when the cost bound is above ``cost_limit``, with
-        ``expression_error`` when the evaluation fails.
+        ``expression_error`` when the evaluation fails. ``activation`` —
+        :meth:`Environment.activation` of the same ``values`` in the environment
+        of this program, built once for several programs over one record.
         """
         cost = self.cost(values)
         if cost > cost_limit:
@@ -1310,7 +1367,8 @@ class Program:
                 details={"cost": cost, "limit": cost_limit},
             )
         self._require_times(values)
-        activation = self.environment.activation(values)
+        if activation is None:
+            activation = self.environment.activation(values)
         scope = _Scope(calendars or {}, self.environment.default_calendar)
         token = _SCOPE.set(scope)
         try:
@@ -1418,6 +1476,12 @@ TASK: JsonSchema = {"$comment": "task"}
 
 # Built environments by the hash of their schemas; the oldest goes first.
 _ENVIRONMENTS: dict[str, Environment] = {}
+_SCALAR_BINDINGS: Mapping[str, Any] = {
+    "string": cel.Type.STRING,
+    "integer": cel.Type.INT,
+    "number": cel.Type.DOUBLE,
+    "boolean": cel.Type.BOOL,
+}
 _MAX_ENVIRONMENTS = 256
 
 
@@ -1430,6 +1494,7 @@ def environment(
     stages: Sequence[str] = (),
     calendar: str | None = None,
     bindings: Mapping[str, Variable] | None = None,
+    settings: Variable = None,
 ) -> Environment:
     """The ``cp/1`` environment for one place of a process definition.
 
@@ -1440,7 +1505,10 @@ def environment(
     ``calendar`` the process's ``spec.calendar``, which makes ``calendarKey``
     of ``cal.*`` optional. ``bindings`` adds variables beyond the profile's —
     the translation of earlier syntaxes names them (``None``: ``dyn``,
-    :data:`TASK` for a task-typed one). Environments are cached by content.
+    :data:`TASK` for a task-typed one). ``settings`` — the type of the
+    variable ``settings`` of an object of a package (CP-ADR-0081 §6, built by
+    :mod:`control_plane.domain.settings_refs`); ``None``: no such variable.
+    Environments are cached by content.
     """
     schemas: dict[str, JsonSchema] = {
         "data": data or {"type": "object"},
@@ -1450,6 +1518,8 @@ def environment(
         "stage": stage_schema(tuple(stages)),
         "instance": INSTANCE_SCHEMA,
     }
+    if settings is not None:
+        schemas["settings"] = settings
     for name, schema in (bindings or {}).items():
         if name in schemas or not _FIELD_NAME.match(name):
             raise ValueError(f"binding {name!r} clashes with the profile or is not a name")
@@ -1471,6 +1541,10 @@ def environment(
         elif _single_type(schema) == "object":
             shapes[name] = _Shape("struct")
             variables[name] = cel.Type.Map(cel.Type.STRING, cel.Type.DYN)
+        elif name not in VARIABLES and _single_type(schema) in _SCALAR_BINDINGS:
+            # A scalar binding (a view's ``status`` of an instance) is typed: never null.
+            shapes[name] = _Shape("value")
+            variables[name] = _SCALAR_BINDINGS[str(_single_type(schema))]
         else:
             shapes[name] = _Shape("value")
             variables[name] = cel.Type.DYN

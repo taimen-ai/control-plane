@@ -1,0 +1,25 @@
+# The data of an instance of the process tender: a procurement as the public
+# register publishes it, amounts as strings of decimal notation.
+type: object
+properties:
+  procurement:
+    type: object
+    properties:
+      number: {type: string}
+      law: {type: string, enum: ["44-FZ", "223-FZ"]}
+      object: {type: string}
+      customer:
+        type: object
+        properties:
+          shortName: {type: string}
+          inn: {type: string}
+      maxPrice:
+        type: object
+        properties:
+          amount: {type: string, pattern: "^[0-9]+(\\.[0-9]+)?$"}
+          currency: {type: string}
+      deadlines:
+        type: object
+        properties:
+          submissionEnd: {type: string}
+  decision: {type: string, enum: [go, no-go]}

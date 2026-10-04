@@ -198,6 +198,63 @@
         }
       }
     },
+    "agent.secret_deleted": {
+      "entityType": "agent",
+      "description": "A secret of an agent was deleted with every version from the secret store (CP-ADR-0079 §11).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "agentKey": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "agentKey",
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    "agent.secret_set": {
+      "entityType": "agent",
+      "description": "A secret of an agent was set by name (CP-ADR-0079 §11): the value went to the secret store in transit; the event carries the name only.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "agentKey": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "created": {
+                "type": "boolean",
+                "description": "The first value under the name, not a replacement"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "agentKey",
+              "created",
+              "name"
+            ]
+          }
+        }
+      }
+    },
     "agent.state_changed": {
       "entityType": "agent",
       "description": "The desired state or replica count of an agent changed; no new revision.",
@@ -1673,6 +1730,321 @@
         }
       }
     },
+    "connection.authorization_failed": {
+      "entityType": "connection",
+      "description": "An OAuth callback of a live state did not connect: consent denied, a provider error, an invalid account, the initiator no longer authorized or a failed exchange. The status of the connection did not change.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string",
+                "description": "A code, e.g. consent_denied, oauth_exchange_failed"
+              },
+              "initiatedBy": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The principal that started :authorize"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "initiatedBy",
+              "key",
+              "reason",
+              "type"
+            ]
+          }
+        }
+      }
+    },
+    "connection.authorized": {
+      "entityType": "connection",
+      "description": "A connection became active: the OAuth code was exchanged in the secret store or a key of the connection was entered. No value, no account, no provider text.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "auth": {
+                "type": "string",
+                "enum": [
+                  "oauth2",
+                  "token"
+                ]
+              },
+              "previousStatus": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "active",
+                  "expired",
+                  "revoked"
+                ]
+              },
+              "connectedBy": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The principal that connected it"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "auth",
+              "connectedBy",
+              "key",
+              "previousStatus",
+              "type"
+            ]
+          }
+        }
+      }
+    },
+    "connection.created": {
+      "entityType": "connection",
+      "description": "A connection was created (CP-ADR-0079 §3); it waits for authorization.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "typeVersion": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "active",
+                  "expired",
+                  "revoked"
+                ]
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "status",
+              "type",
+              "typeVersion"
+            ]
+          }
+        }
+      }
+    },
+    "connection.revoked": {
+      "entityType": "connection",
+      "description": "A connection was revoked (CP-ADR-0079 §10): its material is deleted from the secret store and no agent's policy names it any more. A repeated revocation records nothing.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "previousStatus": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "active",
+                  "expired",
+                  "revoked"
+                ],
+                "description": "pending, active or expired: the status before the revocation"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "previousStatus",
+              "type"
+            ]
+          }
+        }
+      }
+    },
+    "connection.status_changed": {
+      "entityType": "connection",
+      "description": "The status of a connection moved without a new authorization — the connector reported that access is lost. Codes only, no text of the provider.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "from": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "active",
+                  "expired",
+                  "revoked"
+                ]
+              },
+              "to": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "active",
+                  "expired",
+                  "revoked"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "A code, e.g. refresh_rejected"
+              },
+              "connectedBy": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid",
+                "description": "Who connected it last; null if nobody has"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "connectedBy",
+              "from",
+              "key",
+              "reason",
+              "to",
+              "type"
+            ]
+          }
+        }
+      }
+    },
+    "connection.updated": {
+      "entityType": "connection",
+      "description": "The display name, settings or type version of a connection changed; only the names of the changed fields, never their values.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "changes": {
+                "type": "array",
+                "description": "Names of the changed fields: displayName, settings, typeVersion"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "changes",
+              "key",
+              "version"
+            ]
+          }
+        }
+      }
+    },
+    "connection_type.oauth_app_set": {
+      "entityType": "connection_type",
+      "description": "The OAuth application of a connection type was written to the secret store; neither the client id nor the secret is in the event.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "created": {
+                "type": "boolean",
+                "description": "The first write, not a replacement"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "created",
+              "type"
+            ]
+          }
+        }
+      }
+    },
+    "connection_type.published": {
+      "entityType": "connection_type",
+      "description": "A version of a connection type was published (CP-ADR-0079 §2); a repeat of the same spec records nothing.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "auth": {
+                "type": "array"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "auth",
+              "key",
+              "version"
+            ]
+          }
+        }
+      }
+    },
     "context_adapter.rebuilt": {
       "entityType": "event_consumer",
       "description": "The memory context adapter was rewound to rebuild its projection.",
@@ -1840,6 +2212,93 @@
         }
       }
     },
+    "event_journal.exported": {
+      "entityType": "event_journal",
+      "description": "The journal was exported for a period (CP-ADR-0068, export amendment): the filters of the export and the number of events, never the events themselves. Written before the body is streamed.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "format": {
+                "type": "string",
+                "description": "jsonl or csv"
+              },
+              "types": {
+                "type": "array",
+                "description": "Event type prefixes of the filter; empty - every type"
+              },
+              "entityType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "entityId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "actorId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid",
+                "description": "Author filter of the export, not its author"
+              },
+              "occurredFrom": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "occurredTo": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "workspaceId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "includeDescendants": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "events": {
+                "type": "integer",
+                "description": "Events the export holds"
+              },
+              "throughCursor": {
+                "type": "string",
+                "description": "Journal position the export reads up to"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "actorId",
+              "entityId",
+              "entityType",
+              "events",
+              "format",
+              "includeDescendants",
+              "occurredFrom",
+              "occurredTo",
+              "throughCursor",
+              "types",
+              "workspaceId"
+            ]
+          }
+        }
+      }
+    },
     "event_journal.pruned": {
       "entityType": "event_journal",
       "description": "Archived journal events were deleted.",
@@ -1969,7 +2428,7 @@
     "iam_binding.created": {
       "entityType": "iam_binding",
       "description": "An IAM identity was bound to a local principal (CP-ADR-0053).",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -1996,6 +2455,44 @@
               "issuer",
               "permissions",
               "principalId"
+            ]
+          }
+        },
+        "2": {
+          "changes": "visibility",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "principalId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "issuer": {
+                "type": "string"
+              },
+              "iamTenantId": {},
+              "iamPrincipalId": {},
+              "permissions": {
+                "type": "array"
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "tenant",
+                  "members"
+                ],
+                "description": "Visibility of the binding: the whole tenant or the workspaces of membership (CP-ADR-0082)"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "iamPrincipalId",
+              "iamTenantId",
+              "issuer",
+              "permissions",
+              "principalId",
+              "visibility"
             ]
           }
         }
@@ -2032,8 +2529,8 @@
     },
     "iam_binding.updated": {
       "entityType": "iam_binding",
-      "description": "The permissions of an IAM binding changed.",
-      "currentVersion": 1,
+      "description": "The permissions or the visibility of an IAM binding changed.",
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -2065,6 +2562,49 @@
               "issuer",
               "permissions",
               "principalId"
+            ]
+          }
+        },
+        "2": {
+          "changes": "visibility",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "principalId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "issuer": {
+                "type": "string"
+              },
+              "iamTenantId": {},
+              "iamPrincipalId": {},
+              "permissions": {
+                "type": "array"
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "tenant",
+                  "members"
+                ],
+                "description": "Visibility of the binding: the whole tenant or the workspaces of membership (CP-ADR-0082)"
+              },
+              "previousPrincipalId": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Only when the identity moved from another principal"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "iamPrincipalId",
+              "iamTenantId",
+              "issuer",
+              "permissions",
+              "principalId",
+              "visibility"
             ]
           }
         }
@@ -2418,6 +2958,57 @@
         }
       }
     },
+    "package.settings_changed": {
+      "entityType": "package",
+      "description": "The settings of a package have a new version: a PUT /packages/{key}/settings saved other values. No value is in the event — neither the old, the new nor the defaults; who may read them reads GET /packages/{key}/settings/versions (CP-ADR-0081 §5).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "package": {
+                "type": "string",
+                "description": "The key of the package"
+              },
+              "version": {
+                "type": "integer",
+                "description": "The new version of the values"
+              },
+              "previousVersion": {
+                "type": "integer",
+                "description": "The version before; 0 for the first saving"
+              },
+              "schemaRevision": {
+                "type": "integer",
+                "description": "The schema revision the values were checked by"
+              },
+              "changedPaths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "JSON Pointers of the members whose saved value changed"
+              },
+              "actorId": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "actorId",
+              "changedPaths",
+              "package",
+              "previousVersion",
+              "schemaRevision",
+              "version"
+            ]
+          }
+        }
+      }
+    },
     "principal.created": {
       "entityType": "principal",
       "description": "A principal (human, agent or service) was created.",
@@ -2546,6 +3137,43 @@
               "liveApiKeys",
               "previousStatus",
               "reason"
+            ]
+          }
+        }
+      }
+    },
+    "principal.updated": {
+      "entityType": "principal",
+      "description": "The display name or the profile of a principal changed (CP-ADR-0082). Names of the changed fields only, never their values: read them via GET /principals/{id}.",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "principalId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "version": {
+                "type": "integer",
+                "description": "Version of the principal after the change"
+              },
+              "changes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "description": "Changed fields: displayName, profile.<field>"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "changes",
+              "principalId",
+              "version"
             ]
           }
         }
@@ -6844,7 +7472,7 @@
     "skill.invocation_succeeded": {
       "entityType": "skill_invocation",
       "description": "The invocation finished; its result is an artifact.",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -6890,6 +7518,64 @@
               "artifactId",
               "attempt",
               "cost",
+              "runId",
+              "skill",
+              "skillId",
+              "taskId",
+              "version"
+            ]
+          }
+        },
+        "2": {
+          "changes": "outputs (CP-ADR-0072 amendment 2026-10-01)",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "skillId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "skill": {
+                "type": "string"
+              },
+              "version": {},
+              "attempt": {
+                "type": "integer"
+              },
+              "taskId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "runId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "artifactId": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
+              "cost": {},
+              "outputs": {
+                "type": "array",
+                "description": "Typed outputs of the executed task: {key, type, status (created | absent | missing | rejected), artifactId?, reason?}; empty unless this is the task's execution call"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "artifactId",
+              "attempt",
+              "cost",
+              "outputs",
               "runId",
               "skill",
               "skillId",
@@ -7812,7 +8498,7 @@
     "task_type.created": {
       "entityType": "task_type",
       "description": "A task type version was created (ADR-0048).",
-      "currentVersion": 2,
+      "currentVersion": 3,
       "versions": {
         "1": {
           "schema": {
@@ -7918,6 +8604,74 @@
               "version"
             ]
           }
+        },
+        "3": {
+          "changes": "executorRoles (CP-ADR-0048, amendment 2026-10-03 A1)",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "displayName": {
+                "type": "string"
+              },
+              "initialStatus": {},
+              "completionStatus": {},
+              "execution": {},
+              "declaresApprovalOutcomes": {
+                "type": "boolean"
+              },
+              "declaresContextProfile": {
+                "type": "boolean"
+              },
+              "declaresInstructions": {
+                "type": "boolean"
+              },
+              "declaresCompletionWork": {
+                "type": "boolean"
+              },
+              "declaresArtifactSchema": {
+                "type": "boolean"
+              },
+              "inputs": {
+                "type": "integer",
+                "description": "Number of declared artifact inputs"
+              },
+              "outputs": {
+                "type": "integer",
+                "description": "Number of declared artifact outputs"
+              },
+              "executorRoles": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Slugs of the roles a person needs to take work of the version"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "completionStatus",
+              "declaresApprovalOutcomes",
+              "declaresArtifactSchema",
+              "declaresCompletionWork",
+              "declaresContextProfile",
+              "declaresInstructions",
+              "displayName",
+              "execution",
+              "executorRoles",
+              "initialStatus",
+              "inputs",
+              "key",
+              "outputs",
+              "version"
+            ]
+          }
         }
       }
     },
@@ -7993,6 +8747,104 @@
         }
       }
     },
+    "view.published": {
+      "entityType": "view",
+      "description": "A view of a package is in use at a revision: published by a package apply, or brought back as it was; a console drops what it cached of the key (CP-ADR-0080).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "hash": {
+                "type": "string",
+                "description": "sha256 of the revision, as GET /views/{key} returns it"
+              },
+              "previousRevision": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "The revision before; null for a new view"
+              },
+              "packageKey": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "packageVersion": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "hash",
+              "key",
+              "packageKey",
+              "packageVersion",
+              "previousRevision",
+              "revision"
+            ]
+          }
+        }
+      }
+    },
+    "view.retired": {
+      "entityType": "view",
+      "description": "A view of a package is out of use: the package that installed it no longer brings it (CP-ADR-0080).",
+      "currentVersion": 1,
+      "versions": {
+        "1": {
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer",
+                "description": "The last revision of the view"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "packageKey": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "packageVersion": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "key",
+              "packageKey",
+              "packageVersion",
+              "reason",
+              "revision"
+            ]
+          }
+        }
+      }
+    },
     "work.derived": {
       "entityType": "task",
       "description": "A rule derived new work.",
@@ -8060,7 +8912,7 @@
     },
     "work.reconciled": {
       "entityType": "task",
-      "description": "A rule updated, cancelled or completed the work it derived earlier.",
+      "description": "A rule updated, cancelled or completed work: the work it derived earlier, or the task an observation is bound to.",
       "currentVersion": 1,
       "versions": {
         "1": {
@@ -8105,7 +8957,10 @@
                 "type": "string",
                 "format": "uuid"
               },
-              "check": {}
+              "check": {},
+              "target": {
+                "type": "string"
+              }
             },
             "additionalProperties": true,
             "required": [
@@ -8265,7 +9120,7 @@
     "workspace.updated": {
       "entityType": "workspace",
       "description": "Workspace attributes changed.",
-      "currentVersion": 1,
+      "currentVersion": 2,
       "versions": {
         "1": {
           "schema": {
@@ -8275,6 +9130,34 @@
               "changes": {},
               "version": {
                 "type": "integer"
+              }
+            },
+            "additionalProperties": true,
+            "required": [
+              "changes",
+              "version"
+            ]
+          }
+        },
+        "2": {
+          "changes": "taskTypes (CP-ADR-0008, amendment 2026-10-03 A2)",
+          "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "changes": {},
+              "version": {
+                "type": "integer"
+              },
+              "taskTypes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "New own setting of the allowed task types, when it changed; null inherits from the ancestors"
               }
             },
             "additionalProperties": true,

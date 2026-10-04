@@ -2,10 +2,14 @@
 
 import json
 import logging
+import re
 import sys
+import urllib.parse
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
+
+from control_plane.domain.redaction import LOG_SENSITIVE_KEYS
 
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 # ``X-Run-Id`` trace correlator (ADR-0039), logged as ``run_id``. Distinct from
@@ -17,18 +21,57 @@ _STD_ATTRS = frozenset(
     | {"message", "asctime", "taskName"}
 )
 
-_SENSITIVE_KEYS = frozenset({"authorization", "api_key", "apikey", "key_hash", "password", "token"})
+# The OAuth callback carries ``code`` and ``state`` in its query string
+# (CP-ADR-0079 §14): the access log keeps the path and loses the query.
+_REDACTED_QUERY_PATH = re.compile(r"connections:callback(?![a-z0-9_-])")
 
 
 def redact(value: object, key: str | None = None) -> object:
     """Recursively redact obviously sensitive values in log extras."""
-    if key is not None and key.lower() in _SENSITIVE_KEYS:
+    if key is not None and key.lower() in LOG_SENSITIVE_KEYS:
         return "[REDACTED]"
     if isinstance(value, dict):
         return {k: redact(v, k) for k, v in value.items()}
     if isinstance(value, list | tuple):
         return [redact(v) for v in value]
     return value
+
+
+def _normalized_path(path: str) -> str:
+    """The path as the redaction compares it: unquoted and lower-cased.
+
+    uvicorn quotes the path it logs, so the colon arrives as ``%3A``.
+    """
+    return urllib.parse.unquote(path).lower()
+
+
+def redact_query(path: str) -> str:
+    """``path`` with the query string of a redacted path replaced by ``[redacted]``.
+
+    Any path that names the callback loses its query, not only the route
+    itself: a variant the router answers otherwise (case, a trailing or
+    doubled slash and Starlette's ``307``, ``/./``, ``;x``, ``%20``) is
+    logged with its query all the same, and a ``code`` in it is still live.
+    """
+    base, question, _query = path.partition("?")
+    if question and _REDACTED_QUERY_PATH.search(_normalized_path(base)):
+        return f"{base}?[redacted]"
+    return path
+
+
+class AccessLogQueryFilter(logging.Filter):
+    """Drop the query string of the OAuth callback from ``uvicorn.access`` records.
+
+    uvicorn logs ``(client, method, path with query, http version, status)``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            redacted = redact_query(args[2])
+            if redacted != args[2]:
+                record.args = (*args[:2], redacted, *args[3:])
+        return True
 
 
 class JsonFormatter(logging.Formatter):
@@ -64,3 +107,6 @@ def configure_logging(level: str = "INFO") -> None:
         logger = logging.getLogger(name)
         logger.handlers = []
         logger.propagate = True
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, AccessLogQueryFilter) for f in access.filters):
+        access.addFilter(AccessLogQueryFilter())

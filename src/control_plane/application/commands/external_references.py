@@ -12,7 +12,7 @@ external system and does not treat its state as authoritative.
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import record_event
 from control_plane.application.external_entities import (
+    ENTITY_BINDINGS,
     EntityBinding,
     resolve_entity_binding,
     resolve_entity_id,
@@ -90,13 +91,21 @@ async def register_external_reference(
         # Identity is the PAIR: the same uuid under a different entity type is a
         # different entity, not the same one seen from another angle.
         if existing.entity_type != binding.entity_type or existing.entity_id != entity_id:
+            # The other entity is named only when the caller sees it
+            # (CP-ADR-0082 §4): the conflict itself stays, the key is taken.
+            seen = ctx.visible_workspaces is None or await session.scalar(
+                select(
+                    ENTITY_BINDINGS[existing.entity_type].visible(ctx, literal(existing.entity_id))
+                )
+            )
             raise ConflictError(
                 "external_reference_conflict",
                 "This external identifier already maps to a different entity",
-                details={
-                    "entityType": existing.entity_type,
-                    "entityId": str(existing.entity_id),
-                },
+                details=(
+                    {"entityType": existing.entity_type, "entityId": str(existing.entity_id)}
+                    if seen
+                    else {}
+                ),
             )
         if existing.metadata_json == payload:
             return existing, False

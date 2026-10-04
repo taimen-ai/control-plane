@@ -205,7 +205,18 @@ async def test_the_package_brings_what_its_process_names(client: httpx.AsyncClie
         )
 
     objects = (
-        ("agents/sample-process.yaml", document("Agent", "sample-process", {"displayName": "S"})),
+        (
+            "agents/sample-process.yaml",
+            document(
+                "Agent",
+                "sample-process",
+                {
+                    "displayName": "S",
+                    "identity": {"kind": "service", "permissions": ["tasks.read"]},
+                    "placement": "none",
+                },
+            ),
+        ),
         (
             "task-types/review.yaml",
             document(
@@ -401,3 +412,98 @@ async def test_expect_sla_counts_by_the_calendar_the_package_brings(
         (7, "process.sla_breached", ["process.sla_warning"]),
     ]
     assert failures[0]["message"].startswith("SLA of step 'decide' at 2025-05-05T09:00:00Z")
+
+
+async def test_the_author_of_an_emitted_event_reaches_the_start_of_the_process(
+    client: httpx.AsyncClient,
+) -> None:
+    """``emit.by`` is the event's ``actorId``: a process may read it in ``start.set``."""
+    key = await _setup(client)
+    process = PROCESS.replace(
+        "      summary: {type: string}\n",
+        "      summary: {type: string}\n      opener: {type: string}\n",
+    ).replace(
+        "      number: string(event.payload.number)\n",
+        "      number: string(event.payload.number)\n      opener: string(event.actorId)\n",
+    )
+    assert process.count("opener") == 2
+
+    async def tested(by: Any) -> dict[str, Any]:
+        test = scenario()
+        if by is not None:
+            test["steps"][0]["emit"]["by"] = by
+        test["steps"][1]["expect"].update(status="running")
+        test["steps"][1]["expect"]["data"]["opener"] = "alice"
+        response = await client.post(
+            "/api/v1/packages:test",
+            json={"package": package(process=process, test=test)},
+            headers=auth(key),
+        )
+        assert response.status_code == 200, response.text
+        body: dict[str, Any] = response.json()
+        return body
+
+    body = await tested("alice")
+    assert body["status"] == "passed", body["tests"]
+    # Without ``by`` the event has no actorId, as before: the start fails on it.
+    body = await tested(None)
+    assert body["status"] == "failed"
+    failures = body["tests"][0]["failures"]
+    assert ("status of the instance", "running", "failed") in [
+        (f["message"], f["expected"], f["actual"]) for f in failures
+    ]
+    # An empty or non-string author is a finding of the file, and no test runs.
+    for wrong in ("", 7):
+        body = await tested(wrong)
+        assert body["status"] == "invalid" and body["tests"] == [], body
+        (error,) = [p for p in body["problems"] if p["severity"] == "error"]
+        assert (error["code"], error["file"]) == ("invalid_test", "tests/review.test.yaml")
+
+
+async def test_a_rule_of_the_package_closes_the_task_its_observation_names(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """CP-ADR-0063 Zh5 (I013): an observation bound to a step task, a rule with target: task."""
+    key = await _setup(client)
+    test = scenario()
+    test["steps"] = [
+        test["steps"][0],
+        {"emit": {"observation": "sample.closed", "task": "decide", "payload": {"state": "done"}}},
+        {
+            "expect": {
+                "tasks": [{"step": "decide", "status": "completed"}],
+                "rules": [{"rule": "sample-closed", "result": "matched", "step": "decide"}],
+                "noSideEffects": True,
+            }
+        },
+    ]
+    rule = (
+        f"apiVersion: {API_VERSION}\nkind: WorkRule\nkey: sample-closed\nspec:\n"
+        "  trigger: {kind: observation, type: sample.closed, agent: sample-observer}\n"
+        "  action: {kind: complete_work, target: task, taskTypes: [review]}\n"
+    )
+    before = snapshot(sync_engine)
+    response = await client.post(
+        "/api/v1/packages:test",
+        json={"package": package(("rules/sample-closed.yaml", rule), test=test)},
+        headers=auth(key),
+    )
+    assert response.status_code == 200, response.text
+    assert snapshot(sync_engine) == before
+    body = response.json()
+    assert body["status"] == "passed", (body["problems"], body["tests"][0]["failures"])
+
+    broken = rule.replace("taskTypes: [review]", "dedupKeyTemplate: k")
+    response = await client.post(
+        "/api/v1/packages:test",
+        json={"package": package(("rules/sample-closed.yaml", broken), test=test)},
+        headers=auth(key),
+    )
+    body = response.json()
+    assert body["status"] == "invalid"
+    [problem] = [p for p in body["problems"] if p["file"] == "rules/sample-closed.yaml"]
+    assert (problem["code"], problem["path"]) == (
+        "invalid_rule_action",
+        "/spec/action/dedupKeyTemplate",
+    )
+    assert body["tests"] == []

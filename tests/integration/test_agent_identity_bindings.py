@@ -1,5 +1,5 @@
 """The bindings of a registry agent belong to the registry (CP-ADR-0073, amendment
-2026-09-30, E2 and E4; ADR-0053, amendment 2026-09-30).
+2026-09-30, I2 and I4; ADR-0053, amendment 2026-09-30).
 
 Each case is a probe from the review of TASK-001063 and the refusal it now
 gets: an identity of an issuer the core does not trust, a second identity on
@@ -10,6 +10,7 @@ re-bound by an admin with rights beside the revision (TASK-001127). The module r
 ``CP_IAM_ISSUER`` configured, as a deployment with IAM does.
 """
 
+import json
 import uuid
 from typing import Any
 
@@ -194,7 +195,7 @@ async def test_the_registry_identity_itself_is_not_rebound_through_iam_bindings(
 ) -> None:
     """The probe of TASK-001120: admin re-bound it with ``principals.write`` — was 200.
 
-    The transitional exception for the bootstrap is gone (E4, TASK-001127): the
+    The transitional exception for the bootstrap is gone (I4, TASK-001127): the
     registry's own identity is refused like any other, for an admin too, and
     its binding keeps the rights of the revision.
     """
@@ -258,7 +259,7 @@ async def _revoke_registry_binding(
 async def test_link_of_the_same_identity_reopens_a_revoked_registry_binding(
     client: httpx.AsyncClient, sync_engine: Engine
 ) -> None:
-    """The way back after E4 (TASK-001203): ``PUT …/identity`` with the same identity.
+    """The way back after I4 (TASK-001203): ``PUT …/identity`` with the same identity.
 
     The binding comes back with the rights of the current revision, whatever
     it held when it was shut, and the journal says so as ``iam-bindings``
@@ -294,6 +295,7 @@ async def test_link_of_the_same_identity_reopens_a_revoked_registry_binding(
         "iamTenantId": first["iamTenantId"],
         "iamPrincipalId": first["iamPrincipalId"],
         "permissions": ["events.read", "tasks.read"],
+        "visibility": "tenant",
     }
     # Only the binding: no second principal, no second binding.
     assert len(await _events(client, admin_key, "principal.created")) == 1
@@ -337,6 +339,121 @@ async def test_link_of_another_identity_does_not_reopen_the_revoked_one(
     assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]][
         "status"
     ] == "revoked"
+
+
+async def test_the_placement_right_alone_reopens_the_binding(
+    client: httpx.AsyncClient,
+) -> None:
+    """``agents.status.write`` is the whole authority of the way back (I5).
+
+    The fleet-controller holds none of the revision's rights: the escalation
+    rule of publishing does not apply, the rights were checked against
+    whoever applied the revision.
+    """
+    admin_key, principal_id, first = await _service(client)
+    await _revoke_registry_binding(client, admin_key, principal_id, first)
+    _, fleet_key = await create_agent_with_key(
+        client, admin_key, name="fleet", kind="service", permissions=["agents.status.write"]
+    )
+
+    reopened = await _link(client, fleet_key, agent=KEY, **first)
+    assert reopened.status_code == 200, reopened.text
+    binding = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]
+    assert binding["status"] == "active"
+    assert binding["permissions"] == ["events.read", "tasks.read"]
+
+
+async def test_without_the_placement_right_the_binding_stays_revoked(
+    client: httpx.AsyncClient,
+) -> None:
+    """Holding the revision's rights and ``agents.manage`` is not enough."""
+    admin_key, principal_id, first = await _service(client)
+    await _revoke_registry_binding(client, admin_key, principal_id, first)
+    _, manager_key = await create_agent_with_key(
+        client,
+        admin_key,
+        name="manager",
+        kind="human",
+        permissions=["agents.manage", "agents.read", "events.read", "tasks.read"],
+    )
+
+    refused = await _link(client, manager_key, agent=KEY, **first)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "permission_denied"
+    assert (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]][
+        "status"
+    ] == "revoked"
+    assert await _events(client, admin_key, "iam_binding.updated") == []
+
+
+def _republish_beside(sync_engine: Engine, permissions: list[str]) -> None:
+    """A current revision whose rights a publish would refuse today.
+
+    Revisions are immutable, so the row is a new one: the catalog or the kind
+    rule changed after the revision was checked.
+    """
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO agent_revisions (id, tenant_id, agent_id, revision, spec, "
+                "spec_hash, source_kind, source_package_key, source_package_version, "
+                "created_by, created_at) "
+                "SELECT :id, r.tenant_id, r.agent_id, r.revision + 1, "
+                "jsonb_set(r.spec, '{identity,permissions}', CAST(:permissions AS jsonb)), "
+                "r.spec_hash, r.source_kind, r.source_package_key, r.source_package_version, "
+                "r.created_by, now() "
+                "FROM agent_revisions r JOIN agents a "
+                "ON a.id = r.agent_id AND a.current_revision = r.revision WHERE a.key = :key"
+            ),
+            {"id": str(uuid.uuid4()), "permissions": json.dumps(permissions), "key": KEY},
+        )
+        conn.execute(
+            text("UPDATE agents SET current_revision = current_revision + 1 WHERE key = :key"),
+            {"key": KEY},
+        )
+
+
+@pytest.mark.parametrize(
+    ("permissions", "code"),
+    [
+        (["events.read", "no.such.right"], "invalid_permissions"),
+        ([], "invalid_permissions"),
+        (["events.read", "approvals.decide"], "permissions_not_allowed_for_kind"),
+        (["admin"], "permissions_not_allowed_for_kind"),
+    ],
+)
+async def test_the_revision_rights_are_checked_again_on_reopening(
+    client: httpx.AsyncClient, sync_engine: Engine, permissions: list[str], code: str
+) -> None:
+    """The catalog and the kind rule, not the escalation rule (TASK-001227).
+
+    The caller is an admin, so only these two checks can refuse; the binding
+    stays revoked and the journal is silent.
+    """
+    admin_key, principal_id, first = await _service(client)
+    await _revoke_registry_binding(client, admin_key, principal_id, first)
+    _republish_beside(sync_engine, permissions)
+
+    refused = await _link(client, admin_key, agent=KEY, **first)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["code"] == code
+    binding = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]
+    assert binding["status"] == "revoked"
+    assert await _events(client, admin_key, "iam_binding.updated") == []
+
+
+async def test_an_active_binding_is_not_checked_again_on_a_repeat(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """A repeat on a live binding changes nothing, so it refuses nothing either."""
+    admin_key, principal_id, first = await _service(client)
+    _republish_beside(sync_engine, ["events.read", "no.such.right"])
+
+    again = await _link(client, admin_key, agent=KEY, **first)
+    assert again.status_code == 200, again.text
+    binding = (await _bindings(client, admin_key, principal_id))[first["iamPrincipalId"]]
+    assert binding["status"] == "active"
+    assert binding["permissions"] == ["events.read", "tasks.read"]
 
 
 async def test_a_principal_outside_the_registry_still_takes_new_identities(

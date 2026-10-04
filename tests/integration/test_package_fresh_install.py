@@ -75,7 +75,7 @@ def _package(files: list[dict[str, str]]) -> dict[str, Any]:
 
 
 async def _install_outside(client: httpx.AsyncClient, key: str, package: dict[str, Any]) -> None:
-    """What ``cp_packages`` applies before ``packages:apply``: the kinds the core does not plan."""
+    """What package-sdk applies before ``packages:apply``: the kinds the core does not plan."""
     for item in package["files"]:
         body = yaml.safe_load(item["content"])
         if body["kind"] not in ROUTES:

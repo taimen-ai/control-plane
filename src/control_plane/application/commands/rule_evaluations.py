@@ -44,7 +44,7 @@ cancelled is ``work.reconciled``.
 
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -54,7 +54,12 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, ResourceRef, authorize
+from control_plane.application.authorization import (
+    AuthContext,
+    ResourceRef,
+    authorize,
+    permits_task,
+)
 from control_plane.application.commands._artifact_content import artifact_event_fields
 from control_plane.application.commands.agent_assignees import is_agent_reference
 from control_plane.application.commands.approval_outcomes import (
@@ -65,6 +70,7 @@ from control_plane.application.commands.approvals import request_approval
 from control_plane.application.commands.eligibility import RequirementSpec
 from control_plane.application.commands.goals import get_readable_goal
 from control_plane.application.commands.relations import add_relation, resolve_task
+from control_plane.application.commands.role_references import is_role_reference, role_for_task
 from control_plane.application.commands.runs import request_cancel_run
 from control_plane.application.commands.skill_invocations import (
     CANCELLED_BY_SYSTEM,
@@ -80,6 +86,7 @@ from control_plane.application.commands.tasks import (
     update_task,
 )
 from control_plane.application.commands.verification import (
+    current_evidence,
     latest_attempts,
     open_attempt,
 )
@@ -93,6 +100,8 @@ from control_plane.application.event_cursor import EventPosition
 from control_plane.application.events import record_event
 from control_plane.application.locking import lock_principal_key_share, lock_rule_principals
 from control_plane.application.queries.events import JournalEvent, fetch_events_after
+from control_plane.application.queries.package_settings import history, object_scope, snapshot
+from control_plane.application.visibility import with_visibility
 from control_plane.domain.enums import (
     AgentStatus,
     Permission,
@@ -117,6 +126,7 @@ from control_plane.domain.work_graph import (
 )
 from control_plane.domain.work_item import TERMINAL_CATEGORIES, WorkItemStatusCategory
 from control_plane.domain.work_rules import (
+    BASE_ROOTS,
     CREATING_ACTIONS,
     CUSTOM_FIELDS,
     MAX_DEPENDENCIES,
@@ -130,18 +140,22 @@ from control_plane.domain.work_rules import (
     ROOT_GOAL,
     ROOT_ITEM,
     ROOT_PAYLOAD,
+    ROOT_SETTINGS,
     ROOT_SKILL,
     ROOT_TASK,
     ROOT_TRIGGER,
     WORKSPACE_FIELD,
     ActionKind,
+    ActionTarget,
     ConditionError,
     EvaluationStatus,
     RuleStatus,
     TriggerKind,
     VarPath,
     action_roots,
+    author_matches,
     evaluate,
+    has_author_filter,
     normalize_dedup_key,
     parse_path,
     render,
@@ -186,6 +200,10 @@ RULE_CHANGED = "rule_changed"
 RULE_STOPPED = "rule_stopped"
 # A skill result, as artifact type: the same one a task-bound call leaves.
 SKILL_RESULT_ARTIFACT = "skill_result"
+# The kind of the element of an evaluation's evidence naming the settings it read
+# (CP-ADR-0081 §6), and the kind of a rule in ``package_objects``.
+SETTINGS_EVIDENCE = "settings"
+RULE_KIND = "WorkRule"
 # Where core names its own journal entries in an external evidence pointer.
 CORE_SYSTEM = "control-plane"
 # A closing decision on work under a live claim waits for the claim to end
@@ -213,6 +231,16 @@ RELATION_TARGET_NOT_FOUND = "relation_target_not_found"
 DEPENDENCY_NOT_FOUND = "dependency_not_found"
 DEPENDENCY_REFUSED = "dependency_refused"
 DEPENDENCY_CYCLE = "dependency_cycle"
+# A closing action on the task its observation is bound to (amendment
+# integrations-connections, Zh3): why it did not close it.
+NO_BOUND_TASK = "no_bound_task"
+BOUND_TASK_NOT_FOUND = "bound_task_not_found"
+BOUND_TASK_TYPE_NOT_LISTED = "bound_task_type_not_listed"
+BOUND_TASK_FORBIDDEN = "bound_task_forbidden"
+# A rule stored before its trigger had to name the author (Zh6) closes nothing.
+TRIGGER_AUTHOR_UNFILTERED = "trigger_author_unfiltered"
+# Such work has no dedup key: its trail names it by this pseudo-key (Zh4).
+BOUND_KEY_PREFIX = "task:"
 
 
 def rule_context(
@@ -346,7 +374,13 @@ async def _acting_unlocked(
                 rule, trace_run_id=trace_run_id, causation_id=causation_id, authority=authority
             )
         )
-    return _Acting(rule_context(rule, trace_run_id=trace_run_id, causation_id=causation_id))
+    # The snapshot of a person acts within their visibility as it stands now,
+    # like a request of theirs (CP-ADR-0082 V2): a rule does not widen it.
+    return _Acting(
+        await with_visibility(
+            session, rule_context(rule, trace_run_id=trace_run_id, causation_id=causation_id)
+        )
+    )
 
 
 # --- facts ----------------------------------------------------------------------
@@ -365,6 +399,10 @@ class Facts:
     task: dict[str, Any] | None = None
     skill: dict[str, Any] | None = None
     views: set[str] = field(default_factory=set)
+    # The effective settings of the rule's package and the evidence element
+    # naming their version (CP-ADR-0081 §6), read once an evaluation.
+    settings: dict[str, Any] | None = None
+    settings_seen: dict[str, Any] | None = None
 
     def resolve(self, path: VarPath, item: Any = None) -> Any:
         documents: dict[str, Any] = {
@@ -374,6 +412,7 @@ class Facts:
             ROOT_TASK: self.task,
             ROOT_SKILL: self.skill,
             ROOT_ITEM: item,
+            ROOT_SETTINGS: self.settings,
         }
         return walk(documents.get(path.root), path.segments)
 
@@ -402,6 +441,8 @@ def _event_facts(rule: WorkRule, event: JournalEvent) -> Facts:
         "entityType": event.entity_type,
         "entityId": str(event.entity_id),
         "occurredAt": event.occurred_at.isoformat(),
+        # Who the journal says wrote the fact (Zh6): the author cannot spoof it.
+        "actorId": str(event.actor_id) if event.actor_id is not None else None,
     }
     if event.event_type == "observation.recorded":
         trigger["observationId"] = str(event.entity_id)
@@ -488,13 +529,54 @@ async def _load_views(
             {"status": attempt.status, "attempt": attempt.attempt} if attempt else None,
             await session.get(TaskType, task.type_id),
         )
-    facts.views.update({ROOT_GOAL, ROOT_TASK})
+    if ROOT_SETTINGS in roots and ROOT_SETTINGS not in facts.views:
+        await _load_settings(session, rule, facts)
+    facts.views.update({ROOT_GOAL, ROOT_TASK, ROOT_SETTINGS})
+
+
+async def _load_settings(session: AsyncSession, rule: WorkRule, facts: Facts) -> None:
+    """The settings of the rule's package (``package_objects`` of kind ``WorkRule``).
+
+    An evaluation resumed after its skill answered reads the version its
+    evidence names, from the history: the values it began with.
+    """
+    seen = facts.settings_seen
+    if seen is not None:
+        found = await history(
+            session,
+            rule.tenant_id,
+            seen.get("package"),
+            [(int(seen["version"]), int(seen["schemaRevision"]))],
+        )
+        facts.settings = found.values(int(seen["version"]), int(seen["schemaRevision"]))
+        return
+    scope = await object_scope(session, rule.tenant_id, RULE_KIND, rule.key)
+    current = await snapshot(session, rule.tenant_id, scope)
+    if current is not None:
+        facts.settings = current.values
+        facts.settings_seen = current.evidence()
+
+
+def _settings_evidence(row: RuleEvaluation, facts: Facts) -> None:
+    """The version of the settings the evaluation read, an element of its evidence."""
+    if facts.settings_seen is None:
+        return
+    if any(item.get("kind") == SETTINGS_EVIDENCE for item in row.evidence or []):
+        return
+    row.evidence = [*(row.evidence or []), facts.settings_seen]
+
+
+def _task_evidence(items: Sequence[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """The evidence of an evaluation a task cites: the facts, not the settings read."""
+    return [item for item in items or [] if item.get("kind") != SETTINGS_EVIDENCE]
 
 
 # --- recording ----------------------------------------------------------------
 
 
 def _pointer(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("kind") == SETTINGS_EVIDENCE:
+        return {k: item.get(k) for k in ("kind", "package", "version", "schemaRevision")}
     pointer: dict[str, Any] = origin_summary({"kind": "rule", "evidence": [item]})["evidence"][0]
     return pointer
 
@@ -519,7 +601,16 @@ async def _finish(
     work = [
         {
             k: w[k]
-            for k in ("dedupKey", "taskId", "created", "skipped", "failed", "reason", "refused")
+            for k in (
+                "dedupKey",
+                "target",
+                "taskId",
+                "created",
+                "skipped",
+                "failed",
+                "reason",
+                "refused",
+            )
             if k in w
         }
         for w in (row.result or {}).get("work", [])
@@ -621,6 +712,22 @@ def _assignment(fields: dict[str, Any]) -> tuple[uuid.UUID | str | None, Require
     return _uuid_field(fields, "assignee"), None
 
 
+async def _approver_role(
+    session: AsyncSession, ctx: AuthContext, fields: dict[str, Any], task: Task
+) -> uuid.UUID | None:
+    """``fields.approverRole``: a role id, or ``role:<slug>`` seen from the work's workspace."""
+    value = fields.get("approverRole")
+    if is_role_reference(value):
+        return await role_for_task(
+            session,
+            ctx,
+            str(value),
+            workspace_id=task.workspace_id,
+            field="action.fields.approverRole",
+        )
+    return _uuid_field(fields, "approverRole")
+
+
 async def _lock_keys(session: AsyncSession, ctx: AuthContext, dedup_keys: set[str]) -> None:
     """Serialize work on these keys per (tenant, key) for the transaction.
 
@@ -660,10 +767,10 @@ async def _open_work(
     task = await session.get(Task, task_id, populate_existing=True, with_for_update=for_update)
     if task is None or task.system_status_category in TERMINAL_CATEGORIES:
         return None
-    try:
-        await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task.id)))
-    except AuthorizationError as exc:
-        raise NotFoundError("Task not found", details={"dedupKey": dedup_key}) from exc
+    # Work outside the visibility of the rule's person is not theirs to find
+    # by a key either (CP-ADR-0082 §3.7).
+    if not await permits_task(ctx, Permission.TASKS_READ, task=task):
+        raise NotFoundError("Task not found", details={"dedupKey": dedup_key})
     return task
 
 
@@ -743,6 +850,23 @@ def _dependency_keys(value: Any) -> list[str] | None:
     return keys if len(keys) <= MAX_DEPENDENCIES else None
 
 
+def _render_check(
+    action: dict[str, Any], resolve: Callable[[VarPath], Any], roots: frozenset[str]
+) -> str | None:
+    """The check ``complete_work`` ties its evidence to; ``None`` for other actions."""
+    if action["kind"] != ActionKind.COMPLETE_WORK:
+        return None
+    rendered = render(action["check"], resolve, roots=roots) if "check" in action else None
+    check = RULE_EVIDENCE_CHECK if rendered is None else str(rendered)
+    if not CHECK_KEY_RE.match(check):
+        raise ValidationError(
+            "invalid_rule_field",
+            f"action.check rendered to {check[:100]!r}, which is not a check key",
+            details={"field": "action.check"},
+        )
+    return check
+
+
 def _render_item(rule: WorkRule, facts: Facts, item: Any) -> _Planned:
     """The dedup key, the fields and the rest of the action for one item."""
     action = rule.action
@@ -757,16 +881,7 @@ def _render_item(rule: WorkRule, facts: Facts, item: Any) -> _Planned:
     acceptance = (
         render(action["acceptance"], resolve, roots=roots) if "acceptance" in action else None
     )
-    check: str | None = None
-    if action["kind"] == ActionKind.COMPLETE_WORK:
-        rendered = render(action["check"], resolve, roots=roots) if "check" in action else None
-        check = RULE_EVIDENCE_CHECK if rendered is None else str(rendered)
-        if not CHECK_KEY_RE.match(check):
-            raise ValidationError(
-                "invalid_rule_field",
-                f"action.check rendered to {check[:100]!r}, which is not a check key",
-                details={"field": "action.check"},
-            )
+    check = _render_check(action, resolve, roots)
     fields = render(action.get("fields") or {}, resolve, roots=roots)
     planned = _Planned(dedup_key=dedup_key, fields=fields, acceptance=acceptance, check=check)
     if action["kind"] in CREATING_ACTIONS:
@@ -836,14 +951,10 @@ async def _resolve_relations(
                 .order_by(RuleWorkItem.created_at.desc(), RuleWorkItem.id.desc())
                 .limit(1)
             )
-            visible = task_id is not None
-            if visible:
-                try:
-                    await authorize(
-                        ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task_id))
-                    )
-                except AuthorizationError:
-                    visible = False
+            dependency = await session.get(Task, task_id) if task_id is not None else None
+            visible = dependency is not None and await permits_task(
+                ctx, Permission.TASKS_READ, task=dependency
+            )
             if not visible:
                 item.refused = (DEPENDENCY_NOT_FOUND, f"no work is known by the key {key[:100]!r}")
                 break
@@ -967,7 +1078,7 @@ async def _apply(
                     "kind": "rule",
                     "ruleId": str(rule.id),
                     "ref": f"rule_evaluation:{row.id}",
-                    "evidence": list(row.evidence or []),
+                    "evidence": _task_evidence(row.evidence),
                 },
                 acceptance=planned.acceptance,
             )
@@ -1003,7 +1114,7 @@ async def _apply(
                 ctx,
                 task_ref=str(task.id),
                 assigned_principal_id=_uuid_field(fields, "approver"),
-                required_role_id=_uuid_field(fields, "approverRole"),
+                required_role_id=await _approver_role(session, ctx, fields, task),
                 comment=f"Rule {rule.key}: {title}"[:MAX_TEXT_FIELD_LENGTH],
                 gate=True,
             )
@@ -1064,7 +1175,7 @@ async def _update(
     }
     added = [
         e
-        for e in row.evidence or []
+        for e in _task_evidence(row.evidence)
         if (e["kind"], e.get("observationId"), e.get("artifactId"), str(e.get("externalRef")))
         not in known
     ]
@@ -1143,6 +1254,8 @@ async def _close(
     current: Task,
     dedup_key: str,
     check: str | None,
+    *,
+    target: str | None = None,
 ) -> dict[str, Any]:
     """``cancel_work`` / ``complete_work`` on open work nobody holds.
 
@@ -1155,7 +1268,7 @@ async def _close(
     """
     kind = rule.action["kind"]
     changes: dict[str, Any] = {}
-    evidence = _with_facts(current.evidence, list(row.evidence or []), check)
+    evidence = _with_facts(current.evidence, _task_evidence(row.evidence), check)
     if evidence is not None:
         changes["evidence"] = evidence
     extra: dict[str, Any] = {}
@@ -1208,7 +1321,13 @@ async def _close(
         rule,
         row,
         updated,
-        {"action": kind, "dedupKey": dedup_key, "changes": sorted(changes), **extra},
+        {
+            "action": kind,
+            "dedupKey": dedup_key,
+            "changes": sorted(changes),
+            **({"target": target} if target else {}),
+            **extra,
+        },
         event_type="work.reconciled",
     )
     return {
@@ -1272,6 +1391,149 @@ async def _await_release(
     return waiting
 
 
+# --- the task an observation is bound to (amendment integrations-connections, Zh) ---
+
+
+def _bound_key(task_id: uuid.UUID | str) -> str:
+    return f"{BOUND_KEY_PREFIX}{task_id}"
+
+
+async def _bound_task(
+    session: AsyncSession, ctx: AuthContext, rule: WorkRule, task_id: uuid.UUID
+) -> tuple[Task, dict[str, Any] | None]:
+    """Checks 2-5 of Zh3 on the bound task, locked for the decision.
+
+    Returns the task and, when the decision ends here, why it is skipped: a
+    type outside ``taskTypes`` (the fact is not this rule's), work already
+    done or closed (a repeated fact gives neither a second attempt nor a
+    second copy of the evidence). A task that is missing, of another tenant
+    or unreadable to the rule is ``bound_task_not_found`` — what cannot be
+    seen is not told apart from what is not there; a task the rule's identity
+    may not write (its workspace) is ``bound_task_forbidden``.
+    """
+    task: Task | None = await session.scalar(
+        select(Task)
+        .where(Task.id == task_id, Task.tenant_id == ctx.tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if task is not None:
+        try:
+            await authorize(ctx, Permission.TASKS_READ, resource=ResourceRef("task", str(task.id)))
+        except AuthorizationError:
+            task = None
+    if task is None:
+        raise DomainError(
+            BOUND_TASK_NOT_FOUND,
+            "The task the observation is bound to is not found",
+            details={"taskId": str(task_id)},
+        )
+    task_type = await session.get(TaskType, task.type_id) if task.type_id is not None else None
+    type_key = task_type.key if task_type is not None else None
+    if type_key not in rule.action["taskTypes"]:
+        return task, {"skipped": True, "reason": BOUND_TASK_TYPE_NOT_LISTED, "typeKey": type_key}
+    try:
+        await authorize(ctx, Permission.TASKS_WRITE, resource=ResourceRef("task", str(task.id)))
+    except AuthorizationError as exc:
+        raise DomainError(
+            BOUND_TASK_FORBIDDEN,
+            f"The rule may not write {task.public_id}, the task the observation is bound to",
+            details={
+                "taskId": str(task.id),
+                "workspaceId": str(task.workspace_id) if task.workspace_id else None,
+                "permission": Permission.TASKS_WRITE.value,
+            },
+        ) from exc
+    if task.system_status_category == WorkItemStatusCategory.TERMINAL_SUCCESS:
+        return task, {"skipped": True, "reason": ALREADY_DONE}
+    if task.system_status_category == WorkItemStatusCategory.TERMINAL_CANCELLED:
+        return task, {"skipped": True, "reason": ALREADY_CLOSED}
+    return task, None
+
+
+async def _fact_on_record(session: AsyncSession, task: Task, check: str | None) -> bool:
+    """Is the task being verified with a fact of ``check`` for this attempt?
+
+    Then another fact of the same closing (a second observation of the same
+    task) adds nothing to the open attempt: the decision is skipped
+    (``verification_pending``). A task handed in by its executor without the
+    fact still gets it, and its attempt is woken by it. A fact an earlier
+    attempt has spent (the work was handed in anew after it failed) is not
+    this attempt's: the new closing is written (Zh7).
+    """
+    if check is None:
+        return False
+    attempt = await open_attempt(session, task.id)
+    if attempt is None:
+        return False
+    return any(
+        item.get("check") == check for item in await current_evidence(session, task, attempt)
+    )
+
+
+def _bound_skip(item: dict[str, Any]) -> tuple[EvaluationStatus, dict[str, Any]]:
+    details = {k: item[k] for k in ("taskId", "typeKey") if k in item}
+    return EvaluationStatus.SKIPPED, {
+        "skipped": {"reason": item["reason"], **details},
+        "work": [item],
+    }
+
+
+async def _act_on_bound_task(
+    session: AsyncSession,
+    ctx: AuthContext,
+    rule: WorkRule,
+    row: RuleEvaluation,
+    facts: Facts,
+) -> tuple[EvaluationStatus, dict[str, Any]]:
+    """``cancel_work`` / ``complete_work`` with ``target: task`` (Zh3).
+
+    The work is the task of the triggering observation (``payload.taskId``),
+    whoever filed it. The row of the task serializes the decision: there is
+    no dedup key to lock, and none is written to ``rule_work_items`` (Zh4).
+    Past the checks it is closed as ``target: dedup`` closes work: through
+    the verification stage, or after the claim on it has ended.
+    """
+    kind = rule.action["kind"]
+    if not has_author_filter(rule.trigger):
+        return EvaluationStatus.SKIPPED, {
+            "skipped": {"reason": TRIGGER_AUTHOR_UNFILTERED},
+            "work": [],
+        }
+    if facts.task_id is None:
+        return EvaluationStatus.SKIPPED, {"skipped": {"reason": NO_BOUND_TASK}, "work": []}
+    dedup_key = _bound_key(facts.task_id)
+    outcome: dict[str, Any] = {
+        "dedupKey": dedup_key,
+        "target": ActionTarget.TASK.value,
+        "action": kind,
+        "taskId": str(facts.task_id),
+    }
+    task, skipped = await _bound_task(session, ctx, rule, facts.task_id)
+    outcome["publicId"] = task.public_id
+    check = _render_check(
+        rule.action,
+        facts.resolve,
+        action_roots(interpreted=rule.interpretation is not None, for_each=False),
+    )
+    if skipped is None and await _fact_on_record(session, task, check):
+        skipped = {"skipped": True, "reason": VERIFICATION_PENDING}
+    if skipped is not None:
+        return _bound_skip({**outcome, **skipped})
+    claim = await live_claim_of(session, task)
+    if claim is not None:
+        waiting = await _await_release(session, ctx, rule, task, claim.id, dedup_key)
+        return EvaluationStatus.WAITING, {
+            "work": [{**outcome, **waiting, **({"check": check} if check else {})}],
+            "waitingFor": WAITING_FOR_CLAIM,
+            "waitingSince": utcnow().isoformat(),
+        }
+    closed = await _close(
+        session, ctx, rule, row, task, dedup_key, check, target=ActionTarget.TASK.value
+    )
+    return EvaluationStatus.MATCHED, {"work": [{**outcome, **closed}]}
+
+
 async def _act(
     session: AsyncSession,
     ctx: AuthContext,
@@ -1281,6 +1543,8 @@ async def _act(
 ) -> tuple[EvaluationStatus, dict[str, Any]]:
     """The action over every selected item (one item without ``forEach``)."""
     action = rule.action
+    if action.get("target") == ActionTarget.TASK:
+        return await _act_on_bound_task(session, ctx, rule, row, facts)
     items: list[Any]
     if action.get("forEach") is not None:
         outer = action_roots(interpreted=rule.interpretation is not None, for_each=False)
@@ -1490,12 +1754,9 @@ async def evaluate_trigger(
         await acting.require_standing(session)
         await authorize(ctx, Permission.EVENTS_READ, resource=rule_scope(rule.workspace_id))
         await _load_views(session, ctx, rule, facts)
+        _settings_evidence(row, facts)
         _observe("condition", facts)
-        matched = evaluate(
-            rule.condition,
-            facts.resolve,
-            roots=frozenset({ROOT_TRIGGER, ROOT_PAYLOAD, ROOT_GOAL, ROOT_TASK}),
-        )
+        matched = evaluate(rule.condition, facts.resolve, roots=BASE_ROOTS)
     except ConditionError as exc:
         await _finish(
             session,
@@ -1520,11 +1781,7 @@ async def evaluate_trigger(
         interpretation = rule.interpretation
         try:
             async with session.begin_nested():
-                inputs = render(
-                    interpretation.get("inputs") or {},
-                    facts.resolve,
-                    roots=frozenset({ROOT_TRIGGER, ROOT_PAYLOAD, ROOT_GOAL, ROOT_TASK}),
-                )
+                inputs = render(interpretation.get("inputs") or {}, facts.resolve, roots=BASE_ROOTS)
                 queued = await invoke_skill(
                     session,
                     ctx,
@@ -1826,7 +2083,10 @@ async def resume_evaluation(
             },
         )
         return row
-    facts.evidence = list(row.evidence)
+    facts.evidence = _task_evidence(row.evidence)
+    facts.settings_seen = next(
+        (item for item in row.evidence or [] if item.get("kind") == SETTINGS_EVIDENCE), None
+    )
     facts.skill = {
         "invocationId": str(invocation.id),
         "skill": f"{skill.name}@{skill.version}",
@@ -1877,7 +2137,15 @@ async def _resume_claimed(
     work = [dict(item) for item in result.get("work", [])]
     try:
         async with session.begin_nested():
-            await _lock_keys(session, ctx, {w["dedupKey"] for w in work if w.get("waiting")})
+            await _lock_keys(
+                session,
+                ctx,
+                {
+                    w["dedupKey"]
+                    for w in work
+                    if w.get("waiting") and w.get("target") != ActionTarget.TASK
+                },
+            )
             for index, item in enumerate(work):
                 if item.get("waiting"):
                     work[index] = await _settle(session, ctx, rule, row, item, expired=expired)
@@ -1895,6 +2163,12 @@ async def _resume_claimed(
     result.pop("waitingFor", None)
     result.pop("waitingSince", None)
     row.result = result
+    if len(work) == 1 and work[0].get("target") == ActionTarget.TASK and work[0].get("skipped"):
+        # The bound task was closed, handed in or changed while the decision
+        # waited: skipped, as it would have been without the wait (Zh3).
+        status, skipped = _bound_skip(work[0])
+        await _finish(session, ctx, rule, row, status, result=skipped)
+        return row
     stuck = [w["dedupKey"] for w in work if w.get("reason") == CLAIM_NOT_RELEASED]
     if stuck:
         await _finish(
@@ -1925,11 +2199,25 @@ async def _settle(
 ) -> dict[str, Any]:
     """One waiting decision: apply it, keep waiting, or say why it is moot."""
     base: dict[str, Any] = {
-        k: item[k] for k in ("dedupKey", "action", "taskId", "publicId") if k in item
+        k: item[k] for k in ("dedupKey", "target", "action", "taskId", "publicId") if k in item
     }
-    task = await session.get(
-        Task, uuid.UUID(item["taskId"]), populate_existing=True, with_for_update=True
-    )
+    target = item.get("target")
+    task: Task | None
+    if target == ActionTarget.TASK:
+        if not has_author_filter(rule.trigger):
+            # Waited under a rule saved before the filter became mandatory:
+            # it closes nothing now, as it would not have started (Zh6).
+            return {**base, "skipped": True, "reason": TRIGGER_AUTHOR_UNFILTERED}
+        # The checks are made again: rights and status may have changed meanwhile.
+        task, skipped = await _bound_task(session, ctx, rule, uuid.UUID(item["taskId"]))
+        if skipped is None and await _fact_on_record(session, task, item.get("check")):
+            skipped = {"skipped": True, "reason": VERIFICATION_PENDING}
+        if skipped is not None:
+            return {**base, **skipped}
+    else:
+        task = await session.get(
+            Task, uuid.UUID(item["taskId"]), populate_existing=True, with_for_update=True
+        )
     assert task is not None  # pragma: no cover - tasks are never deleted
     if task.system_status_category == WorkItemStatusCategory.TERMINAL_SUCCESS:
         # The executor finished first: its result stands.
@@ -1947,7 +2235,9 @@ async def _settle(
         # Handed in before the decision could apply: the executor's result is
         # being verified and is not thrown away by a stale cancellation.
         return {**base, "skipped": True, "reason": VERIFICATION_PENDING}
-    closed = await _close(session, ctx, rule, row, task, item["dedupKey"], item.get("check"))
+    closed = await _close(
+        session, ctx, rule, row, task, item["dedupKey"], item.get("check"), target=target
+    )
     return {**base, **closed, "afterClaim": True}
 
 
@@ -1993,6 +2283,24 @@ async def _rule_calls(
         )
     )
     return set(rows.all())
+
+
+async def _agent_principals(
+    session: AsyncSession, tenant_id: uuid.UUID, rules: Sequence[WorkRule]
+) -> dict[str, str]:
+    """The principals of the active agents the rules' triggers name as authors (Zh6)."""
+    keys = {rule.trigger["agent"] for rule in rules if rule.trigger.get("agent")}
+    if not keys:
+        return {}
+    rows = await session.execute(
+        select(Agent.key, Agent.principal_id).where(
+            Agent.tenant_id == tenant_id,
+            Agent.key.in_(keys),
+            Agent.status == AgentStatus.ACTIVE,
+            Agent.principal_id.is_not(None),
+        )
+    )
+    return {key: str(principal_id) for key, principal_id in rows.all()}
 
 
 def _outside_workspace(rule: WorkRule, event: JournalEvent) -> bool:
@@ -2090,6 +2398,7 @@ async def process_tenant_events(
         )
     ).all()
     rule_calls = await _rule_calls(session, tenant_id, events)
+    authors = await _agent_principals(session, tenant_id, rules)
     isolate = cursor.failure_count >= max_attempts
     evaluated = 0
     for event in events:
@@ -2100,6 +2409,9 @@ async def process_tenant_events(
             if event.occurred_at < rule.enabled_at:
                 continue
             if not trigger_matches(rule.trigger, event.event_type, event.payload or {}):
+                continue
+            actor_id = str(event.actor_id) if event.actor_id is not None else None
+            if not author_matches(rule.trigger, actor_id, authors):
                 continue
             if _outside_workspace(rule, event):
                 continue

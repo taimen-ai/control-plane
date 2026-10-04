@@ -135,6 +135,8 @@ def replay(
     calendars: Callable[[Mapping[str, int]], Mapping[str, Calendar]],
     *,
     stop: bool = False,
+    settings: Callable[[int, int], Mapping[str, Any] | None] | None = None,
+    definitions: Mapping[int, engine.Definition] | None = None,
 ) -> Replay:
     """Take the recorded inputs again, in ``seq`` order, and compare every step.
 
@@ -152,6 +154,14 @@ def replay(
     The input ``migrated`` after it — the deadlines counted by the new
     version — is the first step replayed: an input of the engine like any
     other, recorded with the calendar versions it counted by.
+
+    A record that names the settings of the package (``settingsVersion``,
+    ``settingsSchemaRevision``, CP-ADR-0081 §6) is taken with the effective
+    values of that pair — ``settings`` gives them from the history — by
+    ``definition`` typed with that revision of the schema (``definitions``;
+    a candidate not in it keeps its own types), not with the current ones. A pair
+    the history lacks is a discrepancy of its own (``settings``) and the
+    replay stops there: substituting other values would replay another case.
     """
     result = Replay()
     state: dict[str, Any] | None = None
@@ -164,15 +174,28 @@ def replay(
     for entry in ordered[start:]:
         seq = int(entry["seq"])
         recorded = entry["input"]
+        here = definition
+        values: Mapping[str, Any] | None = None
+        version, revision = entry.get("settingsVersion"), entry.get("settingsSchemaRevision")
+        if version is not None and revision is not None:
+            values = settings(int(version), int(revision)) if settings is not None else None
+            if definition.reads_settings:
+                here = (definitions or {}).get(int(revision), definition)
+            if values is None:
+                pair = {"version": int(version), "schemaRevision": int(revision)}
+                result.discrepancies.append(Discrepancy(seq, "settings", pair, None))
+                result.steps += 1
+                return result
         given = engine.Input(
             str(recorded["kind"]),
             _time(str(recorded["at"])),
             dict(recorded.get("body") or {}),
             recorded.get("actorId"),
             calendars(dict(entry.get("calendars") or {})),
+            settings=values,
         )
         try:
-            state, decisions, intents = engine.step(definition, state, given)
+            state, decisions, intents = engine.step(here, state, given)
         except engine.EngineError as exc:
             result.discrepancies.append(Discrepancy(seq, "input", recorded, str(exc)))
             result.steps += 1
@@ -223,7 +246,9 @@ class Divergence:
     """The first entry of an instance journal where the candidate decides otherwise.
 
     ``kind`` — ``decision`` or ``intent`` (the first one that differs, with its
-    element), ``input`` (the candidate refused a recorded input), or, when
+    element), ``input`` (the candidate refused a recorded input), ``settings``
+    (the version or the schema revision of the settings a record names is not
+    in the database, ``recorded: {version, schemaRevision}``), or, when
     every step matched, what of the final state differs: ``data``, ``timer``,
     ``state``.
     """
@@ -275,8 +300,8 @@ def first_divergence(
     if result.discrepancies:
         seq = min(d.seq for d in result.discrepancies)
         first = next(d for d in result.discrepancies if d.seq == seq)
-        if first.field == "input":
-            return Divergence(seq, "input", None, first.recorded, first.replayed)
+        if first.field in ("input", "settings"):
+            return Divergence(seq, first.field, None, first.recorded, first.replayed)
         mine, theirs = _first_different(first.recorded, first.replayed)
         return Divergence(seq, _SINGULAR[first.field], _element(mine, theirs), mine, theirs)
     stored = dict(stored or {}) or None
@@ -414,16 +439,26 @@ def journal_entries(
     calendars: Any,
     decisions: Sequence[Mapping[str, Any]],
     intents: Sequence[Mapping[str, Any]],
+    settings_version: int | None = None,
+    settings_schema_revision: int | None = None,
 ) -> list[dict[str, Any]]:
-    """A journal record as entries of ProcessJournalEntryOut: input, decisions, intents."""
+    """A journal record as entries of ProcessJournalEntryOut: input, decisions, intents.
+
+    The input of a step that read the settings of the package names their
+    version and schema revision (``settingsVersion``, ``settingsSchemaRevision``).
+    """
     base = {"seq": seq, "at": at, "actorId": actor_id, "eventId": event_id}
+    data: dict[str, Any] = {"input": given, "calendars": calendars}
+    if settings_version is not None:
+        data["settingsVersion"] = settings_version
+        data["settingsSchemaRevision"] = settings_schema_revision
     entries: list[dict[str, Any]] = [
         {
             **base,
             "kind": "input",
             "element": None,
             "reason": f"{kind}: {source_ref}",
-            "data": {"input": given, "calendars": calendars},
+            "data": data,
         }
     ]
     for decision in decisions:

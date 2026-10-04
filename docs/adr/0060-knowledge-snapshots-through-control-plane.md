@@ -7,7 +7,9 @@
 пакеты арендатора (п. К4) — в K010 (TASK-000770); амендмент 2026-09-28
 (company-knowledge, K031, TASK-000796): перечень сущностей
 `POST /knowledge/entities:query`; амендмент 2026-09-30 (package-sdk,
-TASK-001043): чтение набора пакетов workspace и пакета онтологии
+TASK-001043): чтение набора пакетов workspace и пакета онтологии;
+амендмент 2026-10-03 (TAI-ADR-0066 п.5, TASK-001300): связи записей
+(`include.relations`) и контракт полей источника в перечне сущностей
 
 Контекст: амендмент 2026-09-23 к TAI-ADR-0042 суперпроекта («память — только
 через Control Plane») и TAI-ADR-0031 п.6: никто, кроме ядра, не ходит в
@@ -522,7 +524,8 @@ K031 (TASK-000796).
    наличии — `where`, `asOf`, `cursor`, а также `namespaces: [<root ns>]` и
    поля видимости. `scope` не передаётся: память принимает `namespaces` или
    `scope`, но не оба сразу.
-5. **Ответ** — `200 {items, nextCursor, asOf}`. `items` — сущности памяти как
+5. **Ответ** — `200 {items, nextCursor, asOf}`. Форма записи изменена
+   амендментом 2026-10-03 (С2). `items` — сущности памяти как
    есть (`EntityItem`: `kind`, `key`, `namespace`, `title`, `attributes`,
    `source`, `scope`, `snapshot_id`, `source_path`, `valid_from`, `valid_to`) в
    порядке `(kind, key, namespace)`. Конец перечня — только `nextCursor: null`:
@@ -644,6 +647,114 @@ as_of=, limit=, cursor=)` — одна страница. MCP-инструмен�
   событий не пишут.
 - `tests/client/test_sdk.py`: методы клиента читают набор и пакет.
 
+## Амендмент 2026-10-03 (TAI-ADR-0066 п.5, TASK-001300): связи записей и поля источника
+
+Основание — TAI-ADR-0066 суперпроекта («Экраны вертикальных пакетов
+описанием», п.5): блоку вида `related` и странице документа базы знаний в
+консоли нужны связи записи. У записей вроде `component` (пакет
+`software-delivery@1`) нет атрибутов, их смысл — в связях (`calls`,
+`defined_in`, `governs`…), а `entities:query` связей не отдавал. Второе: ядро
+отдавало запись памяти как есть, и консоль уже читает поля сверх
+`KnowledgeEntityOut` из OpenAPI (`source`/`sources`, `valid_from`; на staging
+2026-10-03 — ещё `snapshot_id`, `source_path`, `valid_to`, `namespace`,
+`scope`). Поля, которых нет в контракте, можно убрать молча.
+
+### С1. `include` у `POST /api/v1/knowledge/entities:query`
+
+Необязательное поле тела `include` (строгое, как всё тело; `null` — то же,
+что его отсутствие):
+
+| Поле | Смысл |
+|---|---|
+| `relations` | Обязательно. Имена связей, 1..20, имя `^[a-z][a-z0-9_]{0,62}$` (как `RelationSpecIn.relation` пакета памяти), повтор берётся один раз; или `"*"` — все связи, которые объявляют пакеты, включённые в namespace корня (`catalog.relations` из `GET /api/memory/namespaces/{ns}/kinds`). Связь нестрогого namespace, не объявленная пакетом, по `"*"` не читается: её надо назвать. |
+| `direction` | `out` — запись субъект связи, `in` — объект, `both` (по умолчанию) — то и другое. |
+| `limit` | Связей на запись, 1..200 (граница шага обхода памяти), по умолчанию 20. |
+
+1. **Ответ.** У каждой записи страницы — `relations: [{relation, direction,
+   kind, key, title}]`: связь, направление относительно записи (`out`/`in`) и
+   противоположный конец. Порядок — `(relation, direction, kind, key)`,
+   не больше `limit` на запись. Без `include` поля `relations` нет и память
+   связей не читает.
+2. **Откуда.** У перечня памяти связей нет, поэтому ядро читает их
+   типизированным обходом `POST /api/memory/context/typed`: якорь — сама
+   запись (`{kind, value: key}`), каждая связь — шаг глубины 1 от якоря с
+   `direction` и `limit` запроса, `allow_semantic: false`, `as_of` — `asOf`
+   запроса. Шагов в одном обходе не больше 10 (`MAX_STEPS` памяти): больше
+   связей — несколько обходов. Один обход (или их пачка) на запись: лимит
+   шага памяти общий для всех якорей, и общий обход страницы отдал бы
+   «соседей» одной записи за счёт другой. Обходы страницы идут не больше 8
+   одновременно, все — в пределах одного срока
+   (`CP_CONTEXT_TIMEOUT_SECONDS`), что и сама страница.
+3. **Видимость** — та же, что у записей: namespace корня дерева и
+   `allowedNamespaces`/`allowedScopes`, вычисленные для перечня (П1 п.2–3).
+   Связь на запись, которую вызывающий не видит, не выдаётся: память не
+   доходит до невидимого конца, а ядро отбрасывает связь, конец которой не
+   пришёл среди сущностей обхода. Ответ неотличим от отсутствия связи.
+4. **Размер страницы.** С `include` — `limit` страницы не больше 100 (иначе
+   `400 invalid_request`): каждая запись — свой обход.
+5. **Ошибки.** Сбой любого обхода или каталога связей — сбой страницы, как
+   сбой перечня (П1 п.6): `502 memory_unavailable`, срок истёк —
+   `503 memory_timeout`. Частичной страницы без связей нет.
+
+Нативное `include` в перечне памяти дешевле (один запрос на страницу); когда
+память его даст, ядро перейдёт на него, не меняя С1.
+
+### С2. Контракт записи (`KnowledgeEntityOut`)
+
+Запись больше не отдаётся как есть: ядро строит её из `EntityItem` памяти
+(MEM-ADR-022: версия, сведённая из источников).
+
+| Поле | Контракт | Откуда |
+|---|---|---|
+| `kind`, `key`, `title`, `attributes` | да | как в памяти |
+| `validFrom`, `validTo` | да | `valid_from`, `valid_to`; пусто — `null` (`validTo: null` — версия открыта) |
+| `sources[]` | да | `sources[]` памяти по старшинству; у элемента — `source`, `sourcePath` (цитата), `snapshotId`. Память без `sources` (до MEM-ADR-022) — один элемент из верхних `source`/`source_path`/`snapshot_id` |
+| `relations[]` | да, только с `include` | С1 |
+| `source`, `source_path`, `snapshot_id`, `valid_from`, `valid_to`, `namespace`, `scope` | переходные | как в памяти, если память их прислала |
+| `scope`, `source_path`, `snapshot_id` у элемента `sources` | переходные | как в памяти |
+
+1. **camelCase — контракт.** Консоль и клиенты читают `validFrom`,
+   `validTo`, `sources[].source`/`sourcePath`/`snapshotId`. Старший источник —
+   `sources[0]`, отдельного поля для него в контракте нет.
+2. **snake_case — переходные.** Сохраняются, чтобы консоль, читающая
+   `source`/`sources` и `valid_from`, не сломалась до перехода. В OpenAPI они
+   помечены `deprecated`. Убрать их можно только следующим амендментом этого
+   ADR, после того как консоль перейдёт на camelCase. Молча не убираются.
+3. **Не в контракте.** `namespace` — имя хранения в памяти (`tenant:<t>:ws:<root>`),
+   его выводит ядро, и клиент его не называет (П1). `scope` — scope
+   видимости источника, служебное поле сверки. Оба отдаются только на
+   переходный период.
+4. **Прочие поля памяти** (новые поля `EntityItem`) больше не проходят без
+   решения: поле попадает в ответ, когда его вносит в контракт амендмент.
+
+### С3. Клиенты
+
+`control-plane-client`: `query_knowledge_entities(..., include=)` — тело
+`include` как есть. MCP-инструмента по-прежнему нет.
+
+### Conformance амендмента 2026-10-03
+
+- `tests/unit/test_knowledge_entity_relations.py`: связи `out`/`in`/`both` с
+  противоположным концом; один обход на запись от неё самой по закреплённым
+  `ContextIn`/`typedRequest` с namespace, видимостью и `as_of` перечня; связь
+  на невидимый конец не выдаётся (с той же связью без сужения — выдаётся);
+  факт без конца среди сущностей отбрасывается; `limit` на запись — у каждой
+  своей; `"*"` читает связи каталога namespace; больше 10 связей — пачками;
+  нет имён или записей — нет обходов; не больше 8 обходов одновременно;
+  сбой обхода или каталога — `502`, срок — `503 memory_timeout`; границы
+  `include` (пустое, `null`, неверный тип, лишнее поле, `limit` страницы).
+  Поля источника: сведённые `sources`, память без `sources`, разреженная или
+  испорченная запись; OpenAPI — контрактные поля без `deprecated`, переходные с
+  ним.
+- `tests/unit/test_graph_memory_contract.py`: страница памяти по закреплённой
+  `EntitiesQueryResult` (перезакреплена с memory-service master 372a52a:
+  `EntityItem.sources`) отдаётся в форме С2.
+- `tests/integration/test_knowledge_entities.py`: связи через HTTP из дочернего
+  workspace — namespace корня, видимость перечня, невидимый вызывающий не
+  выдаётся, `"*"`; поля источника в ответе; ошибки `include` — `400`, память не
+  вызывается; сбой обхода — `502`.
+- `tests/client/test_sdk.py`: `query_knowledge_entities(include=)` отдаёт связи.
+
 ## Conformance
 
 ```conformance
@@ -690,6 +801,10 @@ as_of=, limit=, cursor=)` — одна страница. MCP-инструмен�
 - grep: {path: "src/control_plane/application/queries/knowledge_entities.py", pattern: 'Permission.EVENTS_READ, resource=ResourceRef\("workspace"'}
   repo: control-plane
 - grep: {path: "client/src/control_plane_client/client.py", pattern: "def query_knowledge_entities"}
+  repo: control-plane
+- grep: {path: "src/control_plane/application/queries/knowledge_entities.py", pattern: '"anchors": \[\{"kind": item\["kind"\], "value": item\["key"\]\}\]'}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/schemas.py", pattern: 'alias="validFrom"'}
   repo: control-plane
 - grep: {path: "src/control_plane/api/v1/knowledge.py", pattern: '"/knowledge/packs/\{ref\}"'}
   repo: control-plane

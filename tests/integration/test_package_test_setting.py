@@ -948,9 +948,29 @@ def _bombs() -> dict[str, str]:
         ),
         # 900 KB five times over.
         "rules/big.yaml": f"s: &s {'y' * 900_000}\nl: [*s, *s, *s, *s, *s]\n",
-        # The reader of YAML refuses a raw NUL before any parsing.
-        "rules/nul.yaml": "a: \x00\n",
     }
+
+
+async def test_a_nul_in_a_package_file_is_refused_at_the_api_boundary(
+    client: httpx.AsyncClient,
+) -> None:
+    """A NUL never reaches the reader of YAML: ``422 validation_error`` (CP-ADR-0083)."""
+    key = await setup(client)
+    files = [*claims(), {"path": "rules/nul.yaml", "content": "a: \x00\n"}]
+    for route in ("packages:test", "packages:test?checkOnly=true", "packages:plan"):
+        response = await client.post(
+            f"/api/v1/{route}", json={"package": {"files": files}}, headers=auth(key)
+        )
+        assert response.status_code == 422, (route, response.text)
+        error = response.json()["error"]
+        assert error["code"] == "validation_error"
+        assert error["details"]["errors"] == [
+            {
+                "path": f"/package/files/{len(files) - 1}/content",
+                "code": "nul_character",
+                "message": "Request body contains the NUL character (U+0000) in a string",
+            }
+        ]
 
 
 async def test_an_alias_bomb_is_invalid_yaml_on_every_route_that_reads_a_package(
@@ -1173,3 +1193,171 @@ async def test_a_number_json_has_not_under_a_data_ref_is_unresolved_not_a_500(
             problems = await _problems(client, key, route, files(schema))
             problem = _refused_at(problems, "unresolved_data_ref", "processes/sample.yaml")
             assert message in problem["message"], (route, problem)
+
+
+# --- a gate addressed to a role of the package (CP-ADR-0061, amendment 2026-10-01) ------
+
+APPROVERS = ("roles/approvers.yaml", document("Role", "approvers", {"name": "Approvers"}))
+ROLE_GATED = {
+    "displayName": "Role-gated",
+    "acceptance": [
+        {
+            "key": "approved",
+            "kind": "human",
+            "description": "Approved by an approver",
+            "spec": {"approverRole": "role:approvers"},
+        }
+    ],
+    "completionSchema": {
+        "onComplete": {
+            "actions": [
+                {
+                    "ensureWork": {
+                        "type": "claim-review",
+                        "key": "after:$.task.id",
+                        "title": "After $.task.publicId",
+                        "requestApproval": {"assignee": "role:approvers"},
+                    }
+                }
+            ]
+        }
+    },
+}
+GATED = ("task-types/role-gated.yaml", document("TaskType", "role-gated", ROLE_GATED))
+
+
+async def test_a_type_test_checks_who_may_decide_a_gate_addressed_to_a_role(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    key = await setup(client)
+    holders = {"principals": {"approvers": ["sam"]}}
+    before = snapshot(sync_engine)
+    body = await run(
+        client,
+        key,
+        claims(
+            APPROVERS,
+            GATED,
+            type_test(
+                "holder-decides",
+                "role-gated",
+                holders,
+                [
+                    {"complete": {}},
+                    {
+                        "approve": {
+                            "decision": "approved",
+                            "by": "bob",
+                            "expectRefused": "not_eligible",
+                        }
+                    },
+                    {"approve": {"decision": "approved", "by": "sam"}},
+                    {"expect": {"status": {"category": "terminal_success"}}},
+                ],
+            ),
+        ),
+    )
+    assert snapshot(sync_engine) == before
+    passed(body)
+    # The type names the package's role by slug: published after the role, no finding.
+    assert [p for p in body["problems"] if p["severity"] == "error"] == []
+
+
+async def test_a_refusal_expected_but_not_given_is_a_failure(client: httpx.AsyncClient) -> None:
+    key = await setup(client)
+    holders = {"principals": {"approvers": ["sam"]}}
+    body = await run(
+        client,
+        key,
+        claims(
+            APPROVERS,
+            GATED,
+            type_test(
+                "taken",
+                "role-gated",
+                holders,
+                [
+                    {"complete": {}},
+                    {
+                        "approve": {
+                            "decision": "approved",
+                            "by": "sam",
+                            "expectRefused": "not_eligible",
+                        }
+                    },
+                ],
+            ),
+            type_test(
+                "other-code",
+                "role-gated",
+                holders,
+                [
+                    {"complete": {}},
+                    {
+                        "approve": {
+                            "decision": "approved",
+                            "by": "bob",
+                            "expectRefused": "separation_of_duties_violation",
+                        }
+                    },
+                ],
+            ),
+            # No gate is pending: there is nobody to refuse.
+            type_test(
+                "no-gate",
+                "claim-review",
+                {},
+                [{"approve": {"decision": "approved", "by": "bob", "expectRefused": "x"}}],
+            ),
+            # A refusal nobody expected ends the test, as before.
+            type_test(
+                "unexpected",
+                "role-gated",
+                holders,
+                [{"complete": {}}, {"approve": {"decision": "approved", "by": "bob"}}],
+            ),
+        ),
+    )
+    assert body["status"] == "failed"
+    status, first = failure(body, "taken")
+    assert (status, first["step"], first["expected"], first["actual"]) == (
+        "failed",
+        1,
+        "not_eligible",
+        None,
+    )
+    assert "a refusal was expected" in first["message"]
+    _, first = failure(body, "other-code")
+    assert (first["expected"], first["actual"]) == (
+        "separation_of_duties_violation",
+        "not_eligible",
+    )
+    _, first = failure(body, "no-gate")
+    assert first["step"] == 0 and "no gate is pending" in first["message"]
+    _, first = failure(body, "unexpected")
+    assert first["actual"]["code"] == "not_eligible"
+
+
+async def test_without_a_decider_the_holder_of_the_role_is_given(
+    client: httpx.AsyncClient,
+) -> None:
+    key = await setup(client)
+    body = await run(
+        client,
+        key,
+        claims(
+            APPROVERS,
+            GATED,
+            type_test(
+                "anyone",
+                "role-gated",
+                {},
+                [
+                    {"complete": {}},
+                    {"approve": {"decision": "approved"}},
+                    {"expect": {"status": {"category": "terminal_success"}}},
+                ],
+            ),
+        ),
+    )
+    passed(body)

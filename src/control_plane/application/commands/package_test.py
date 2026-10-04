@@ -16,7 +16,11 @@ The body is the package as its files. The core
    engine a live instance runs, a rule or task type test by the application
    code of the core in a transaction that is rolled back
    (:mod:`control_plane.application.commands.package_trials`, Z2); and reports
-   the coverage of every process, rule and task type.
+   the coverage of every process, rule and task type. The package's rules
+   that close the task an observation is bound to (``WorkRule`` with
+   ``target: task``, CP-ADR-0063 amendment Zh5) are checked
+   (:func:`normalize_rule_spec`) and evaluated in the process sandbox on the
+   observations a process test emits.
 
 Nothing is written. The transaction of the process tests is ``READ ONLY`` —
 the catalog, roles and calendars are read from it — and a guard on the
@@ -47,6 +51,7 @@ from sqlalchemy.sql.elements import TextClause
 from control_plane.application.authorization import AuthContext, authorize
 from control_plane.application.commands import package_trials
 from control_plane.application.commands.package_catalog import SpecShape
+from control_plane.application.commands.package_settings import unknown_refs
 from control_plane.application.commands.process_definitions import (
     engine_revision_for,
     load_catalog,
@@ -59,6 +64,7 @@ from control_plane.application.commands.process_instances import (
     latest_calendar_versions,
 )
 from control_plane.application.context.graph import GraphScope
+from control_plane.application.queries.package_settings import snapshot
 from control_plane.application.queries.process_regulations import (
     governed_by_problems,
     regulation_scope,
@@ -68,7 +74,13 @@ from control_plane.domain import process_engine as engine
 from control_plane.domain import process_sandbox as sandbox
 from control_plane.domain.calendar import Calendar
 from control_plane.domain.enums import ApprovalStatus, Permission
-from control_plane.domain.errors import NotFoundError
+from control_plane.domain.errors import NotFoundError, ValidationError
+from control_plane.domain.package_settings import (
+    Reference,
+    check_declaration,
+    validate,
+)
+from control_plane.domain.package_settings import references as settings_references
 from control_plane.domain.package_source import (
     SUBJECT_PROCESS,
     PackageObject,
@@ -85,8 +97,11 @@ from control_plane.domain.process_definition import (
     check_process,
     governed_references,
     normalized_spec,
+    package_skill,
     references,
 )
+from control_plane.domain.settings_refs import SettingsScope
+from control_plane.domain.work_rules import ActionTarget, normalize_rule_spec
 from control_plane.infrastructure.context_provider import GraphProvider
 from control_plane.infrastructure.db.engine import transaction
 from control_plane.infrastructure.db.models import (
@@ -200,18 +215,11 @@ class WriteGuard:
 # --- the package over the catalog -------------------------------------------------------
 
 
-def _skill_entry(spec: Mapping[str, Any]) -> SkillEntry:
-    contract = spec.get("contract")
-    if isinstance(contract, dict):
-        return SkillEntry(contract.get("inputs"), contract.get("outputs"))
-    return SkillEntry(spec.get("inputSchema"), spec.get("outputSchema"))
-
-
 def overlay_catalog(catalog: Catalog, package: ParsedPackage, calendars: frozenset[str]) -> Catalog:
     """The tenant's catalog with the package's objects over it."""
     skills = dict(catalog.skills)
     for obj in package.of_kind("Skill"):
-        skills[f"{obj.key}@{obj.spec.get('version')}"] = _skill_entry(obj.spec)
+        skills[f"{obj.key}@{obj.spec.get('version')}"] = package_skill(obj.spec)
     task_types = dict(catalog.task_types)
     for obj in package.of_kind("TaskType"):
         task_types[obj.key] = obj.spec.get("fieldSchema") or None
@@ -341,6 +349,14 @@ async def run_package_tests(
     subjects = [t for t in chosen if t.subject != SUBJECT_PROCESS]
     report.problems.extend(package_trials.limit_problems(subjects))
     checked: list[_Checked] = []
+    # The settings the package declares type ``settings`` of its processes (CP-ADR-0081 §6).
+    declaration = check_declaration(package)
+    report.problems.extend(declaration.problems)
+    manifest = package.manifest_object
+    scope = SettingsScope(
+        manifest.key if manifest is not None else None,
+        declaration.declared.schema if declaration.declared is not None else None,
+    )
     if workspace_id is not None:
         # The run reads the roles and calendars of the workspace as its processes would.
         await authorize(ctx, Permission.PROCESSES_READ, resource=process_scope(workspace_id))
@@ -361,19 +377,29 @@ async def run_package_tests(
                     calendars[obj.key] = calendar
             for obj in package.of_kind("Process"):
                 done, problems = await _check_process(
-                    db, ctx, settings, obj, package, calendars, workspace_id
+                    db, ctx, settings, obj, package, calendars, workspace_id, scope
                 )
                 report.problems.extend(problems)
                 if done is not None:
                     checked.append(done)
+            rules, problems = sandbox_rules(package)
+            # The form of every rule is already a finding of the static check
+            # (Z4): the same refusal of a ``target: task`` rule is not repeated.
+            seen = {(p.code, p.file, p.path) for p in report.problems}
+            report.problems.extend(p for p in problems if (p.code, p.file, p.path) not in seen)
             report.problems.extend(_test_problems(package, checked))
             if not check_only and not any(p.error for p in report.problems):
                 given = {str((t.data.get("given") or {}).get("calendar") or "") for t in processes}
                 world = await _world(
                     db, ctx, package, checked, calendars, given - {""}, workspace_id
                 )
+                world = replace(
+                    world,
+                    settings_schema=scope.schema,
+                    known_refs=await _known_refs(db, ctx.tenant_id, scope, processes),
+                )
                 live = await _live_instances(db, ctx, processes)
-                world = replace(world, live=live, writes=lambda: guard.count)
+                world = replace(world, live=live, writes=lambda: guard.count, rules=rules)
                 process_results = [sandbox.run_test(world, t.file, t.data) for t in processes]
                 report.tests.extend(process_results)
                 report.coverage = sandbox.package_coverage(
@@ -412,6 +438,40 @@ async def run_package_tests(
     return report
 
 
+def sandbox_rules(package: ParsedPackage) -> tuple[dict[str, dict[str, Any]], list[Problem]]:
+    """The package's rules the sandbox evaluates: those with ``target: task`` (Zh5).
+
+    Each is checked as ``POST /rules`` checks it; a finding names the file and
+    the line. The other rules file or reconcile work by a dedup key, which the
+    sandbox does not keep: they are left to ``packages:plan``.
+    """
+    rules: dict[str, dict[str, Any]] = {}
+    problems: list[Problem] = []
+    for obj in package.of_kind("WorkRule"):
+        action = obj.spec.get("action")
+        if not isinstance(action, dict) or action.get("target") != ActionTarget.TASK:
+            continue
+        try:
+            spec = normalize_rule_spec(
+                trigger=obj.spec.get("trigger"),
+                condition=obj.spec.get("condition"),
+                interpretation=obj.spec.get("interpretation"),
+                action=action,
+            )
+        except ValidationError as exc:
+            where = str(exc.details.get("field") or "")
+            path = "/spec" + "".join(f"/{part}" for part in re.split(r"[.\[\]]+", where) if part)
+            problems.append(obj.place(Problem(exc.code, "error", path, exc.message)))
+            continue
+        rules[obj.key] = {
+            "trigger": spec.trigger,
+            "condition": spec.condition,
+            "interpretation": spec.interpretation,
+            "action": spec.action,
+        }
+    return rules, problems
+
+
 async def _check_process(
     db: AsyncSession,
     ctx: AuthContext,
@@ -420,6 +480,7 @@ async def _check_process(
     package: ParsedPackage,
     calendars: Mapping[str, Calendar],
     workspace_id: uuid.UUID | None,
+    scope: SettingsScope,
 ) -> tuple[_Checked | None, list[Problem]]:
     try:
         spec = with_workspace(normalized_spec(obj.spec), workspace_id)
@@ -427,7 +488,7 @@ async def _check_process(
         return None, [obj.place(Problem("invalid_document", "error", exc.path, exc.message))]
     previous = await previous_version(db, ctx.tenant_id, obj.key, spec.get("version"))
     catalog = overlay_catalog(
-        await load_catalog(db, ctx.tenant_id, obj.key, spec, previous),
+        await load_catalog(db, ctx.tenant_id, obj.key, spec, previous, settings=scope),
         package,
         frozenset(calendars),
     )
@@ -439,6 +500,28 @@ async def _check_process(
     if governed_references(spec):
         item.scope = await regulation_scope(db, ctx, settings, spec)
     return item, list(result.problems)
+
+
+async def _known_refs(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    scope: SettingsScope,
+    tests: Sequence[PackageTestFile],
+) -> frozenset[tuple[str, str]]:
+    """The ``x-ref`` values of the settings the tests save that name objects in use."""
+    if scope.schema is None:
+        return frozenset()
+    named: set[tuple[str, str]] = set()
+    for test in tests:
+        saved = [(test.data.get("given") or {}).get("settings")]
+        saved += [step.get("settings") for step in test.data.get("steps") or ()]
+        for values in saved:
+            if isinstance(values, dict) and not validate(values, scope.schema):
+                named |= {(r.kind, r.value) for r in settings_references(values, scope.schema)}
+    # One reference a value, its index for a path: the answer names the missing by path.
+    refs = [Reference(str(i), kind, value) for i, (kind, value) in enumerate(sorted(named))]
+    missing = {item["path"] for item in await unknown_refs(db, tenant_id, refs)}
+    return frozenset((r.kind, r.value) for r in refs if r.path not in missing)
 
 
 def _test_problems(package: ParsedPackage, checked: Sequence[_Checked]) -> list[Problem]:
@@ -553,6 +636,12 @@ async def _world(
         task_types.update(item.catalog.task_types)
         agents |= item.catalog.agents
     nested = await _catalog_processes(db, ctx.tenant_id, named - set(definitions))
+    # A process of the catalog reads the settings of its own package as they are now.
+    other_settings: dict[str, dict[str, Any]] = {}
+    for definition in nested.values():
+        if definition.reads_settings:
+            seen = await snapshot(db, ctx.tenant_id, definition.settings)
+            other_settings[definition.key] = seen.values if seen is not None else {}
     for definition in nested.values():
         refs = references(definition.spec)
         wanted_calendars |= refs.calendars
@@ -570,4 +659,5 @@ async def _world(
         agents=frozenset(agents),
         roles=roles | {obj.key for obj in package.of_kind("Role")},
         calendars=all_calendars,
+        other_settings=other_settings,
     )

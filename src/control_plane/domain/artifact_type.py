@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import jsonschema
+
 from control_plane.domain.errors import ValidationError
 from control_plane.domain.project import (
     guard_json_document,
@@ -152,6 +154,60 @@ def check_artifact_against_type(
             },
         )
     if size_bytes is not None and size_bytes > definition.max_bytes:
+        raise ValidationError(
+            "artifact_too_large",
+            f"content of {size_bytes} bytes exceeds {definition.max_bytes} for {key!r}",
+            details={**ref, "sizeBytes": size_bytes, "maxBytes": definition.max_bytes},
+        )
+
+
+def check_output_value(
+    definition: ArtifactTypeDefinition,
+    *,
+    key: str,
+    version: int,
+    value: Any,
+    media_type: str,
+    size_bytes: int,
+    narrowed_to: tuple[str, ...] | None = None,
+) -> None:
+    """A value a skill handed in as a typed output of its task (CP-ADR-0072 amendment).
+
+    The value is the artifact: it is checked against the type's
+    ``metadataSchema`` — the only JSON Schema a type has — and its encoding
+    against the media types (the type's, then the output's own narrowing)
+    and the size ceiling. Formats stay annotations, as for ``metadata``.
+    """
+    ref = {"artifactType": key, "artifactTypeVersion": version}
+    schema = definition.metadata_schema
+    if schema:
+        validator = jsonschema.Draft202012Validator(schema)
+        try:
+            found = sorted(validator.iter_errors(value), key=lambda e: list(e.absolute_path))
+        except Exception as exc:  # an unresolvable $ref is a failed check, not a 500
+            errors = [{"path": "/", "message": f"schema could not be evaluated: {exc}"[:300]}]
+        else:
+            errors = [
+                {
+                    "path": "/" + "/".join(str(part) for part in error.absolute_path),
+                    "message": error.message[:500],
+                }
+                for error in found
+            ][:20]
+        if errors:
+            raise ValidationError(
+                "invalid_output_value",
+                f"the value does not match the schema of artifact type {key!r}",
+                details={**ref, "errors": errors},
+            )
+    for allowed in (definition.media_types, list(narrowed_to or ())):
+        if allowed and not media_type_allowed(allowed, media_type):
+            raise ValidationError(
+                "media_type_not_allowed",
+                f"media type {media_type!r} is not allowed for {key!r}",
+                details={**ref, "mediaType": media_type, "allowed": allowed},
+            )
+    if size_bytes > definition.max_bytes:
         raise ValidationError(
             "artifact_too_large",
             f"content of {size_bytes} bytes exceeds {definition.max_bytes} for {key!r}",

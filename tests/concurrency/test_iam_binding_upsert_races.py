@@ -1,4 +1,4 @@
-"""Races of ``POST /principals/{id}/iam-bindings`` (ADR-0053; CP-ADR-0073, E4).
+"""Races of ``POST /principals/{id}/iam-bindings`` (ADR-0053; CP-ADR-0073, I4).
 
 Two upserts of one new identity both find no row to lock and meet on
 ``uq_iam_bindings_identity``: the loser inserts under a SAVEPOINT and answers
@@ -233,3 +233,42 @@ async def test_upsert_does_not_reopen_what_a_concurrent_replace_revokes(
             {"p": principal},
         ).all()
     assert [str(r[0]) for r in active] == [new]
+
+
+async def test_a_concurrent_upsert_of_rights_alone_never_resets_the_visibility(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """CP-ADR-0082 §2.2: an upsert without ``visibility`` keeps the mode it
+    finds under the row lock, whichever of two concurrent upserts goes first."""
+    admin_key = (await do_bootstrap(client))["apiKey"]["key"]
+    created = await client.post(
+        "/api/v1/principals", json={"kind": "human", "displayName": "Ann"}, headers=auth(admin_key)
+    )
+    human = created.json()["id"]
+    identity = str(uuid.uuid4())
+    body = _body(identity)
+    first = await client.post(
+        f"/api/v1/principals/{human}/iam-bindings", json=body, headers=auth(admin_key)
+    )
+    assert first.status_code == 201, first.text
+
+    for _ in range(5):
+        narrowed, rights = await asyncio.gather(
+            client.post(
+                f"/api/v1/principals/{human}/iam-bindings",
+                json={**body, "visibility": "members"},
+                headers=auth(admin_key),
+            ),
+            client.post(
+                f"/api/v1/principals/{human}/iam-bindings",
+                json={**body, "permissions": ["tasks.read", "tasks.write"]},
+                headers=auth(admin_key),
+            ),
+        )
+        assert (narrowed.status_code, rights.status_code) == (200, 200)
+        with sync_engine.connect() as conn:
+            stored = conn.execute(
+                text("SELECT visibility FROM iam_principal_bindings WHERE iam_principal_id = :i"),
+                {"i": identity},
+            ).scalar_one()
+        assert stored == "members"

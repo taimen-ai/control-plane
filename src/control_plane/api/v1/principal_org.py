@@ -52,6 +52,7 @@ def _assignment_body(
 # --- roles --------------------------------------------------------------------
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.post("/principals/{principal_id}/roles", status_code=201, responses=ERROR_RESPONSES)
 async def assign_role(
     principal_id: uuid.UUID,
@@ -85,6 +86,7 @@ async def assign_role(
     )
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.get("/principals/{principal_id}/roles", responses=ERROR_RESPONSES)
 async def list_roles(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rows = await queries.list_principal_roles(db, ctx, principal_id)
@@ -100,6 +102,7 @@ async def list_roles(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONRe
     )
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.post(
     "/principals/{principal_id}/roles/{role_id}:revoke",
     status_code=204,
@@ -137,6 +140,7 @@ async def revoke_role(
 # --- capabilities -------------------------------------------------------------
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.post("/principals/{principal_id}/capabilities", status_code=201, responses=ERROR_RESPONSES)
 async def assign_capability(
     principal_id: uuid.UUID,
@@ -170,6 +174,7 @@ async def assign_capability(
     )
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.get("/principals/{principal_id}/capabilities", responses=ERROR_RESPONSES)
 async def list_capabilities(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rows = await queries.list_principal_capabilities(db, ctx, principal_id)
@@ -185,6 +190,7 @@ async def list_capabilities(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) ->
     )
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.post(
     "/principals/{principal_id}/capabilities/{capability_id}:revoke",
     status_code=204,
@@ -214,6 +220,7 @@ async def revoke_capability(
 # --- skills -------------------------------------------------------------------
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.post("/principals/{principal_id}/skills", status_code=201, responses=ERROR_RESPONSES)
 async def assign_skill(
     principal_id: uuid.UUID,
@@ -247,6 +254,7 @@ async def assign_skill(
     )
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.get("/principals/{principal_id}/skills", responses=ERROR_RESPONSES)
 async def list_skills(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     rows = await queries.list_principal_skills(db, ctx, principal_id)
@@ -262,6 +270,7 @@ async def list_skills(principal_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONR
     )
 
 
+# visibility: tenant — principals and their grants are objects of the tenant
 @router.post(
     "/principals/{principal_id}/skills/{skill_id}:revoke",
     status_code=204,

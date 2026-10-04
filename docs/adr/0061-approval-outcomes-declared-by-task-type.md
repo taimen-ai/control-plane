@@ -15,7 +15,8 @@
 после завершения задачи (`completionSchema`) вместо ревью, заведённого демоном;
 амендмент 2 2026-09-25 (TASK-000375) — предусловия `approve` (`preconditions`,
 шаг 3 TAI-ADR-0041, п.7); амендмент 3 2026-09-30 (TASK-001071) — перевод задачи
-на другую версию типа не обгоняет неисполненный исход
+на другую версию типа не обгоняет неисполненный исход; амендмент 4 2026-10-01
+(TASK-001237, из приёмки S033 №12) — адресат гейта ролью пакета `role:<slug>`
 
 Контекст: TAI-ADR-0041 (Accepted 2026-09-23, суперпроект) — исходы approval
 объявляются типом задачи; ADR-0018 (gate-approval); ADR-0048 (иммутабельная
@@ -804,10 +805,111 @@ approval. С появлением перевода задачи на другу�
 исхода после перевода исполняет исходы новой версии — оператор, переводящий
 задачу с `failed`-исходом, решает это сознательно.
 
+## Амендмент 4 2026-10-01: адресат гейта — роль пакета `role:<slug>` (TASK-001237)
+
+### Проблема
+
+Приёмка S033 (TASK-000957, №12): внешний автор пакета «заявки на закупку» не
+смог адресовать гейт ролью, которую пакет объявляет сам. `requestApproval.assignee`
+(А2) принимал только id principal'а, `approverRole` критерия приёмки
+(ADR-0067) и `request_decision` правила (ADR-0063) — только UUID роли. Id
+принадлежат одной установке, поэтому пакет нёс переменную установки вида `role`
+(`${FINANCE_DIRECTOR_ROLE_ID}`). Тест типа задачи к тому же не мог сказать,
+кому решать нельзя: шаг `approve` знал только того, кто решает.
+
+### Р1. `role:<slug>` в адресате гейта
+
+Строка **`role:<slug>`** (slug роли по схеме каталога,
+`^[a-z0-9][a-z0-9-]{0,62}$`) принимается наравне с прежними значениями в полях:
+
+- `ensureWork.requestApproval.assignee` — в исходах `approvalSchema`, реакциях
+  `onSuccess`/`onFailure` и в `completionSchema` (А2, А3); gate получает
+  `requiredRoleId` вместо `assignedPrincipalId`;
+- `spec.approverRole` критериев приёмки `human` и `llm_judge` (у типа задачи и
+  у самой задачи);
+- `action.fields.approverRole` правила с `request_decision`.
+
+Id роли (UUID) принимается по-прежнему. Значение — строка грамматики поля:
+шаблон (`role:$.task.customFields.approver`, `role:{{payload.data.role}}`)
+разрешается после рендеринга.
+
+### Р2. Разрешение при публикации и при открытии гейта
+
+- **Публикация** версии типа (`POST /task-types`, `packages:apply`, проба
+  плана и тест пакета) и правила (`POST /rules`, `PUT /rules/{id}`):
+  литеральная ссылка должна называть роль, которая есть у tenant'а — в любом
+  workspace или на уровне tenant'а. Нет — **`422 unknown_role`**,
+  `details: {field, role}`; `field` — путь поля
+  (`completionSchema.onComplete.actions[0].ensureWork.requestApproval.assignee`,
+  `acceptance[0].spec.approverRole`, `action.fields.approverRole`), в плане
+  пакета — указатель находки
+  (`/spec/completionSchema/onComplete/actions/0/ensureWork/requestApproval/assignee`).
+  Ссылка с неверным slug (`role:`, `role:Purchase`) — тот же `unknown_role`.
+  Ссылку при публикации и при открытии гейта разбирает одна функция ядра
+  (`role_reference_slug`, та же грамматика, что у `approverRole` критерия):
+  ничего вокруг slug не обрезается, `role: buyer`, `role:buyer ` и шаблон,
+  отрендеренный в slug с пробелом, — `unknown_role` (TASK-001277).
+  `approverRole` критерия, который не UUID и не `role:<slug>`, — по-прежнему
+  `invalid_acceptance_spec`. Шаблон при публикации не проверяется.
+- **Открытие гейта**: slug разрешается в области задачи, на которой гейт,
+  как требование роли задачи (ADR-0010): роль workspace задачи или ближайшего
+  предка раньше роли уровня tenant'а. Approval хранит id найденной роли
+  (`requiredRoleId`), саму ссылку ядро не хранит. Роли нет — `unknown_role`:
+  действие исхода или работы после завершения проваливается и откатывает
+  свою работу (п.7, А3), правило — ошибка команды (ADR-0063 п.5), критерий —
+  ошибка открытия проверки.
+
+Роль пакета публикует установщик раньше типов (вспомогательные объекты плана,
+CP-ADR-0074 И1), поэтому проба плана и тест пакета видят её.
+
+### Р3. Право решающего в тесте типа задачи
+
+Шаг `approve` теста `subject: taskType` (CP-ADR-0074 З1) получает
+необязательное `expectRefused: <код>` — как у шага `approve` теста процесса.
+Решает тот же код ядра, что живое решение, поэтому гейт ролью решает только её
+держатель (`given.principals`), чужой получает `not_eligible`:
+
+```yaml
+given: {principals: {approvers: [sam]}}
+steps:
+  - complete: {}
+  - approve: {decision: approved, by: bob, expectRefused: not_eligible}
+  - approve: {decision: approved, by: sam}
+  - expect: {status: {category: terminal_success}}
+```
+
+Ожидаемый отказ не решает гейт, тест идёт дальше. Решение принято, а отказ
+ожидался, или отказ с другим кодом — провал шага (`expected` — код,
+`actual` — фактический или `null`). Если гейта нет, `expectRefused` — провал
+(«no gate is pending»): иначе песочница открыла бы гейт на самого решающего.
+Отказ без `expectRefused` по-прежнему заканчивает тест. Схема тестов
+package-sdk (`test.schema.json`, `taskTypeStep.approve`) получает поле
+`expectRefused`; закреплённая копия ядра обновлена, правка package-sdk — парной
+задачей.
+
+### Что не меняется
+
+`agent:<key>` в `requestApproval.assignee` не добавлен: это отдельная правка
+(пре-блокировка `_referenced_principals` уже понимает его, а исполнение — нет).
+Миграции нет: approval и раньше хранил `requiredRoleId`.
+
+### Проверки
+
+`tests/integration/test_gate_role_reference.py` (публикация и отказ
+`unknown_role`, гейт ролью и `not_eligible` чужого, роль workspace раньше роли
+tenant'а, шаблон без роли проваливает работу, а не завершение, ссылка и
+шаблон с пробелом вокруг slug, критерий и правило),
+`tests/unit/test_role_reference.py` (один разбор на обоих моментах), `test_package_plan_catalog.py::test_a_gate_addressed_to_a_role_needs_the_role_of_the_package`,
+`test_package_test_setting.py` (`expectRefused`).
+
 ## Conformance
 
 ```conformance
 - file: src/control_plane/domain/approval_outcomes.py
+  repo: control-plane
+- file: src/control_plane/application/commands/role_references.py
+  repo: control-plane
+- grep: {path: tests/integration/test_gate_role_reference.py, pattern: "test_the_gate_asks_the_role_and_only_its_holder_decides"}
   repo: control-plane
 - file: src/control_plane/application/commands/approval_outcomes.py
   repo: control-plane

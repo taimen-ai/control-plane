@@ -7,6 +7,7 @@ that records what the executor reports.
 
 import asyncio
 import json
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,19 +18,24 @@ import pytest
 from mcp.server.mcpserver import MCPServer
 
 from control_plane_agent.skills import (
+    ENV_LOCAL_ENV,
+    ENV_LOCAL_PACKAGES,
     EndpointPolicy,
     HttpProtocol,
     LocalProtocol,
     McpProtocol,
+    SkillCall,
     SkillExecutor,
     SkillFailure,
     _guarded_mcp_client,
+    _skill_env_reserved,
     discover_local_entrypoints,
     executor_from_environment,
     iam_token_source,
     is_public_address,
     map_inputs,
     origin_of,
+    parse_skill_env,
     resolve_path,
 )
 from control_plane_client import ConflictError, ControlPlaneError
@@ -417,6 +423,7 @@ async def test_http_posts_the_invocation_with_an_iam_token() -> None:
     assert json.loads(request.content) == {
         "invocationId": "inv-1",
         "idempotencyKey": "key-1",
+        "settings": None,
         "inputs": {"n": 2},
     }
 
@@ -943,6 +950,7 @@ async def test_sdk_local_skill_gets_the_invocation_and_reports_its_cost(isolatio
         "idempotencyKey": "key-1",
         "timeoutSeconds": 5.0,
         "skill": "arith.double@1",
+        "settings": None,
     }
     assert completed["cost"] == {"units": {"ops": 1.0}}
 
@@ -1051,6 +1059,8 @@ async def test_mcp_call_carries_invocation_and_idempotency_key_in_meta() -> None
     [meta] = effects
     assert meta["skill/invocationId"] == "inv-1"
     assert meta["skill/idempotencyKey"] == "key-1"
+    # The MCP client leaves a null member out of _meta: absent means null.
+    assert meta.get("skill/settings") is None
 
 
 async def test_mcp_retry_with_the_same_key_does_not_repeat_the_effect() -> None:
@@ -1064,3 +1074,221 @@ async def test_mcp_retry_with_the_same_key_does_not_repeat_the_effect() -> None:
         await skills.execute_claimed(claimed(implementation), None)
     assert [c["output"] for c in fake.completed] == [{"double": 4}, {"double": 4}]
     assert len(effects) == 1
+
+
+# --- settings of the skills (CP-ADR-0073, amendment 2026-10-01) ---------------------------
+
+SETTINGS_ENTRYPOINT = "tests.skill_stubs.settings:run"
+
+
+def _settings_call(name: str) -> SkillCall:
+    return SkillCall(
+        invocation_id="inv-settings",
+        idempotency_key=None,
+        inputs={"name": name},
+        skill="settings.read@1",
+        implementation={"protocol": "local", "entrypoint": SETTINGS_ENTRYPOINT},
+        timeout_seconds=30,
+    )
+
+
+async def test_a_local_skill_reads_its_settings_in_its_own_process() -> None:
+    local = LocalProtocol(
+        [SETTINGS_ENTRYPOINT], environment={"PORTAL_URL": "https://portal.example.test"}
+    )
+    outcome = await local.call(_settings_call("PORTAL_URL"))
+    assert outcome.output == {"value": "https://portal.example.test"}
+    # The daemon's own environment is not changed by a child's settings.
+    assert "PORTAL_URL" not in os.environ
+
+
+async def test_a_local_skill_in_a_thread_reads_its_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PORTAL_TIMEOUT", raising=False)
+    local = LocalProtocol(
+        [SETTINGS_ENTRYPOINT], isolation="thread", environment={"PORTAL_TIMEOUT": "30"}
+    )
+    try:
+        outcome = await local.call(_settings_call("PORTAL_TIMEOUT"))
+    finally:
+        os.environ.pop("PORTAL_TIMEOUT", None)
+    assert outcome.output == {"value": "30"}
+
+
+def test_the_settings_reach_the_local_protocol_from_the_environment() -> None:
+    environ = {
+        ENV_LOCAL_PACKAGES: SETTINGS_ENTRYPOINT,
+        ENV_LOCAL_ENV: json.dumps({"PORTAL_URL": "https://portal.example.test"}),
+    }
+    skills = executor_from_environment(FakeControlPlane(), environ)  # type: ignore[arg-type]
+    assert skills is not None
+    local = skills.handlers["local"]
+    assert isinstance(local, LocalProtocol)
+    assert local.environment == {"PORTAL_URL": "https://portal.example.test"}
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not json", "must be a JSON object"),
+        ("[]", "must be an object"),
+        ('{"PORTAL_PASSWORD": "x"}', "a secret"),
+        ('{"PATH": "/tmp"}', "belongs to the host"),
+        ('{"IAM_CLIENT_ID": "x"}', "belongs to the host"),
+        ('{"portal_url": "x"}', "not a variable name"),
+        ('{"PORTAL_URL": 5}', "must be a string"),
+        (json.dumps({"PORTAL_URL": "x" * 2001}), "must be a string"),
+    ],
+)
+def test_bad_settings_are_a_configuration_error(value: str, message: str) -> None:
+    environ = {ENV_LOCAL_PACKAGES: SETTINGS_ENTRYPOINT, ENV_LOCAL_ENV: value}
+    with pytest.raises(ValueError, match=message):
+        executor_from_environment(FakeControlPlane(), environ)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Where the host goes and whom it trusts.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        # Families of the host's loaders and tools, by prefix.
+        "XDG_CONFIG_HOME",
+        "GIT_SSH_COMMAND",
+        "GIT_CONFIG_GLOBAL",
+        "NODE_OPTIONS",
+        "NODE_EXTRA_CA_CERTS",
+        "DYLD_INSERT_LIBRARIES",
+        "UV_INDEX_URL",
+        "PIP_INDEX_URL",
+        # The families refused before.
+        "CONTROL_PLANE_URL",
+        "IAM_CLIENT_ID",
+        "PYTHONPATH",
+        "LD_PRELOAD",
+        "PATH",
+        "TMPDIR",
+    ],
+)
+def test_a_setting_of_the_host_is_refused(name: str) -> None:
+    with pytest.raises(ValueError, match=f"env.{name} belongs to the host"):
+        parse_skill_env({name: "x"}, where="env")
+
+
+@pytest.mark.parametrize(
+    "name", ["http_proxy", "https_proxy", "Https_Proxy", "all_proxy", "no_proxy", "node_options"]
+)
+def test_a_lower_case_host_setting_is_refused_too(name: str) -> None:
+    with pytest.raises(ValueError):
+        parse_skill_env({name: "x"}, where="env")
+
+
+def test_the_reserved_check_ignores_case() -> None:
+    # The name pattern already refuses lower case; the reserved check does not lean on it.
+    assert _skill_env_reserved("https_proxy")
+    assert _skill_env_reserved("Git_Dir")
+    assert not _skill_env_reserved("portal_url")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "PORTAL_URL",
+        "PORTAL_BASE_URL",
+        "API_BASE_URL",
+        "CRM_URL",
+        "FETCH_LIMIT",
+        # A prefix is a prefix: the family name inside or at the end is fine.
+        "PORTAL_GIT_URL",
+        "MY_NODE_URL",
+        "PROXY_URL",
+        "PIPELINE_URL",
+        "UVA_URL",
+        "PATH_PREFIX",
+    ],
+)
+def test_a_setting_of_the_package_passes(name: str) -> None:
+    assert parse_skill_env({name: "https://portal.example.test"}, where="env") == {
+        name: "https://portal.example.test"
+    }
+
+
+def test_no_settings_and_empty_settings_are_none() -> None:
+    assert parse_skill_env(None, where="env") == {}
+    assert parse_skill_env({}, where="env") == {}
+
+
+# --- settings of the skill's package (CP-ADR-0081 §8) ---------------------------
+
+SETTINGS = {
+    "package": "sample",
+    "version": 3,
+    "schemaRevision": 2,
+    "values": {"limit": 1000, "window": {"start": 9}},
+}
+
+
+def with_settings(claim: dict[str, Any], settings: Any) -> dict[str, Any]:
+    claim["settings"] = settings
+    return claim
+
+
+@pytest.mark.parametrize("isolation", ["process", "thread"])
+async def test_sdk_local_skill_gets_the_settings_of_its_package(isolation: str) -> None:
+    fake = FakeControlPlane()
+    protocol = LocalProtocol(["tests.skill_stubs.sdk_like:double"], isolation=isolation)
+    claim = claimed(local("tests.skill_stubs.sdk_like:double"), {"n": 3}, outputs=SDK_OUTPUTS)
+    await executor(fake, local=protocol).execute_claimed(with_settings(claim, SETTINGS), "s-1")
+    [completed] = fake.completed
+    assert completed["output"]["seen"]["settings"] == SETTINGS
+
+
+async def test_http_body_carries_the_settings_of_the_package() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"double": 4})
+
+    fake = FakeControlPlane()
+    protocol = HttpProtocol(None, policy=policy(), transport=httpx.MockTransport(handler))
+    claim = with_settings(claimed(http_skill(None, "https://skills.test/double")), SETTINGS)
+    await executor(fake, http=protocol).execute_claimed(claim, None)
+    assert fake.completed[0]["output"] == {"double": 4}
+    assert json.loads(seen[0].content)["settings"] == SETTINGS
+
+
+async def test_mcp_meta_carries_the_settings_of_the_package() -> None:
+    effects: list[dict[str, Any]] = []
+    protocol = McpProtocol(connect=lambda implementation: idempotent_mcp_server(effects))
+    implementation = {"protocol": "mcp", "endpoint": "stdio:skills", "entrypoint": "double"}
+    fake = FakeControlPlane()
+    claim = with_settings(claimed(implementation), SETTINGS)
+    await executor(fake, mcp=protocol).execute_claimed(claim, None)
+    [meta] = effects
+    assert meta["skill/settings"] == SETTINGS
+
+
+@pytest.mark.parametrize("settings", [None, "values", ["a"], 3, True])
+async def test_a_claim_without_settings_or_with_a_wrong_type_gives_none(settings: Any) -> None:
+    fake = FakeControlPlane()
+    protocol = LocalProtocol(["tests.skill_stubs.sdk_like:double"], isolation="thread")
+    claim = claimed(local("tests.skill_stubs.sdk_like:double"), {"n": 3}, outputs=SDK_OUTPUTS)
+    await executor(fake, local=protocol).execute_claimed(with_settings(claim, settings), "s-1")
+    assert fake.completed[0]["output"]["seen"]["settings"] is None
+
+
+async def test_a_claim_of_a_core_without_settings_gives_none() -> None:
+    fake = FakeControlPlane()
+    protocol = LocalProtocol(["tests.skill_stubs.sdk_like:double"], isolation="thread")
+    claim = claimed(local("tests.skill_stubs.sdk_like:double"), {"n": 3}, outputs=SDK_OUTPUTS)
+    assert "settings" not in claim
+    await executor(fake, local=protocol).execute_claimed(claim, "s-1")
+    assert fake.completed[0]["output"]["seen"]["settings"] is None

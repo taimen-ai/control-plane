@@ -14,7 +14,16 @@ the route itself declares (its dependencies included), so a new ``Query`` is
 accepted without separate registration. An unknown parameter yields
 ``400 invalid_request`` naming it in ``details.errors[].loc`` as
 ``query.<name>``.
+
+One route is exempt by design, and says so with :func:`open_query`: the OAuth
+callback (CP-ADR-0079 §6). Its parameters are set by the provider, not by a
+client of this API — the account parameter is the connection type's, and a
+provider may add its own — and a ``400`` there would quote the query (the
+authorization code) back and lose the provider's answer.
 """
+
+from collections.abc import Callable
+from typing import Any
 
 from fastapi.dependencies.models import Dependant
 from fastapi.exceptions import RequestValidationError
@@ -28,6 +37,13 @@ UNKNOWN_QUERY_PARAMETER_MESSAGE = (
 
 # Computed once per route and kept on the route itself (APIRoute is unhashable).
 _CACHE_ATTR = "_cp_declared_query_names"
+_OPEN_QUERY_ATTR = "_cp_open_query"
+
+
+def open_query[E: Callable[..., Any]](endpoint: E) -> E:
+    """Mark an endpoint whose query parameters are set by a third party."""
+    setattr(endpoint, _OPEN_QUERY_ATTR, True)
+    return endpoint
 
 
 def _query_aliases(dependant: Dependant) -> set[str]:
@@ -51,7 +67,7 @@ def reject_unknown_query_params(connection: HTTPConnection) -> None:
     if connection.scope["type"] != "http":
         return
     route = connection.scope.get("route")
-    if not isinstance(route, APIRoute):
+    if not isinstance(route, APIRoute) or getattr(route.endpoint, _OPEN_QUERY_ATTR, False):
         return
     allowed = _declared_query_names(route)
     unknown = sorted({name for name in connection.query_params if name not in allowed})

@@ -35,6 +35,7 @@ router = APIRouter(tags=["organization"])
 # --- roles --------------------------------------------------------------------
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.post("/roles", response_model=RoleOut, status_code=201, responses=ERROR_RESPONSES)
 async def create_role(
     payload: RoleCreateRequest,
@@ -66,6 +67,7 @@ async def create_role(
     )
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get("/roles", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_roles(
     ctx: AuthDep,
@@ -83,6 +85,7 @@ async def list_roles(
     return JSONResponse(page_body(items, page.next_cursor))
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get("/roles/{role_id}", response_model=RoleOut, responses=ERROR_RESPONSES)
 async def get_role(role_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     role = await queries.get_role(db, ctx, role_id)
@@ -90,6 +93,7 @@ async def get_role(role_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSONResponse:
     return JSONResponse(body, headers={"ETag": format_etag("role", role.version)})
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get("/roles/{role_id}/principals", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_role_holders(
     role_id: uuid.UUID,
@@ -105,6 +109,7 @@ async def list_role_holders(
     return JSONResponse(page_body([dump(RoleHolderOut, p) for p in page.items], page.next_cursor))
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.patch("/roles/{role_id}", response_model=RoleOut, responses=ERROR_RESPONSES)
 async def update_role(
     role_id: uuid.UUID,
@@ -144,6 +149,7 @@ async def update_role(
 # --- capabilities -------------------------------------------------------------
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.post(
     "/capabilities", response_model=CapabilityOut, status_code=201, responses=ERROR_RESPONSES
 )
@@ -172,6 +178,7 @@ async def create_capability(
     )
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get("/capabilities", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_capabilities(
     ctx: AuthDep,
@@ -186,6 +193,7 @@ async def list_capabilities(
     return JSONResponse(page_body(items, page.next_cursor))
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get(
     "/capabilities/{capability_id}", response_model=CapabilityOut, responses=ERROR_RESPONSES
 )
@@ -200,6 +208,7 @@ async def get_capability(capability_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> J
 # --- skills -------------------------------------------------------------------
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.post("/skills", response_model=SkillOut, status_code=201, responses=ERROR_RESPONSES)
 async def register_skill(
     payload: SkillRegisterRequest,
@@ -237,6 +246,7 @@ async def register_skill(
     )
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get("/skills", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_skills(
     ctx: AuthDep,
@@ -255,6 +265,7 @@ async def list_skills(
     return JSONResponse(page_body(items, page.next_cursor))
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.get("/skills/{skill_ref}", response_model=SkillOut, responses=ERROR_RESPONSES)
 async def get_skill(skill_ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     """By id, ``name@version`` or ``name`` (resolution of ADR-0021); the body
@@ -267,6 +278,7 @@ async def get_skill(skill_ref: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     return JSONResponse(body, headers={"ETag": format_etag("skill", skill.row_version)})
 
 
+# visibility: tenant — roles, capabilities and skills are objects of the tenant
 @router.patch("/skills/{skill_id}", response_model=SkillOut, responses=ERROR_RESPONSES)
 async def update_skill(
     skill_id: uuid.UUID,

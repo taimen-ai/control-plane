@@ -28,14 +28,21 @@ from sqlalchemy import ColumnElement, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, authorize, visible_objects
+from control_plane.application.authorization import (
+    VISIBILITY_TENANT,
+    AuthContext,
+    authorize,
+    visible_objects,
+)
 from control_plane.application.commands._claim_release import release_active_claims_of_holder
 from control_plane.application.commands.iam_bindings import (
     BINDING_STATUS_ACTIVE,
     BINDING_STATUS_REVOKED,
+    check_agent_binding_escalation,
     check_trusted_issuer,
     identity_taken,
     validate_binding_permissions,
+    validate_stored_permissions,
 )
 from control_plane.application.commands.package_links import link_object
 from control_plane.application.common import decode_cursor, encode_cursor, new_uuid, utcnow
@@ -159,7 +166,7 @@ async def _agent_by_key(
     return agent
 
 
-async def _require_agent(
+async def require_agent(
     session: AsyncSession, ctx: AuthContext, key: str, *, for_update: bool = False
 ) -> Agent:
     agent = await _agent_by_key(session, ctx, key, for_update=for_update)
@@ -184,7 +191,7 @@ async def _current_revision(session: AsyncSession, agent: Agent) -> AgentRevisio
     return revision
 
 
-def _retired(agent: Agent) -> ConflictError:
+def retired_conflict(agent: Agent) -> ConflictError:
     return ConflictError(
         "agent_retired",
         "The agent is retired; its key is never reused",
@@ -249,7 +256,7 @@ async def list_revisions(
     """
     await authorize(ctx, Permission.AGENTS_READ)
     effective_limit = clamp_limit(limit)
-    agent = await _require_agent(session, ctx, key)
+    agent = await require_agent(session, ctx, key)
     stmt = select(AgentRevision).where(AgentRevision.agent_id == agent.id)
     if cursor is not None:
         below = decode_cursor(cursor).get("r")
@@ -523,7 +530,7 @@ async def check_agent_spec(
     """
     agent = await _agent_by_key(session, ctx, key, for_update=lock)
     if agent is not None and agent.status == AgentStatus.RETIRED:
-        raise _retired(agent)
+        raise retired_conflict(agent)
 
     identity = spec["identity"]
     identity_kind = identity.get("kind", "agent")
@@ -551,6 +558,16 @@ async def check_agent_spec(
             "Assigning roles, capabilities or skills requires org.manage",
             code="permission_escalation",
             details={"missing": [Permission.ORG_MANAGE.value]},
+        )
+    if spec.get("connections") and not ctx.has(Permission.CONNECTIONS_MANAGE):
+        # The list gives the agent the material of those connections
+        # (CP-ADR-0079 §8): its presence is checked, not the difference with
+        # the current revision, so ``:validate`` and a re-applied package
+        # answer alike.
+        raise AuthorizationError(
+            "Naming connections in an agent spec requires connections.manage",
+            code="permission_escalation",
+            details={"missing": [Permission.CONNECTIONS_MANAGE.value], "path": "spec.connections"},
         )
     role_ids = await _resolve_roles(session, ctx, roles)
     capability_ids = await _resolve_capabilities(session, ctx, capabilities)
@@ -777,7 +794,7 @@ async def state_gate(
 ) -> Agent:
     """Who may change state and replicas; ``POST /authz:check`` asks the same."""
     await authorize(ctx, Permission.AGENTS_MANAGE)
-    return await _require_agent(session, ctx, key, for_update=for_update)
+    return await require_agent(session, ctx, key, for_update=for_update)
 
 
 async def update_agent_state(
@@ -791,7 +808,7 @@ async def update_agent_state(
     """Change only the desired state (§3); an unchanged request writes nothing."""
     agent = await state_gate(session, ctx, key, for_update=True)
     if agent.status == AgentStatus.RETIRED:
-        raise _retired(agent)
+        raise retired_conflict(agent)
     previous = (agent.state, agent.replicas)
     desired = (state or agent.state, agent.replicas if replicas is None else replicas)
     if desired != previous:
@@ -816,6 +833,9 @@ async def _record_binding_event(
     if event_type != "iam_binding.revoked":
         payload["iamTenantId"] = str(binding.iam_tenant_id)
         payload["permissions"] = binding.permissions
+        # An agent's binding is always tenant-wide (CP-ADR-0082 §2.3); the
+        # default is applied on flush, which may not have happened yet.
+        payload["visibility"] = binding.visibility or VISIBILITY_TENANT
     await record_event(
         session,
         tenant_id=ctx.tenant_id,
@@ -867,6 +887,8 @@ async def _apply_identity(
     principal = await session.get(Principal, principal_id)
     if principal is not None and principal.display_name != checked.display_name:
         principal.display_name = checked.display_name
+        # Any writer of the name moves the version (CP-ADR-0082 §1.3).
+        principal.version += 1
         principal.updated_at = utcnow()
 
     held_roles = {
@@ -1051,10 +1073,12 @@ async def link_agent_identity(
     Only the issuer the core trusts is linked (``check_trusted_issuer``).
     """
     await authorize(ctx, Permission.AGENTS_STATUS_WRITE)
+    # Linking makes or reopens a tenant-wide binding (CP-ADR-0082 B5, V3).
+    check_agent_binding_escalation(ctx)
     check_trusted_issuer(issuer, trusted_issuer)
-    agent = await _require_agent(session, ctx, key, for_update=True)
+    agent = await require_agent(session, ctx, key, for_update=True)
     if agent.status == AgentStatus.RETIRED:
-        raise _retired(agent)
+        raise retired_conflict(agent)
     revision = await _current_revision(session, agent)
     requested = (issuer, iam_tenant_id, iam_principal_id)
     if agent.principal_id is not None:
@@ -1134,9 +1158,20 @@ async def link_agent_identity(
 async def _revision_identity(
     session: AsyncSession, ctx: AuthContext, agent: Agent, revision: AgentRevision
 ) -> CheckedSpec:
-    """The identity part of the current revision, in the shape ``_apply_identity`` takes."""
+    """The identity part of the current revision, in the shape ``_apply_identity`` takes.
+
+    The rights are checked again against the catalog and the kind rule: the
+    revision was checked when it was published, and a permission may have
+    left the catalog since. The escalation rule is not applied — the caller
+    hands out no rights of its own, only those of a revision already checked
+    against whoever applied it (§5).
+    """
     spec = revision.spec
     identity = spec["identity"]
+    identity_kind = identity.get("kind", "agent")
+    permissions = validate_stored_permissions(
+        permissions=list(identity["permissions"]), principal_kind=identity_kind
+    )
     return CheckedSpec(
         key=agent.key,
         spec=spec,
@@ -1144,8 +1179,8 @@ async def _revision_identity(
         state=agent.state,
         replicas=agent.replicas,
         display_name=agent.display_name,
-        identity_kind=identity.get("kind", "agent"),
-        permissions=sorted(set(identity["permissions"])),
+        identity_kind=identity_kind,
+        permissions=permissions,
         role_ids=await _resolve_roles(session, ctx, list(identity.get("roles", []))),
         capability_ids=await _resolve_capabilities(
             session, ctx, list(identity.get("capabilities", []))
@@ -1162,7 +1197,7 @@ async def _reopen_identity(
 ) -> list[tuple[str, uuid.UUID]]:
     """The same identity linked again: its binding reopened if it was shut (§6).
 
-    Since ``iam-bindings`` refuses the registry's own identity (E4), this is
+    Since ``iam-bindings`` refuses the registry's own identity (I4), this is
     the way back for a binding revoked beside the registry: it comes back
     with the rights of the current revision, the principal's roles,
     capabilities and skills brought to it as by a publish. An active binding
@@ -1241,7 +1276,7 @@ async def replace_agent_identity(
     configured the agent's current issuer.
     """
     await authorize(ctx, Permission.AGENTS_MANAGE)
-    agent = await _require_agent(session, ctx, key, for_update=True)
+    agent = await require_agent(session, ctx, key, for_update=True)
     # The principal ``FOR UPDATE`` before its bindings, the order of
     # ``principals/{id}:disable`` and ``:retire`` (CP-ADR-0077).
     if agent.principal_id is not None:
@@ -1251,7 +1286,7 @@ async def replace_agent_identity(
         principal = None
     revision = await _current_revision(session, agent)
     if agent.status == AgentStatus.RETIRED:
-        raise _retired(agent)
+        raise retired_conflict(agent)
     if agent.principal_id is None or principal is None:
         raise ConflictError(
             "agent_identity_not_linked",
@@ -1276,6 +1311,9 @@ async def replace_agent_identity(
     previous = (agent.iam_issuer, agent.iam_tenant_id, agent.iam_principal_id)
     if previous == (issuer, iam_tenant_id, iam_principal_id):
         return AgentView(agent, revision)  # idempotent
+    # The new binding is tenant-wide, as every binding of the registry: not
+    # one a caller in members mode makes (CP-ADR-0082 B5, V3).
+    check_agent_binding_escalation(ctx)
 
     # In id order: every binding of the principal and the requested one.
     rows = (
@@ -1389,7 +1427,7 @@ async def retire_agent(
 ) -> AgentView:
     """Stop the agent for good: revoke its bindings, disable its principal, free its claims."""
     await authorize(ctx, Permission.AGENTS_MANAGE)
-    agent = await _require_agent(session, ctx, key, for_update=True)
+    agent = await require_agent(session, ctx, key, for_update=True)
     # The agent's principal ``FOR UPDATE`` and the caller's ``FOR KEY SHARE``,
     # in id order (the write flow leaves the caller to this command,
     # CP-ADR-0077 §3).
@@ -1486,7 +1524,7 @@ async def get_agent_status(
     session: AsyncSession, ctx: AuthContext, *, key: str
 ) -> tuple[Agent, AgentObservedStatus | None]:
     await authorize(ctx, Permission.AGENTS_READ)
-    agent = await _require_agent(session, ctx, key)
+    agent = await require_agent(session, ctx, key)
     return agent, await session.get(AgentObservedStatus, agent.id)
 
 
@@ -1495,9 +1533,9 @@ async def report_agent_status(
 ) -> tuple[Agent, AgentObservedStatus]:
     """Store what the placement service sees; journal only a change that matters."""
     await authorize(ctx, Permission.AGENTS_STATUS_WRITE)
-    agent = await _require_agent(session, ctx, key, for_update=True)
+    agent = await require_agent(session, ctx, key, for_update=True)
     if agent.status == AgentStatus.RETIRED:
-        raise _retired(agent)
+        raise retired_conflict(agent)
     row = await session.get(AgentObservedStatus, agent.id, with_for_update=True)
     if row is not None and report.observed_at < row.observed_at:
         raise ConflictError(

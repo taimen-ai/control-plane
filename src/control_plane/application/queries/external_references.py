@@ -5,7 +5,7 @@ are authorized by the entity type they touch rather than by the project that
 happens to own it (ADR-0047).
 """
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from control_plane.application.authorization import AuthContext, authorize
@@ -79,6 +79,18 @@ async def lookup_by_external_key(
     )
     if external_type is not None:
         stmt = stmt.where(ExternalReference.external_type == external_type)
+    if ctx.visible_workspaces is not None:
+        # An entity outside the caller's visibility is not found by its key
+        # either: the same empty page as for an unknown key (CP-ADR-0082 §4).
+        stmt = stmt.where(
+            or_(
+                *(
+                    (ExternalReference.entity_type == entity_type)
+                    & ENTITY_BINDINGS[entity_type].visible(ctx, ExternalReference.entity_id)
+                    for entity_type in readable
+                )
+            )
+        )
     return await _page(session, stmt, limit=limit, cursor=cursor)
 
 

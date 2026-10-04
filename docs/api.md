@@ -12,14 +12,15 @@ Authorization: Bearer cp_<prefix>_<secret>
 Actor всегда определяется из ключа; `actorId` из тела запроса не принимается.
 Permissions ключа: `principals.read|write`, `delegations.manage`,
 `sessions.open|manage`, `tasks.read|write|claim`, `claims.manage`,
-`events.read`, `workspaces.read|manage`, `org.read|manage`,
+`events.read|export`, `workspaces.read|manage`, `org.read|manage`,
 `artifacts.read|write`, `approvals.read|manage|decide`,
 `observations.write`, `projects.read|manage`,
 `project_templates.read|manage`, `operations.read|manage`,
 `artifact_types.read|manage` (CP-ADR-0072),
 `agents.read|manage|status.write` (CP-ADR-0073),
 `processes.read|write|operate`, `packages.test|plan`, `calendars.write`
-(CP-ADR-0074), `knowledge.packs.manage` (CP-ADR-0060), `admin`
+(CP-ADR-0074), `packages.settings.read|manage` (CP-ADR-0081),
+`knowledge.packs.manage` (CP-ADR-0060), `admin`
 (подразумевает все). Права v0.5 не выдаются старым ключам неявно —
 их нужно назначить явно (см. [migration-v0.5](migration-v0.5.md)). Проверка выполняется и в route-слое, и в командах
 application-слоя.
@@ -115,8 +116,13 @@ POST /api/v1/authz:check      (любой аутентифицированный
 `hasMore`; каждое событие несёт своё поле `cursor`, `workspaceId` (workspace
 сущности; `null` у событий уровня tenant) и `schemaVersion` — версию схемы
 `payload` по каталогу `docs/events/catalog.md` (CP-ADR-0068). Фильтры `types`
-(префиксы типа) и `workspaceId` (поддерево) сужают выборку, не меняя порядок и
-смысл курсора. Legacy
+(префиксы типа) и `workspaceId` (поддерево; `includeDescendants=false` —
+только сам workspace), а также `actorId` (автор события) и период
+`occurredFrom` (включительно) / `occurredTo` (исключительно; ISO 8601 с зоной)
+сужают выборку, не меняя порядок и смысл курсора (CP-ADR-0068, амендмент
+2026-10-03, Б1–Б4). Те же фильтры за период принимает выгрузка
+`GET /events:export?format=jsonl|csv` — всё тело одним потоком, с пределом
+периода и объёма (CP-ADR-0068, амендмент 2026-10-04, В1–В5). Legacy
 `?after=<sequence>` (v0.3) принимается и адаптируется; `?tail=N` возвращает
 последние N стабильных событий. Назад журнал читается через
 `?before=<cursor>` — события строго до курсора; `prevCursor` ответа — `before`
@@ -172,9 +178,31 @@ POST /api/v1/authz:check                  аутентифицированный
 
 POST /api/v1/principals                   principals.write
 GET  /api/v1/principals                   principals.read
-GET  /api/v1/principals/{id}              principals.read
+GET  /api/v1/principals/{id}              principals.read    (ETag: "principal-<version>")
+PATCH /api/v1/principals/{id}             principals.write   (CP-ADR-0082 п.1: {displayName?, profile?},
+                                                              profile — полная замена {jobTitle, email,
+                                                              phone, note}; If-Match: "principal-<version>"
+                                                              обязателен (428/400/409 version_conflict);
+                                                              агент реестра — 409 principal_managed_by_registry;
+                                                              секрет в строке — 422 secret_material_rejected,
+                                                              форма — 422 validation_error, обе с
+                                                              details.errors[].path без значения;
+                                                              principal.updated с именами полей)
 POST /api/v1/principals/{id}/api-keys     principals.write   (полный ключ — один раз)
 POST /api/v1/api-keys/{id}:revoke         principals.write
+GET  /api/v1/principals/{id}/iam-bindings principals.read    (связки IAM-identity, отозванные тоже)
+POST /api/v1/principals/{id}/iam-bindings principals.write   (upsert по issuer + iamPrincipalId, ADR-0053;
+                                                              visibility?: tenant|members — нет поля —
+                                                              без изменения, у новой связки tenant;
+                                                              неверное — 422 validation_error,
+                                                              details.errors[{path:/visibility, code}];
+                                                              members не у human — 422
+                                                              visibility_requires_human (CP-ADR-0082 §2);
+                                                              вызывающий в members не оставляет связку
+                                                              tenant — 403 visibility_escalation
+                                                              (CP-ADR-0082 Б5; так же identity:replace
+                                                              и PUT /agents/{key}/identity, В3))
+POST /api/v1/iam-bindings/{id}:revoke     principals.write
 POST /api/v1/principals/{id}:disable      principals.write   (CP-ADR-0077: human/agent, не себя, не агента
                                                               реестра; администратора — только admin;
                                                               связки и делегирования → revoked, сессии
@@ -190,7 +218,11 @@ POST /api/v1/principals/{id}:enable       principals.write   (CP-ADR-0077, ам�
                                                               (и права неотозванных связок) вызывающий
                                                               обязан иметь сам — иначе 403 permission_escalation
                                                               с details.missing, как при выдаче ключа;
-                                                              агент реестра → 409 use_agent_publish;
+                                                              выведенный агент реестра → 409
+                                                              use_agent_publish; живой агент реестра
+                                                              (agent|service) включается, связку
+                                                              открывает PUT /agents/{key}/identity
+                                                              (CP-ADR-0073 И5);
                                                               ответ — PrincipalOut + liveApiKeys (число живых
                                                               ключей); principal.enabled; повтор — 200 без
                                                               изменений)
@@ -217,7 +249,10 @@ GET  /api/v1/harness/context              только аутентификац�
 GET  /api/v1/work/available               tasks.read   (advisory discovery: eligible+ready+
                                           unclaimed+ungated; ?workspaceId=&includeDescendants=
                                           &projectId=&includeSubprojects=&assigneeId=
-                                          &assignedToMe=&limit=&cursor=; assignedToMe=true —
+                                          &assignedToMe=&typeKey=&limit=&cursor=; typeKey —
+                                          повторяемый ключ типа (любая версия), только сужает,
+                                          пустой или >50 — 422 invalid_type_key (CP-ADR-0056
+                                          Ж1); assignedToMe=true —
                                           только адресованное вызывающему, перекрывает assigneeId;
                                           страница может быть короче limit при непустом
                                           nextCursor; архивный проект новую работу не выдаёт;
@@ -254,9 +289,32 @@ POST  /api/v1/task-types                  task_types.manage (следующая 
                                           content? required|optional}]; тип артефакта не
                                           зарегистрирован — 422 unknown_artifact_type,
                                           иначе 422 invalid_artifact_schema;
+                                          executorRoles[] — slug ролей, нужных человеку,
+                                          чтобы брать работу версии, CP-ADR-0048
+                                          амендмент 2026-10-03 А1: ≤ 20 уникальных slug,
+                                          иначе 400 invalid_request; роли нет у tenant'а —
+                                          422 unknown_role (details.field =
+                                          executorRoles[i]); нет/[] — людей не ограничивает;
                                           изменение — только новой версией)
-GET   /api/v1/task-types                  task_types.read   (?key=&status=)
+GET   /api/v1/task-types                  task_types.read   (?key=&status=&workspaceId=;
+                                          workspaceId — только типы, разрешённые в workspace
+                                          по его effectiveTaskTypes, CP-ADR-0008 амендмент
+                                          2026-10-03 А2; чужой или несуществующий
+                                          workspace — 404)
 GET   /api/v1/task-types/{id}             task_types.read
+GET   /api/v1/task-types/{id}/executors   workspaces.read и (org.read | principals.read)
+                                          (?workspaceId= обязателен; CP-ADR-0048 амендмент
+                                          2026-10-03 А2–А3: кто может брать эту версию типа
+                                          в workspace; items[]: principalId, kind
+                                          human|agent|service, displayName, roles[],
+                                          reason role|any|agent_task_types|agent_any;
+                                          люди — участники workspace с одной из
+                                          executorRoles в его области, пусто — все;
+                                          агенты и сервисы — реестр /agents, running и
+                                          active, spec.work.workspace — сам workspace или
+                                          предок, spec.work.taskTypes содержит тип или не
+                                          задан; чужой тип или workspace — 404; назначение
+                                          без роли ядро не запрещает)
 POST  /api/v1/task-types/{id}:deprecate   task_types.manage (идемпотентно; задачи, ссылающиеся
                                           на версию, продолжают работать)
 POST  /api/v1/task-types/{id}:migrate-tasks task_types.manage + tasks.write (ADR-0048,
@@ -289,7 +347,10 @@ POST  /api/v1/tasks                       tasks.write  (optional parentTask со
                                           external_write, тип артефакта критерия
                                           spec.artifact — зарегистрированный, иначе
                                           тоже 422; ключ с префиксом output. —
-                                          422 invalid_acceptance)
+                                          422 invalid_acceptance; тип не разрешён в
+                                          workspaceId (effectiveTaskTypes, CP-ADR-0008
+                                          амендмент 2026-10-03 А3) — 422
+                                          task_type_not_allowed {workspaceId, typeKey})
 GET   /api/v1/tasks                       tasks.read   (?status=&systemStatusCategory=&typeKey=
                                           &priority=&ownerId=&assigneeId=&workspaceId=
                                           &includeDescendants=&startFrom=&startTo=&dueFrom=&dueTo=
@@ -298,7 +359,12 @@ GET   /api/v1/tasks/{id|publicId}         tasks.read   (+ETag)
 GET   /api/v1/tasks/{ref}/claimability    tasks.read   (диагностика: claimable + reasons; ADR-0067:
                                           verification_pending {verificationId, status};
                                           CP-ADR-0072: input_missing
-                                          {missing[{key, type, from}]})
+                                          {missing[{key, type, from}]};
+                                          CP-ADR-0082 В4: невидимые вызывающему
+                                          предусловия и шлюзы не называются —
+                                          hiddenBlockers / hiddenApprovals (число),
+                                          так же в 409 task_not_ready /
+                                          approval_required у :claim)
 GET   /api/v1/tasks/{ref}/verifications   tasks.read   (ADR-0067: попытки стадии проверки, новые
                                           сверху; ?limit=&cursor=)
 GET   /api/v1/tasks/{ref}/transitions     tasks.read   (объявленные цели перехода из текущего
@@ -314,7 +380,9 @@ PATCH /api/v1/tasks/{id|publicId}         tasks.write  (If-Match; claimId+fencin
                                           (goals.read) и того же воркспейса или уровня tenant,
                                           иначе 404; перенос задачи от цели её воркспейса —
                                           422 goal_workspace_mismatch; acceptance/evidence
-                                          заменяют список целиком, null запрещён; origin — 400)
+                                          заменяют список целиком, null запрещён; origin — 400;
+                                          перенос в workspace, где тип задачи не разрешён, —
+                                          422 task_type_not_allowed {workspaceId, typeKey})
 
 POST  /api/v1/goals                       goals.write  (ADR-0062: title, desiredState, criteria[],
                                           ownerId, workspaceId, parentGoalId, createdFrom —
@@ -364,7 +432,25 @@ POST  /api/v1/rules                       rules.write  (ADR-0063: key, descripti
                                           tasks.write проверяется на целевом workspace; не id —
                                           failed invalid_rule_field), fields.assignee
                                           role:<slug> — работа роли целевого workspace без
-                                          исполнителя (нет роли — failed unknown_role)
+                                          исполнителя (нет роли — failed unknown_role);
+                                          амендмент ADR-0063 I001/TASK-001205: action.target
+                                          dedup|task — у cancel_work|complete_work; task
+                                          закрывает задачу, к которой привязано наблюдение
+                                          триггера (payload.taskId); trigger.agent (ключ
+                                          агента реестра) и trigger.actorId (id principal'а)
+                                          — фильтр автора у триггера observation: правило
+                                          берёт только наблюдения, записанные этим автором
+                                          (events.actor_id; оба поля — должны совпасть оба);
+                                          у event|schedule этих полей нет; неверная форма —
+                                          422 invalid_rule_trigger; агент неизвестен,
+                                          выведен — 422 unknown_agent, details {field:
+                                          trigger.agent, agent}; target: task без
+                                          trigger.agent и без trigger.actorId — 422
+                                          invalid_rule_trigger, details.field =
+                                          trigger.agent (POST, PATCH, пакет); правило,
+                                          сохранённое раньше без фильтра, ничего не
+                                          закрывает — оценка, в т.ч. ждавшая снятия claim,
+                                          skipped trigger_author_unfiltered
 GET   /api/v1/rules                       rules.read   (?status=&workspaceId=&key=&triggerKind=;
                                           archived — только по status=archived)
 GET   /api/v1/rules/{id}                  rules.read   (+ETag "rule-<v>")
@@ -436,7 +522,7 @@ POST  /api/v1/tasks/{id|publicId}:complete tasks.write (If-Match; claimId+fencin
   критерии сразу; иначе засчитывается gate задачи, одобренный после начала
   попытки (каждому критерию — своё решение). Если такого нет, попытка ждёт
   открытый gate задачи, а без него запрашивает gate-approval от имени ядра у
-  `spec.approver` / `spec.approverRole`, иначе у owner, затем assignee задачи
+  `spec.approver` / `spec.approverRole` (id роли или `role:<slug>`), иначе у owner, затем assignee задачи
   (никого — провал `no_approver`); текст запроса — ключ и описание критерия,
   у `llm_judge` — и `rubric`. Попытка ждёт в `waiting_human` без таймера
   (`approvalId` — ожидаемый approval); решение или отмена approval будит её.
@@ -488,6 +574,12 @@ CP-ADR-0067 2026-09-27, CP-ADR-0063 2026-09-27, CP-ADR-0073 А1).
   `422 invalid_acceptance` (`details.field = acceptance[i].key`).
   `TaskOut.acceptance` — по-прежнему только собственный документ задачи.
   Evidence задачи может ссылаться на критерий её типа (`check`).
+- `executorRoles[]` у `POST /task-types` и в `TaskTypeOut` (CP-ADR-0048,
+  амендмент 2026-10-03 А1) — slug ролей tenant'а, нужных человеку, чтобы брать
+  работу версии; `[]` — людей не ограничивает. Неизвестная роль —
+  `422 unknown_role` (`details.field = executorRoles[i]`). Кто подходит —
+  `GET /task-types/{id}/executors?workspaceId=`; событие `task_type.created`
+  несёт поле с версии 3.
 - `when[]` у критерия (задача, тип, `acceptance` правил и `ensureWork`): 1…8
   выражений `$.task…` без `|truncate`; иначе `422 invalid_acceptance_spec`,
   `details.field = acceptance[i].when[j]`; у критериев цели —
@@ -535,8 +627,13 @@ POST /api/v1/claims/{id}:reclaim          tasks.claim  (только для ис
 
 POST  /api/v1/workspaces                  workspaces.manage
 GET   /api/v1/workspaces                  workspaces.read (?parentId=&rootsOnly=&status=)
-GET   /api/v1/workspaces/{id}             workspaces.read (+ETag)
-PATCH /api/v1/workspaces/{id}             workspaces.manage (If-Match "workspace-<v>")
+GET   /api/v1/workspaces/{id}             workspaces.read (+ETag; ответы об одном workspace
+                                          несут taskTypes и effectiveTaskTypes — null = все
+                                          типы, CP-ADR-0008 амендмент 2026-10-03)
+PATCH /api/v1/workspaces/{id}             workspaces.manage (If-Match "workspace-<v>"; taskTypes:
+                                          [ключ типа] — разрешённые типы работ, null —
+                                          наследовать от предка, [] — ни одного; неизвестный
+                                          ключ — 422 unknown_task_type {field, taskType})
 POST  /api/v1/workspaces/{id}:archive     workspaces.manage (нужно отсутствие активных детей)
 POST  /api/v1/workspaces/{id}:move        workspaces.manage (body: newParentId|null; циклы -> 422)
 POST  /api/v1/workspaces/{id}/members     workspaces.manage
@@ -735,6 +832,178 @@ GET  /api/v1/artifact-types               artifact_types.read (?key=&status=)
 GET  /api/v1/artifact-types/{key}[@version]  artifact_types.read (без версии — последняя;
                                           нет такой — 404)
 
+Типы подключений (CP-ADR-0079 п.2):
+POST  /api/v1/connection-types            connections.manage ({key, version, spec} — spec
+                                          объекта каталога вида ConnectionType: displayName,
+                                          description?, auth [oauth2|token], oauth2
+                                          {authorizeUrl, tokenUrlTemplate, accountParam?,
+                                          authStyle, scopes}, accountField {title,
+                                          description?, pattern}, settingsSchema, defaultKey;
+                                          пара (key, version) неизменяема: тот же spec по
+                                          sha256 канонического JSON — 200 без события, другой —
+                                          409 connection_type_version_exists; новая — 201 и
+                                          событие connection_type.published; нарушение формы —
+                                          422 invalid_connection_type с details.field,
+                                          неизвестное поле — 400 invalid_request; имя свойства
+                                          settingsSchema вроде password или материал, похожий
+                                          на секрет, в любой строке spec — 422
+                                          secret_material_rejected с details {field: "spec",
+                                          errors: [{path, match}]}: path — JSON Pointer внутри
+                                          spec, для имени члена — путь объекта, значения в
+                                          ответе нет (амендмент 2026-10-03); хост tokenUrlTemplate —
+                                          внешнее DNS-имя, {account} — целые метки)
+GET   /api/v1/connection-types            connections.read (?key=&status=&package=; новые
+                                          первыми)
+GET   /api/v1/connection-types/{key}[@version]
+                                          connections.read (без версии — свежайшая active;
+                                          нет такой — 404; ETag "connection-type-<rowVersion>";
+                                          незаданное необязательное поле spec — null)
+PATCH /api/v1/connection-types/{key}@{version}
+                                          connections.manage (If-Match, body {status}; только
+                                          вперёд active → deprecated → disabled, иначе 409
+                                          invalid_status_transition; тот же статус — 200 без
+                                          изменений; без версии в пути — 400)
+PUT   /api/v1/connection-types/{key}/oauth-app
+                                          connections.manage ({clientId, clientSecret} —
+                                          секрет транзитом в kv/data/platform/oauth-apps/<key>
+                                          хранилища с cas прочитанной версии; ответ {type,
+                                          configured, clientId, updatedAt} без секрета; нет
+                                          oauth2 ни в одной версии типа — 422
+                                          auth_not_supported; документ другого tenant'а — 409
+                                          oauth_app_owned_by_other_tenant; проигранный cas —
+                                          409 oauth_app_write_conflict (retryable); событие
+                                          connection_type.oauth_app_set {type, created})
+GET   /api/v1/connection-types/{key}/oauth-app
+                                          connections.read ({type, configured, clientId?,
+                                          updatedAt?}; приложение другого tenant'а — configured
+                                          false)
+
+Подключения (CP-ADR-0079 п.3, п.4; материала доступа эти маршруты не касаются):
+POST  /api/v1/connections                 connections.manage ({type, key?, displayName?,
+                                          settings?}; тип — свежайшая active версия, нет её —
+                                          422 unknown_connection_type; key по умолчанию —
+                                          defaultKey типа, displayName — имя типа, settings —
+                                          {}; settings по settingsSchema версии — иначе 422
+                                          invalid_connection_settings с details {field:
+                                          "settings", errors: [{path, code, message}]} — все
+                                          нарушения (до 50), path — JSON Pointer внутри
+                                          settings, code — ключевое слово JSON Schema, message
+                                          без значения; имя ключа вроде password или материал
+                                          секрета в строке или имени члена — 422
+                                          secret_material_rejected с details {field:
+                                          "settings", errors: [{path, match}]}, все находки,
+                                          для имени — путь объекта (/ — корень), значения нет
+                                          (CP-ADR-0079 амендмент 2026-10-03); занятый ключ — 409
+                                          connection_key_taken: вторая учётка того же типа —
+                                          другой key; 201 со status pending и событие
+                                          connection.created)
+GET   /api/v1/connections                 connections.read (?type=&status=; новые первыми;
+                                          без agents)
+GET   /api/v1/connections/{key}           connections.read (+ agents — ключи агентов, чья
+                                          текущая ревизия называет подключение; ETag
+                                          "connection-<version>"; чужое и несуществующее — 404)
+PATCH /api/v1/connections/{key}           connections.manage (If-Match; {displayName?,
+                                          settings?, typeVersion?}, хотя бы одно, null — 400;
+                                          settings заменяются целиком и проверяются схемой
+                                          версии после правки — ошибки в той же форме, что у
+                                          POST; typeVersion — не disabled версия
+                                          того же типа, иначе 422 unknown_connection_type;
+                                          неверный If-Match — 409 version_conflict; те же
+                                          значения — 200 без версии и события; иначе событие
+                                          connection.updated с именами полей)
+PUT   /api/v1/connections/{key}/status    connections.status.write ({status: active|expired,
+                                          reason?, message?, checkedAt}; вызывающий — агент
+                                          реестра, в spec.connections текущей ревизии которого
+                                          есть key, иначе 403 connection_not_assigned —
+                                          и для несуществующего key; active на active и
+                                          expired на expired сдвигают только lastCheckedAt;
+                                          expired на active — переход, reason обязателен (422
+                                          status_reason_required), message без материала,
+                                          событие connection.status_changed; остальное — 409
+                                          connection_status_conflict; checkedAt старше
+                                          lastCheckedAt — 409 stale_status_report)
+
+Доступ подключения и секреты агентов (CP-ADR-0079 п.6, п.7, п.11; материал идёт транзитом
+в хранилище секретов, ни в ответ, ни в базу, ни в журнал не попадает; хранилище не
+настроено, недоступно или запечатано — 503 secret_store_unavailable, ничего не
+изменилось):
+POST  /api/v1/connections/{key}:authorize connections.manage ({}; тип без oauth2 — 422
+                                          auth_not_supported; приложение типа не записано
+                                          tenant'ом — 409 oauth_app_not_configured; пустые
+                                          CP_OAUTH_REDIRECT_URI/CP_CONNECTIONS_RETURN_URL — 409
+                                          oauth_not_configured с details.missing, не https —
+                                          то же с details.insecure; 200
+                                          {authorizeUrl, expiresAt}, Cache-Control: no-store;
+                                          state 256 бит в базе только SHA-256, живые state
+                                          подключения гасятся; повтор Idempotency-Key —
+                                          authorizeUrl null; статус не меняется)
+GET   /api/v1/connections:callback        публичный — одноразовый state (параметры задаёт
+                                          провайдер, неизвестные не отвергаются); state
+                                          гасится первым; неизвестный, погашенный, истёкший —
+                                          303 ?result=invalid_state без записи; иначе
+                                          полномочиями credential'а, выпустившего state:
+                                          учётка из accountParam (≤ 253 символов, затем шаблон
+                                          типа), сервер попытки и обмен кода в oauth2/
+                                          хранилища под блокировкой подключения, прежний
+                                          сервер удаляется после успеха, сервер неудачной
+                                          попытки — сразу; active и событие
+                                          connection.authorized; отказ
+                                          согласия, ошибка провайдера или обмена, учётка,
+                                          отозванный credential — статус прежний, statusReason
+                                          и событие connection.authorization_failed; ответ 303
+                                          на CP_CONNECTIONS_RETURN_URL ?connection=&result=
+                                          &reason= (пустой или не https — 200 text/plain),
+                                          no-store,
+                                          no-referrer)
+PUT   /api/v1/connections/{key}/token     connections.manage ({account, token, expiresAt?};
+                                          тип без token — 422 auth_not_supported; учётка не по
+                                          шаблону — 422 invalid_account; expiresAt в прошлом —
+                                          422 invalid_expiry; token транзитом в
+                                          kv/data/tenants/<t>/connections/<key>; поверх oauth2
+                                          сначала удаляются creds и сервер; 200 ConnectionOut,
+                                          событие connection.authorized с auth token; отпечаток
+                                          Idempotency-Key — без token)
+POST  /api/v1/connections/{key}:revoke    connections.manage ({reason?} ≤ 500 или без тела;
+                                          сначала хранилище: creds и OAuth-сервер или документ
+                                          kv со всеми версиями (DELETE kv/metadata), затем
+                                          синхронно политики агентов, называющих подключение;
+                                          потом учёт: status revoked, auth/secretRef/expiresAt
+                                          null, statusMessage — reason после редакции, живые
+                                          state гасятся, событие connection.revoked
+                                          {key, type, previousStatus}; сбой хранилища — 503
+                                          secret_store_unavailable, статус прежний, повтор
+                                          доводит; повтор отозванного — 200 без события)
+GET   /api/v1/agents/me/connections       аутентификация (подключения из spec.connections
+                                          текущей ревизии агента вызывающего:
+                                          {items: [AgentConnectionOut]} — key, type,
+                                          typeVersion, account, auth, status, settings,
+                                          secretRef, expiresAt; материала нет; не агент — 404)
+GET   /api/v1/agents/me/connections/{key} аутентификация (AgentConnectionOut; ключ вне
+                                          spec.connections и несуществующий — одинаково 404)
+PUT   /api/v1/agents/{key}/secrets/{name} agents.secrets.manage ({value} — строка 1…65536;
+                                          имя ^[a-z0-9][a-z0-9-]{0,62}$, иначе 422
+                                          invalid_secret_name; агента нет или он чужого
+                                          tenant'а — 404, выведен из оборота — 409
+                                          agent_retired; value транзитом в
+                                          kv/data/tenants/<t>/agents/<key>/<name> ({value},
+                                          одна версия); в базе только имя, кто и когда; 201
+                                          новое имя, 200 замена — {name, updatedAt,
+                                          updatedBy}; событие agent.secret_set {agentKey,
+                                          name, created}; отпечаток Idempotency-Key — без
+                                          value; путь агента входит в его политику после
+                                          сведения воркером)
+GET   /api/v1/agents/{key}/secrets        agents.read ({items: [{name, updatedAt,
+                                          updatedBy}]} по имени; значений нет, хранилище не
+                                          нужно)
+DELETE /api/v1/agents/{key}/secrets/{name} agents.secrets.manage (документ со всеми
+                                          версиями — DELETE kv/metadata, затем имя; 204,
+                                          событие agent.secret_deleted {agentKey, name}; имени
+                                          нет — 404; выведен из оборота — 409 agent_retired:
+                                          секреты такого агента удаляет воркер по списку
+                                          kv/metadata хранилища, не по таблице имён;
+                                          значения активного агента без имени — полный
+                                          проход, CP-ADR-0079 п.11)
+
 Реестр агентов (CP-ADR-0073):
 POST /api/v1/agents                       agents.manage (body {key, spec, package?} — spec объекта
                                           каталога вида Agent; ревизия только при отличии
@@ -743,7 +1012,10 @@ POST /api/v1/agents                       agents.manage (body {key, spec, packag
                                           state/replicas из spec — желаемое состояние;
                                           права ревизии ⊆ права применяющего — 403
                                           permission_escalation, роли/capabilities/
-                                          skills.invoke — org.manage;
+                                          skills.invoke — org.manage, непустой
+                                          spec.connections (0…20 уникальных ключей
+                                          подключений) — connections.manage
+                                          (details.path = "spec.connections");
                                           422 invalid_permissions|permissions_not_allowed_for_kind|
                                           unknown_reference|secret_material_rejected|
                                           skill_disabled|skills_invoke_not_permitted|
@@ -754,7 +1026,7 @@ POST /api/v1/agents                       agents.manage (body {key, spec, packag
                                           spec.executor.image — ссылка на образ OCI с
                                           тегом или дайджестом, ядро проверяет только
                                           форму: неверная — 400 invalid_request,
-                                          амендмент Е1–Е3)
+                                          CP-ADR-0073 З1–З3)
 POST /api/v1/agents:validate              agents.manage (те же проверки без записи; ответ
                                           {key, specHash, currentRevision,
                                           wouldCreateRevision, wouldChangeState}; отказ — та же
@@ -765,7 +1037,10 @@ GET  /api/v1/agents                       agents.read (?status=active|retired&st
                                           тело GET …/{key}/status, одним запросом на страницу)
 GET  /api/v1/agents/me                    аутентификация (агент вызывающего с текущей
                                           ревизией; не агент — 404; ретайрнутый — status
-                                          retired)
+                                          retired; AgentMeOut: и packageSettings
+                                          {package, version, schemaRevision, values} —
+                                          настройки пакета агента, null — агент не из
+                                          пакета или пакет без настроек, CP-ADR-0081 §8)
 GET  /api/v1/agents/{key}[@revision]      agents.read (без ревизии — текущая; AgentOut:
                                           state, replicas, currentRevision, revision{spec,
                                           specHash, createdBy}, principalId)
@@ -841,8 +1116,11 @@ POST /api/v1/process-definitions/{key}:replay     packages.test + processes.read
                                           200 {key, candidateHash, replayed, diverged,
                                           problems, instances[instanceId, instanceKey,
                                           version, events, divergences[journalSeq, kind
-                                          decision | intent | input | data | timer | state,
-                                          element, recorded, replayed]]} — у экземпляра не
+                                          decision | intent | input | settings | data |
+                                          timer | state, element, recorded, replayed]]};
+                                          settings — версии или ревизии схемы настроек
+                                          записи нет в базе (recorded {version,
+                                          schemaRevision}, CP-ADR-0081 §6) — у экземпляра не
                                           больше одного, первое; кандидат с ошибкой проверки —
                                           problems и пустой instances; нет процесса или
                                           экземпляра этого процесса — 404, экземпляр вне
@@ -890,8 +1168,10 @@ GET  /api/v1/process-instances/{id}       processes.read (данные, стад
                                           пока null) — реализован
 GET  /api/v1/process-instances/{id}/journal  processes.read (журнал решений по шагам: вход,
                                           решения, намерения; seq, at, kind, element, reason,
-                                          actorId, eventId, data; ?kind=&limit=&cursor=)
-                                          — реализован
+                                          actorId, eventId, data; ?kind=&limit=&cursor=;
+                                          data входа шага процесса, читающего settings, —
+                                          ещё settingsVersion и settingsSchemaRevision,
+                                          CP-ADR-0081 §6) — реализован
 POST /api/v1/process-instances/{id}:suspend  processes.operate ({reason}; таймеры
                                           замораживаются; не running — 409
                                           invalid_process_instance_state) — реализован
@@ -966,7 +1246,10 @@ POST /api/v1/packages:test                packages.test ({package: {files[{path,
 POST /api/v1/packages:plan                packages.plan ({package, workspaceId?,
                                           replayLimit=50, overwriteConsole=false}; виды
                                           TaskType, Agent, Calendar, Process, WorkRule
-                                          (CP-ADR-0074 п.11, амендмент 2026-09-29), прочие
+                                          (CP-ADR-0074 п.11, амендмент 2026-09-29), View
+                                          (CP-ADR-0080: проверка вида и словарей с путём,
+                                          Component встраивается в вид, retire — вид,
+                                          который пакет больше не приносит), прочие
                                           виды пакета — в outside; ничего не пишет; changes —
                                           create | update | rename | restore | unchanged
                                           (restore — выведенный процесс или календарь
@@ -985,7 +1268,15 @@ POST /api/v1/packages:plan                packages.plan ({package, workspaceId?,
                                           ставит, сдвигает, снимает или находит уже
                                           прошедшими, — шаг migrated на копии
                                           состояния, в planHash не входит; не больше
-                                          200 на процесс, все — deadlinesTotal)
+                                          200 на процесс, все — deadlinesTotal;
+                                          settings — раздел настроек пакета
+                                          (CP-ADR-0081 §7): schemaRevision {before,
+                                          after}, added [{path, default?}], removed
+                                          [{path, saved}], incompatible [{path, code}] —
+                                          каждое ещё и ошибка settings_incompatible,
+                                          uischemaChanged; null — пакет настроек не
+                                          объявлял и не объявляет; входит в planHash,
+                                          ревизия схемы и версия значений — в catalogEtag)
                                           — реализован
 POST /api/v1/packages:apply               packages.plan + право вида каждого изменения
                                           (task_types.manage, agents.manage,
@@ -1003,12 +1294,16 @@ POST /api/v1/packages:apply               packages.plan + право вида к
                                           выведен после плана — 409 calendar_retired с
                                           details {process, calendars}, ничего не
                                           применено; ответ applied[kind, key,
-                                          action, version] и catalogEtag после) — реализован
+                                          action, version] и catalogEtag после; новая
+                                          ревизия схемы настроек пакета — активной,
+                                          прежняя — нет; версия значений не меняется,
+                                          CP-ADR-0081 §7) — реализован
 POST /api/v1/packages:record              packages.plan + право записи каждого вида
                                           (CP-ADR-0074 Е2; {package: {key, version},
                                           installHash?, objects: [{kind, key}]} — объекты
                                           видов ArtifactType, TaskType, ProjectTemplate,
-                                          WorkspaceType, Role (tenant), Capability, Skill,
+                                          WorkspaceType, Role (tenant), Capability,
+                                          ConnectionType (право connections.manage), Skill,
                                           WorkRule, Agent, которые установщик применил, и
                                           неизменившиеся тоже; связь объекта переходит на эту
                                           версию пакета; Process/Calendar связывает
@@ -1018,9 +1313,76 @@ POST /api/v1/packages:record              packages.plan + право запис�
                                           422 unknown_object, ничего не пишется; ответ
                                           {package, installHash, recorded})
 
+GET  /api/v1/views                       роль из audience вида (если есть) и право читать
+                                          его источник (processes.read | tasks.read |
+                                          events.read), CP-ADR-0080; ?locale=&package=
+                                          &limit=&cursor=; строки на языке запроса, его
+                                          базовом языке или defaultLocale пакета; форма,
+                                          согласованная с консолью (CP-ADR-0080 §9):
+                                          {items: [ViewSummary], nextCursor}, ViewSummary
+                                          {key, title, description?, revision, hash,
+                                          blocks: 1, locale, package, nav? {group: work |
+                                          knowledge | packages, icon?, order?}, source
+                                          {kind, process?, instance}} — без layout
+GET  /api/v1/views/{view_key}             ViewOut = ViewSummary + layout: блоки с
+                                          дискриминатором block — ключи, подписи и форматы
+                                          колонок, полей и показателей, фильтры с типом из
+                                          схемы данных; без путей, CEL и сырого source;
+                                          невидимый, выведенный и несуществующий — 404
+                                          not_found
+POST /api/v1/views/{view_key}:query       данные одного блока вида источника process
+                                          (CP-ADR-0080, амендмент А1–А8); видимость — как у
+                                          GET /views/{view_key}, экземпляры — в workspace с
+                                          processes.read; ?locale=; тело {block, params?,
+                                          filter? [{field, op: eq|in|gte|lte|prefix,
+                                          value}], sort? [{field, dir}], limit? ≤200,
+                                          cursor?}; field — только объявленные блоком
+                                          фильтры и сортировки (иначе 422
+                                          undeclared_filter | undeclared_sort); ответ по
+                                          блоку: table/list {items: [{id, title, values}],
+                                          nextCursor}, board {columns}, metrics {values},
+                                          chart {points}, header {title, status}, fields
+                                          {values}, steps|timeline|artifacts|related
+                                          {items}; поля data, которых вид не показывает, не
+                                          отдаются; экземпляр чужого workspace или другого
+                                          процесса — 404; вид tasks/knowledge — 501; больше
+                                          20 000 экземпляров, вычисленных запись за записью
+                                          (непереводимый CEL), — 409 view_too_costly
+GET  /api/v1/package-settings            packages.settings.read (CP-ADR-0081 §4);
+                                          ?locale=; {items: [{package, title,
+                                          packageVersion, version, updatedBy, updatedAt}]}
+                                          — пакеты с активной ревизией схемы настроек, по
+                                          ключу; version 0 — ничего не сохраняли
+GET  /api/v1/packages/{key}/settings      packages.settings.read; ?locale=; {package,
+                                          title, packageVersion, schema, uischema|null,
+                                          values, effective, version, schemaHash,
+                                          updatedBy, updatedAt, canManage}; строки словаря
+                                          пакета — прямо в schema (title, description) и
+                                          uischema (label, text); ETag
+                                          "package-settings-<version>"; пакета нет — 404
+                                          package_not_installed, настроек не объявляет —
+                                          404 settings_not_declared
+PUT  /api/v1/packages/{key}/settings      packages.settings.manage; If-Match
+                                          "package-settings-<version>" обязателен (428, 400);
+                                          тело {values} целиком; ?locale= для строк ответа;
+                                          порядок отказов: 404, 422
+                                          secret_material_rejected {details.errors[{path,
+                                          match}]} без значения, 422 settings_invalid
+                                          {details.errors[{path, code, message}]}, 422
+                                          unknown_ref {details.errors[{path, ref}]}, 409
+                                          version_conflict {details.currentVersion}; те же
+                                          значения — 200 без новой версии; иначе версия,
+                                          строка истории и package.settings_changed (без
+                                          значений); ответ — как у GET, новый ETag
+GET  /api/v1/packages/{key}/settings/versions
+                                          packages.settings.read; ?limit= (1…100, 50)
+                                          &cursor=; {items: [{version, values,
+                                          changedPaths, updatedBy, updatedAt}],
+                                          nextCursor}, новые первыми
+
 Привязка к пакету (CP-ADR-0074 Е3): списки и карточки task-types, artifact-types,
-project-templates, workspace-types, roles, capabilities, skills, rules, agents,
-process-definitions и calendars отдают package {key, version, installHash,
+project-templates, workspace-types, roles, capabilities, connection-types, skills,
+rules, agents, process-definitions, calendars и views отдают package {key, version, installHash,
 installedAt} — пакет, который поставил объект (ключ, все его версии), или null у
 созданного вручную; списки этих видов принимают ?package=<key>.
 
@@ -1070,7 +1432,9 @@ POST /api/v1/approvals/{id}:replay-outcome approvals.decide; решивший (�
 целевого типа (отказ — действие `custom_fields_invalid`, остальные действия
 исхода остаются для replay), найденная по `key` задача полей не получает; и
 `requestApproval {assignee, comment?}` — gate-approval на созданной задаче
-(нужно `approvals.manage`). `completionSchema` версии типа исполняется при
+(нужно `approvals.manage`); `assignee` — id principal'а или `role:<slug>`:
+решает держатель роли, найденной из workspace задачи (литеральная ссылка без
+роли у tenant'а — `422 unknown_role` при публикации, CP-ADR-0061, амендмент 4). `completionSchema` версии типа исполняется при
 переходе задачи в `terminal_success` (`:complete`, `:succeed` run,
 `completeTask` исхода) синхронно, с правами завершившего, один раз на задачу;
 отказ действия не отменяет завершения — он записан событием
@@ -1110,7 +1474,59 @@ GET  /api/v1/events                       events.read  (?cursor=<opaque>|after=<
                                           workspaceId= — поддерево workspace, events.read
                                           спрашивается на нём, нет workspace -> 404; у
                                           события workspaceId и schemaVersion; каталог
-                                          типов — docs/events/catalog.md)
+                                          типов — docs/events/catalog.md;
+                                          CP-ADR-0068 Б1–Б4: &includeDescendants=true|false
+                                          (без параметра — поддерево; false — только
+                                          workspace; без workspaceId не влияет)
+                                          &actorId=<principal> &occurredFrom= (>=)
+                                          &occurredTo= (<) — ISO 8601 с зоной, без зоны
+                                          или from > to -> 422 invalid_event_period;
+                                          фильтры — пересечение, право прежнее);
+                                          CP-ADR-0082 В7: вызывающему в members —
+                                          события видимых пространств и tenant, событие
+                                          без пространства — если taskId/runId/
+                                          workspaceId/entityId его payload видимы; так
+                                          же WS; фильтры Б1–Б4 сужают только внутри
+                                          видимого (пересечение)
+GET  /api/v1/events:export               events.export + events.read  (CP-ADR-0068
+                                          В1–В5: ?format=jsonl|csv (обязателен) и
+                                          фильтры GET /events — types, entityType,
+                                          entityId, actorId, workspaceId,
+                                          includeDescendants, occurredFrom/occurredTo
+                                          (оба обязательны; нет -> 422
+                                          export_period_required; длиннее 92 дней ->
+                                          422 export_period_too_long); cursor/limit/
+                                          tail/order нет (-> 400); больше 100 000
+                                          событий -> 422 export_too_large
+                                          {maxEvents} — до тела; пределы —
+                                          events_export_max_period_days|max_events;
+                                          200 — поток в порядке журнала до снимка на
+                                          момент запроса: JSONL
+                                          (application/x-ndjson) — тело элемента
+                                          GET /events на строку; CSV (text/csv, CRLF) —
+                                          заголовок и id, occurredAt, type,
+                                          schemaVersion, actorId, entityType, entityId,
+                                          workspaceId, payload (JSON-строка); заголовки
+                                          X-Event-Count, Content-Disposition
+                                          attachment, Cache-Control private, no-store;
+                                          видимость как у GET /events (members — только
+                                          видимое, невидимый workspaceId -> 404);
+                                          событие event_journal.exported — фильтры и
+                                          число событий, без данных, до тела; отказ не
+                                          журналируется)
+GET  /api/v1/event-types                  events.read  (CP-ADR-0068, амендмент А: каталог
+                                          событий целиком, по имени, без страниц;
+                                          ?locale= — цепочка видов (CP-ADR-0080 §5),
+                                          строки ядра только en; ответ {locale,
+                                          items[]}: запись типа из docs/events/
+                                          catalog.json (entityType, description,
+                                          currentVersion, versions{"<n>": {changes?,
+                                          schema}}) + type, group (префикс до точки,
+                                          как в types=), supportedVersions, labelKey
+                                          event.<type> для словаря консоли; ETag
+                                          "event-types-<sha256>", Cache-Control
+                                          private, max-age=300; If-None-Match ->
+                                          304 после проверки права)
 WS   /api/v1/events/ws?after=<cursor>     events.read  (opaque-курсор или legacy int;
                                           те же types= и workspaceId=;
                                           4401 — нет credentials, 4403 — нет права,
@@ -1124,9 +1540,20 @@ POST /api/v1/observations                 observations.write  (v0.4 explicit rem
                                           ADR-0057: source, dedupKey, observedAt,
                                           supersedes, externalRef{system,id,url} —
                                           source обязателен с dedupKey/externalRef;
-                                          повтор (source, dedupKey) в tenant → 200 с тем
-                                          же id и deduplicated=true, первый — 201;
-                                          supersedes на неизвестное наблюдение → 404)
+                                          повтор (source, dedupKey) тем же автором в
+                                          tenant → 200 с тем же id и deduplicated=true,
+                                          первый — 201; автор — часть ключа (амендмент
+                                          ADR-0057 2026-10-01): та же пара от другого
+                                          автора — его собственное наблюдение, 201 и
+                                          новое событие, ничего о чужом в ответе;
+                                          supersedes на неизвестное наблюдение → 404;
+                                          амендмент ADR-0057 TASK-001205: task|runId
+                                          требует tasks.read на этой задаче — иначе 403
+                                          permission_denied, событие не пишется и ключ
+                                          не занимается; неизвестная или чужая задача
+                                          → 404; CP-ADR-0082 В6: runId невидимой работы
+                                          и supersedes невидимого наблюдения — тот же
+                                          404, что у несуществующих)
 POST /api/v1/context                      только аутентификация  (v0.4: authoritative
                                           operational context + durable memory ContextPack;
                                           query/task/runId/workspaceId/maxTokens/
@@ -1239,8 +1666,17 @@ POST /api/v1/knowledge/entities:query    events.read на workspace:<workspaceId
                                           видимость вызывающего выводит ядро
                                           (namespaces/scope в теле → 400); память POST
                                           /api/memory/entities:query; ответ {items
-                                          (EntityItem памяти как есть), nextCursor
-                                          (null — конец перечня), asOf}; namespace
+                                          ({kind, key, title, attributes, validFrom,
+                                          validTo, sources[{source, sourcePath,
+                                          snapshotId}]} + переходные snake_case-поля
+                                          памяти, амендмент 2026-10-03 С2), nextCursor
+                                          (null — конец перечня), asOf}; include:
+                                          {relations[≤20] | "*", direction out|in|both
+                                          (both), limit 1..200 (20) на запись} →
+                                          relations[{relation, direction, kind, key,
+                                          title}] у записи через /api/memory/context/
+                                          typed, конец вне видимости не выдаётся,
+                                          limit страницы ≤100 (С1); namespace
                                           корня вне видимости policy → 403; 422
                                           entities_query_invalid — чужой курсор; 502
                                           memory_unavailable; 503 memory_disabled /
@@ -1449,9 +1885,11 @@ GET  /api/v1/skill-invocations/{id}              skills.invoke | skills.execute
 POST /api/v1/skill-invocations:claim             skills.execute
      body: {protocols: [http|local|mcp], localEntrypoints: [...], httpOrigins: [...],
             mcpEndpoints: [...], audiences: [...], sessionId?, leaseSeconds?, invocationId?}
-     → 200 {invocation, skill} | 204 нечего исполнять
+     → 200 {invocation, skill, settings} | 204 нечего исполнять
      (skill — {id, name, version, protocol, sideEffects, riskLevel, contract}; config каталога
-      исполнителю не отдаётся)
+      исполнителю не отдаётся; settings — {package, version, schemaRevision, values}
+      пакета скилла на момент выдачи, null — скилл не из пакета или пакет без настроек,
+      CP-ADR-0081 §8)
 POST /api/v1/skill-invocations/{id}:heartbeat    skills.execute  {fencingToken, leaseSeconds?, sessionId?}
 POST /api/v1/skill-invocations/{id}:complete     skills.execute  {fencingToken, output, cost?, sessionId?}
 POST /api/v1/skill-invocations/{id}:fail         skills.execute
@@ -1548,6 +1986,35 @@ Skills: claim, run, один вызов с `runId` и `idempotencyKey = executio
 `skill_invocation_<status>: <code>`). Runner'у нужны `skills.invoke`,
 `skills.execute`, `task_types.read` и назначение Skill (effective tool policy run).
 
+Типизированные выходы такой задачи (CP-ADR-0072, амендмент 2026-10-01). Успешный
+`:complete` вызова-исполнения (`authorizationBasis.kind = execution`) до
+`skill_result` сдаёт выходы `artifactSchema.outputs` типа задачи. Значение
+выхода — поле `output` скилла с тем же именем, что `key` выхода (`outputs[].key
+= draft` ← `output.draft`); явного отображения нет. Для каждого выхода:
+
+- поля нет или оно `null` — артефакта нет, статус `absent` (`missing`, если
+  выход `required: true`: тогда неявный критерий проверки провалит задачу с
+  `artifact_missing`);
+- иначе значение проверяется по последней версии типа артефакта: по её
+  `metadataSchema` (форматы — аннотации), media type `application/json` — по
+  `mediaTypes` типа и сужению выхода, размер — по `maxBytes`. Прошло —
+  артефакт `type = <type выхода>`, `name = <key>.json`, содержимое — значение
+  в UTF-8 JSON в хранилище (`contentState = stored`, `mediaType =
+  application/json`), `taskId`/`runId` — задачи и run вызова, автор —
+  исполнитель скилла (вызывающий `:complete`), `metadata = {output, skill,
+  version, invocationId, authorityPrincipalId}`, `typeVersion`; вытесняет
+  (`supersedesArtifactId`) прежнюю head-ревизию того же типа у задачи. Не
+  прошло — статус `rejected` с `reason = {code, message, details?}`: коды
+  `invalid_output_value` (`details.errors[{path, message}]`),
+  `media_type_not_allowed`, `artifact_too_large`, `content_store_unavailable`.
+
+Вызов при этом остаётся `succeeded`, `skill_result` сохраняется: что стало с
+выходами — в его `metadata.outputs` и в `outputs` события
+`skill.invocation_succeeded` (v2): `[{key, type, status: created | absent |
+missing | rejected, artifactId?, reason?}]`; у вызова не для исполнения задачи
+— `[]`. Видимость артефакта — как у задачи (`artifacts.read` на задаче, вход
+задачи-получателя через `?forTask=`).
+
 SDK: `register_skill`, `describe_skill`, `invoke_skill`, `get_skill_invocation`,
 `wait_skill_invocation` (ограниченное ожидание), `claim_skill_invocation`,
 `heartbeat_skill_invocation`, `complete_skill_invocation`,
@@ -1584,7 +2051,7 @@ bootstrap-admin они входят автоматически (как все п
 | 409 | `project_exists`, `workspace_type_exists`, `external_reference_conflict`, `retention_blocked_by_consumer`, `task_already_claimed`, `version_conflict`, `stale_claim`, `task_claimed`, `session_expired`, `session_not_active`, `claim_expired`, `claim_not_active`, `claim_not_expired`, `idempotency_key_reused`, `idempotency_in_flight`, `already_bootstrapped`, `task_already_completed`, `task_not_ready`, `run_already_active`, `run_not_active`, `run_in_progress`, `workspace_slug_conflict`, `role_slug_conflict`, `capability_exists`, `skill_exists`, `relation_exists`, `approval_already_decided`, `approval_required` (v0.3 gate), `verification_pending` (ADR-0067), `budget_exceeded`, `action_already_finished`, `child_handle_revoked`, `child_handle_expired`, `child_run_already_bound`, `skill_not_invocable`, `skill_version_immutable`, `invalid_status_transition`, `idempotency_key_reuse`, `stale_invocation_lease`, `approval_already_used`, `task_terminal`, `outcome_not_replayable`, `approval_precondition_failed`, `snapshot_stale`, `pack_version_conflict`, `input_missing` (CP-ADR-0072), `content_not_stored` (CP-ADR-0072), `cannot_disable_self`, `use_agent_retire`, `use_agent_publish` (CP-ADR-0077), `incompatible_status`, `approval_pending` (ADR-0048, амендмент 2026-09-30) |
 | 410 | `content_purged` (содержимое удалено `:purge-content`, CP-ADR-0072) |
 | 413 | `request_too_large` (в т.ч. загрузка сверх `CP_ARTIFACT_MAX_BYTES`) |
-| 422 | `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `invalid_pack_ref` (`GET /knowledge/packs/{ref}`), `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`, `entities_query_invalid` (`/knowledge/entities:query`, CP-ADR-0060 K031); CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type`; CP-ADR-0077: `principal_kind_not_disableable`, `principal_kind_not_enableable` |
+| 422 | `validation_error` (в т.ч. символ NUL в строке JSON-тела — `details.errors[{path, code: "nul_character"}]` с JSON Pointer в `path`, в параметре запроса или пути — с `path` вида `query.<имя>` или `path.<имя>`, CP-ADR-0083), `invalid_*` (доменная валидация), `task_not_claimable`, `task_cancelled`, `empty_update`, `unknown_requirement`, `dependency_cycle`, `workspace_cycle`, `workspace_archived`, `workspace_has_active_children`, `task_not_runnable`, `artifact_mismatch`, `invalid_approval`, `skill_disabled`, `unsupported_protocol_version`, `invalid_harness`, `invalid_budget`, `invalid_checkpoint`, `invalid_action`, `invalid_tool_query`, `invalid_correlation_id`, `invalid_child_grant`, `invalid_child_result`, `invalid_child_handle_ref`, `invalid_child_handle_token`, `invalid_entity_type`, `invalid_entity_reference`, `invalid_external_lookup`, `status_not_in_lifecycle`, `invalid_transition`, `invalid_lifecycle_schema`, `invalid_status_category`, `system_task_type_required`, `child_grant_exceeds_parent`, `child_depth_exceeded`, `child_result_too_large`, `invalid_skill_contract`, `unsupported_skill_condition`, `secret_material_rejected`, `invalid_approval_schema`, `workspace_not_root`, `pack_invalid`, `pack_not_found`, `pack_version_required`, `invalid_pack_ref` (`GET /knowledge/packs/{ref}`), `snapshot_invalid`, `invalid_context_schema`, `invalid_recall_request`, `entities_query_invalid` (`/knowledge/entities:query`, CP-ADR-0060 K031); CP-ADR-0072: `invalid_artifact_content`, `content_ref_not_found`, `invalid_artifact_metadata`, `media_type_not_allowed`, `artifact_too_large`, `invalid_artifact_type`, `invalid_artifact_schema`, `unknown_artifact_type`; CP-ADR-0077: `principal_kind_not_disableable`, `principal_kind_not_enableable` |
 | 428 | `if_match_required` |
 | 500 | `internal_error` (без стектрейса) |
 | 502 | `memory_unavailable` (память не обработала проксируемый запрос, в т.ч. отвергла credential ядра — `403`; `details.memoryStatus`, `details.retryable`; текст ответа памяти клиенту не отдаётся) |
@@ -1592,7 +2059,7 @@ bootstrap-admin они входят автоматически (как все п
 
 ## События
 
-`type` в журнале: `tenant.bootstrapped`, `principal.created|disabled|enabled`,
+`type` в журнале: `tenant.bootstrapped`, `principal.created|updated|disabled|enabled`,
 `api_key.created|revoked`, `delegation.created|revoked`,
 `session.opened|closed|expired`, `task.created|updated|claimed|completed|context_pack_recorded`,
 `claim.released|expired`, `workspace.created|updated|archived|moved`,
@@ -1631,7 +2098,9 @@ recall_timed_out|migrated|completed|cancelled|failed` (entity `process_instance`
 M2.1 (ADR-0056): `skill.invocation_requested|claimed|retry_scheduled|succeeded|failed`
 (entity `skill_invocation`; payload — ids, skill/version, attempt, код ошибки,
 без inputs и output; `claimed` не уходит в outbox). Успех с `taskId` пишет
-также `artifact.created` для `skill_result`.
+также `artifact.created` для `skill_result`, а вызов-исполнение — ещё и для
+каждого созданного типизированного выхода (`skillInvocationId`); `succeeded` v2
+добавляет `outputs` — статусы выходов без значений.
 
 v0.7 (HRS-7): `run.child.launched|started|resolved|revoked|cancel_requested`.
 Payload несёт ids, correlationId, outcome, `resultHash` и размеры grant;

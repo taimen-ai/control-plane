@@ -319,7 +319,7 @@ wheels = [
 
 [[package]]
 name = "control-plane"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -372,7 +372,7 @@ requires-dist = [
     { name = "httpx2", specifier = ">=2.12.0" },
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "mcp", specifier = ">=2.0.0" },
-    { name = "platform-auth-sdk", editable = "../platform-auth-sdk" },
+    { name = "platform-auth-sdk", editable = "../../sdk/platform-auth-sdk" },
     { name = "protobuf", specifier = ">=5.29" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.8" },
@@ -1027,7 +1027,7 @@ wheels = [
 [[package]]
 name = "platform-auth-sdk"
 version = "0.1.0"
-source = { editable = "../platform-auth-sdk" }
+source = { editable = "../../sdk/platform-auth-sdk" }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },

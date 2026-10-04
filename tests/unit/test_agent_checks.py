@@ -39,6 +39,7 @@ from control_plane_agent.checks import (
     check_environment,
     checks_at_base,
     is_secret_name,
+    is_secret_value,
     not_run,
     redact,
     run_check,
@@ -480,6 +481,83 @@ def test_reserved_names_in_any_case_do_not_reach_a_check(name: str) -> None:
 
 def test_kept_reserved_names_are_kept_in_any_case() -> None:
     assert check_environment(None, {"path": "/bin", "Home": "/h"}) == {"path": "/bin", "Home": "/h"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "postgresql://u:pw@db:5432/app",
+        "postgresql+asyncpg://postgres:s3cret@localhost/test",
+        "redis://:pw@cache:6379/0",
+        "https://user:tok@example.com/repo.git",
+        "first http://a@x then amqp://u:p@mq/",
+        "Server=db;Database=app;User Id=sa;Password=s3cret;",
+        "Driver={ODBC};Server=db;UID=sa;PWD=s3cret",
+        "DefaultEndpointsProtocol=https;AccountName=acc;AccountKey=abc+/==;EndpointSuffix=x",
+        "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=Root;SharedAccessKey=k=",
+        "password=s3cret",
+        "Server=db; password = s3cret",
+    ],
+)
+def test_values_carrying_a_secret(value: str) -> None:
+    assert is_secret_value(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "C.UTF-8",
+        "postgresql://db:5432/app",
+        "postgresql://postgres@db/app",
+        "postgresql://postgres:@db/app",
+        "https://example.com/a:b@c",
+        "Server=db;Database=app;User Id=sa;",
+        "Server=db;Password=;Database=app",
+        "Endpoint=sb://ns/;SharedAccessKeyName=Root",
+        "--password=s3cret",
+        "MyPassword=x",
+        "/home/runner/.pgpass",
+    ],
+)
+def test_values_carrying_no_secret(value: str) -> None:
+    assert is_secret_value(value) is False
+
+
+def test_daemon_variables_whose_value_carries_a_secret_do_not_reach_a_check() -> None:
+    # Their names say nothing: masking the password in the output is not
+    # enough, the check's own code would see the whole value.
+    daemon = {
+        "DATABASE_URL": "postgresql://u:pw@db/app",
+        "database_url": "postgresql://u:pw@db/app",
+        "AZURE_STORAGE_CONNECTION_STRING": "AccountName=a;AccountKey=abc==",
+        "SERVICEBUS_CONNECTION": "Endpoint=sb://ns/;SharedAccessKey=k=",
+        "SQL_CONN": "Server=db;User Id=sa;Password=pw",
+        "PUBLIC_DATABASE_URL": "postgresql://u@db/app",
+        "UPSTREAM": "https://example.com",
+        "LANG": "C.UTF-8",
+    }
+    assert check_environment(None, daemon) == {
+        "PUBLIC_DATABASE_URL": "postgresql://u@db/app",
+        "UPSTREAM": "https://example.com",
+        "LANG": "C.UTF-8",
+    }
+
+
+@pytest.mark.parametrize("name", ["PATH", "HOME", "SHELL", "SSL_CERT_FILE", "https_proxy"])
+def test_kept_reserved_names_are_kept_whatever_their_value(name: str) -> None:
+    # Without them no program runs, and no request leaves a host behind an
+    # authenticating proxy; their userinfo is masked in the output.
+    value = "http://user:pa55word@proxy:3128"
+    assert check_environment(None, {name: value}) == {name: value}
+
+
+def test_the_run_environment_keeps_its_urls_with_a_password() -> None:
+    # The run's database is the check's to use, and replaces the daemon's.
+    env = check_environment(
+        {"DATABASE_URL": "postgresql://u:run@h/d"}, {"DATABASE_URL": "postgresql://u:daemon@h/d"}
+    )
+    assert env == {"DATABASE_URL": "postgresql://u:run@h/d"}
 
 
 def test_no_secret_names_is_no_change() -> None:

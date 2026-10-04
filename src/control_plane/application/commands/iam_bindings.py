@@ -5,17 +5,25 @@ identity gets its Control Plane permissions (ADR-0053). So the rules that
 guard key issuance apply here unchanged — the caller cannot hand out more than
 it holds, and only an admin can make another admin. What is new is a rule
 about the target: a non-human principal is never given the two rights that
-exist to keep a human in the loop.
+exist to keep a human in the loop, nor narrowed to the workspaces of its
+membership: visibility by membership is a human's (CP-ADR-0082 §2.3).
 """
 
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from control_plane.application.authorization import AuthContext, authorize
+from control_plane.application.authorization import (
+    VISIBILITIES,
+    VISIBILITY_MEMBERS,
+    VISIBILITY_TENANT,
+    AuthContext,
+    authorize,
+)
 from control_plane.application.commands.principals import (
     get_tenant_principal,
     ungranted_permissions,
@@ -45,6 +53,9 @@ HUMAN_ONLY_PERMISSIONS = frozenset({Permission.ADMIN.value, Permission.APPROVALS
 BINDING_STATUS_ACTIVE = "active"
 BINDING_STATUS_REVOKED = "revoked"
 
+# ``visibility`` absent from the request: the mode of the binding is kept.
+VISIBILITY_UNSET: Any = object()
+
 
 @dataclass(frozen=True)
 class UpsertedBinding:
@@ -52,10 +63,7 @@ class UpsertedBinding:
     created: bool
 
 
-def validate_binding_permissions(
-    ctx: AuthContext, *, permissions: list[str], principal_kind: str
-) -> list[str]:
-    """The same three checks an API key goes through, plus the kind rule."""
+def _check_known_permissions(permissions: list[str]) -> None:
     unknown = sorted(set(permissions) - ALL_PERMISSIONS)
     if unknown:
         raise ValidationError(
@@ -65,6 +73,121 @@ def validate_binding_permissions(
         )
     if not permissions:
         raise ValidationError("invalid_permissions", "permissions must not be empty")
+
+
+def _check_permissions_for_kind(permissions: list[str], principal_kind: str) -> None:
+    if principal_kind != PrincipalKind.HUMAN:
+        forbidden = sorted(HUMAN_ONLY_PERMISSIONS & set(permissions))
+        if forbidden:
+            raise ValidationError(
+                "permissions_not_allowed_for_kind",
+                f"A principal of kind {principal_kind!r} cannot hold human-only permissions",
+                details={"kind": principal_kind, "forbidden": forbidden},
+            )
+
+
+def check_visibility_for_kind(visibility: str | None, principal_kind: str) -> None:
+    """``members`` narrows a human only; an agent's reach is its package's."""
+    if visibility == VISIBILITY_MEMBERS and principal_kind != PrincipalKind.HUMAN:
+        raise ValidationError(
+            "visibility_requires_human",
+            "Only a human can be narrowed to the workspaces of their membership",
+            details={"errors": [{"path": "/visibility"}]},
+        )
+
+
+def parse_visibility(value: Any) -> str | None:
+    """``visibility`` of the request; ``None`` when absent (the mode is kept).
+
+    ``null``, another string or not a string — ``422 validation_error`` with
+    the JSON Pointer of the field and the JSON Schema keyword, without the
+    value (CP-ADR-0082 §2.2).
+    """
+    if value is VISIBILITY_UNSET:
+        return None
+    if isinstance(value, str) and value in VISIBILITIES:
+        return value
+    code = "enum" if isinstance(value, str) else "type"
+    raise ValidationError(
+        "validation_error",
+        "Request body does not match the schema",
+        details={
+            "errors": [
+                {"path": "/visibility", "code": code, "message": "must be tenant or members"}
+            ]
+        },
+    )
+
+
+def check_visibility_escalation(
+    ctx: AuthContext,
+    *,
+    visibility: str | None,
+    existing: IamPrincipalBinding | None,
+    principal: Principal,
+) -> None:
+    """A caller in ``members`` mode leaves no binding tenant-wide (CP-ADR-0082 B5).
+
+    The rule of key issuance (CP-ADR-0053): no wider than one's own. Such a
+    caller does not set ``tenant`` explicitly, nor by default on a new
+    binding, nor by reopening a revoked one, nor by moving an identity onto
+    another principal — for itself or anyone. Only a binding that is already
+    active, tenant-wide and stays on its principal may have its rights
+    changed while ``visibility`` is left out.
+    """
+    if ctx.visible_workspaces is None:
+        return
+    if visibility is not None:
+        result = visibility
+    elif existing is None or principal.kind != PrincipalKind.HUMAN:
+        result = VISIBILITY_TENANT
+    else:
+        result = existing.visibility
+        if (
+            existing.principal_id == principal.id
+            and existing.status == BINDING_STATUS_ACTIVE
+            and existing.revoked_at is None
+        ):
+            # Left as it is: no binding becomes tenant-wide here.
+            return
+    if result == VISIBILITY_TENANT:
+        raise _escalation()
+
+
+def _escalation() -> AuthorizationError:
+    return AuthorizationError(
+        "A caller who sees only the workspaces of their membership cannot make"
+        " a binding tenant-wide",
+        code="visibility_escalation",
+        details={"errors": [{"path": "/visibility"}]},
+    )
+
+
+def check_agent_binding_escalation(ctx: AuthContext) -> None:
+    """The registry's binding of an agent or service is always ``tenant`` (B4):
+    a caller in ``members`` mode does not make one (CP-ADR-0082 B5, V3)."""
+    if ctx.visible_workspaces is not None:
+        raise _escalation()
+
+
+def validate_stored_permissions(*, permissions: list[str], principal_kind: str) -> list[str]:
+    """The checks of ``validate_binding_permissions`` without the escalation rule.
+
+    For rights the caller does not hand out itself but takes from a record
+    checked when it was written — a published agent revision: the catalog
+    and the kind rule may have changed since, the caller's own rights are not
+    the measure.
+    """
+    _check_known_permissions(permissions)
+    _check_permissions_for_kind(permissions, principal_kind)
+    return sorted(set(permissions))
+
+
+def validate_binding_permissions(
+    ctx: AuthContext, *, permissions: list[str], principal_kind: str
+) -> list[str]:
+    """The same three checks an API key goes through, plus the kind rule."""
+    _check_known_permissions(permissions)
     # No privilege escalation: a binding can only grant permissions its creator
     # holds (admin holds everything).
     if not ctx.has(Permission.ADMIN):
@@ -79,14 +202,7 @@ def validate_binding_permissions(
                 code="permission_escalation",
                 details={"missing": missing},
             )
-    if principal_kind != PrincipalKind.HUMAN:
-        forbidden = sorted(HUMAN_ONLY_PERMISSIONS & set(permissions))
-        if forbidden:
-            raise ValidationError(
-                "permissions_not_allowed_for_kind",
-                f"A principal of kind {principal_kind!r} cannot hold human-only permissions",
-                details={"kind": principal_kind, "forbidden": forbidden},
-            )
+    _check_permissions_for_kind(permissions, principal_kind)
     return sorted(set(permissions))
 
 
@@ -149,7 +265,7 @@ def _registry_principal_conflict(agent: Agent) -> ConflictError:
     no exception, for an admin neither: re-binding it would set rights beside
     the revision, and racing ``identity:replace`` would reopen the binding the
     replacement revokes. So every identity goes through the registry
-    (CP-ADR-0073, amendment 2026-09-30, E4).
+    (CP-ADR-0073, amendment 2026-09-30, I4).
     """
     return ConflictError(
         "agent_identity_conflict",
@@ -234,6 +350,7 @@ async def upsert_iam_binding(
     iam_principal_id: uuid.UUID,
     permissions: list[str],
     trusted_issuer: str,
+    visibility: Any = VISIBILITY_UNSET,
 ) -> UpsertedBinding:
     """Create or replace the binding of one federated identity.
 
@@ -244,8 +361,14 @@ async def upsert_iam_binding(
     the principal of a registry agent takes no identity through here at all
     (``_registry_principal_conflict``). Losing a race to insert the same new
     identity is a 409 too (``_insert_new``).
+
+    ``visibility`` left out keeps the mode of an existing binding and gives a
+    new one ``tenant`` (CP-ADR-0082 §2.2): a console changing only the rights
+    does not reset it. It is checked after ``principals.write``: a caller
+    without the right learns nothing about the body (CP-ADR-0082 B5).
     """
     await authorize(ctx, Permission.PRINCIPALS_WRITE)
+    visibility = parse_visibility(visibility)
     check_trusted_issuer(issuer, trusted_issuer)
     principal = await get_tenant_principal(session, ctx, principal_id)
     if principal.status != PrincipalStatus.ACTIVE:
@@ -257,6 +380,7 @@ async def upsert_iam_binding(
     granted = validate_binding_permissions(
         ctx, permissions=permissions, principal_kind=principal.kind
     )
+    check_visibility_for_kind(visibility, principal.kind)
     # Unlocked, and safely so: a principal becomes an agent's only in the
     # transaction that creates it (``PUT /agents/{key}/identity``), and every
     # call on an agent's principal is refused, so nothing here races
@@ -285,6 +409,7 @@ async def upsert_iam_binding(
     previous_owner = existing.principal_id if existing is not None else None
     if existing is not None and existing.principal_id != principal.id:
         await _check_previous_owner(session, ctx, existing_binding=existing)
+    check_visibility_escalation(ctx, visibility=visibility, existing=existing, principal=principal)
 
     if existing is None:
         binding = IamPrincipalBinding(
@@ -296,6 +421,7 @@ async def upsert_iam_binding(
             iam_principal_id=iam_principal_id,
             permissions=granted,
             status=BINDING_STATUS_ACTIVE,
+            visibility=visibility or VISIBILITY_TENANT,
             revoked_at=None,
             last_used_at=None,
             created_at=now,
@@ -322,6 +448,12 @@ async def upsert_iam_binding(
         binding.iam_tenant_id = iam_tenant_id
         binding.permissions = granted
         binding.status = BINDING_STATUS_ACTIVE
+        if visibility is not None:
+            binding.visibility = visibility
+        elif principal.kind != PrincipalKind.HUMAN:
+            # An identity moved from a human to an agent or a service does not
+            # carry the human's narrowing along.
+            binding.visibility = VISIBILITY_TENANT
         binding.revoked_at = None
         binding.updated_at = now
         await session.flush()
@@ -333,6 +465,7 @@ async def upsert_iam_binding(
         "iamTenantId": str(binding.iam_tenant_id),
         "iamPrincipalId": str(binding.iam_principal_id),
         "permissions": binding.permissions,
+        "visibility": binding.visibility,
     }
     if previous_owner is not None and previous_owner != binding.principal_id:
         payload["previousPrincipalId"] = str(previous_owner)

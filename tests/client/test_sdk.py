@@ -504,6 +504,7 @@ async def test_knowledge_entities_page_by_page(client: httpx.AsyncClient, sdk: M
     fake = FakeGraphMemory()
     app.state.context_provider = fake
     keys: list[str] = []
+    relations: list[str] = []
     try:
         async with sdk(agent_key) as agent:
             cursor = None
@@ -515,14 +516,17 @@ async def test_knowledge_entities_page_by_page(client: httpx.AsyncClient, sdk: M
                     as_of="2026-09-28T00:00:00+00:00",
                     limit=1,
                     cursor=cursor,
+                    include={"relations": ["governs"], "direction": "out"},
                 )
                 keys += [item["key"] for item in page["items"]]
+                relations += [r["key"] for item in page["items"] for r in item["relations"]]
                 cursor = page["nextCursor"]
                 if cursor is None:
                     break
     finally:
         app.state.context_provider = None
     assert keys == ["CP-0019", "GET /runs/{}/checkpoints"]
+    assert relations == ["control-plane:src/control_plane/api/v1/claims.py"]
     assert [r.get("cursor") for r in fake.entities_requests] == [None, "adr|CP-0019"]
     assert fake.entities_requests[0]["asOf"] == "2026-09-28T00:00:00+00:00"
 

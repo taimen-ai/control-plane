@@ -25,10 +25,14 @@ from control_plane.domain.project import validate_against_schema
 from control_plane.infrastructure.db.models import (
     ProjectProfile,
     Task,
+    TaskType,
     Workspace,
     WorkspaceMember,
     WorkspaceType,
 )
+
+# "Not passed" for a nullable setting, where None means "inherit".
+UNSET: Any = object()
 
 
 async def lock_workspace_tree(session: AsyncSession, tenant_id: uuid.UUID) -> None:
@@ -51,7 +55,9 @@ async def get_tenant_workspace(
     if for_update:
         stmt = stmt.with_for_update()
     workspace = await session.scalar(stmt)
-    if workspace is None:
+    # Outside the caller's visibility a workspace answers as a missing one,
+    # for every object filed in it by id (CP-ADR-0082 §3.6).
+    if workspace is None or not ctx.sees_workspace(workspace.id):
         raise NotFoundError("Workspace not found", details={"workspaceId": str(workspace_id)})
     return workspace
 
@@ -94,6 +100,65 @@ async def workspace_ancestor_ids(
         {"ws": workspace_id, "tenant": tenant_id},
     )
     return [row[0] for row in rows]
+
+
+async def effective_task_types(
+    session: AsyncSession, tenant_id: uuid.UUID, workspace_id: uuid.UUID
+) -> list[str] | None:
+    """Task type keys allowed in a workspace (CP-ADR-0008, amendment 2026-10-03 A1).
+
+    The own ``task_types`` or, while it is NULL, that of the nearest ancestor
+    which sets it; None when nobody on the path does — every type is allowed.
+    ``[]`` set anywhere on the path stops the walk: it allows none.
+    """
+    ancestors = await workspace_ancestor_ids(session, tenant_id, workspace_id)
+    if not ancestors:
+        return None
+    rows = await session.execute(
+        select(Workspace.id, Workspace.task_types).where(
+            Workspace.tenant_id == tenant_id, Workspace.id.in_(ancestors)
+        )
+    )
+    own = {row.id: row.task_types for row in rows}
+    for node in ancestors:
+        value = own.get(node)
+        if value is not None:
+            return list(value)
+    return None
+
+
+async def require_task_type_allowed(
+    session: AsyncSession, tenant_id: uuid.UUID, workspace_id: uuid.UUID, type_key: str
+) -> None:
+    """Refuse work of a type the workspace does not allow (A3); work already
+    there is never re-checked."""
+    allowed = await effective_task_types(session, tenant_id, workspace_id)
+    if allowed is not None and type_key not in allowed:
+        raise ValidationError(
+            "task_type_not_allowed",
+            f"Task type {type_key!r} is not allowed in this workspace",
+            details={"workspaceId": str(workspace_id), "typeKey": type_key},
+        )
+
+
+async def _check_task_type_keys(session: AsyncSession, ctx: AuthContext, keys: list[str]) -> None:
+    """Every key names a task type of the tenant: any version, any status."""
+    known = set(
+        (
+            await session.scalars(
+                select(TaskType.key)
+                .where(TaskType.tenant_id == ctx.tenant_id, TaskType.key.in_(keys))
+                .distinct()
+            )
+        ).all()
+    )
+    for index, key in enumerate(keys):
+        if key not in known:
+            raise ValidationError(
+                "unknown_task_type",
+                f"Task type {key!r} is not registered",
+                details={"field": f"taskTypes[{index}]", "taskType": key},
+            )
 
 
 async def workspace_subtree_ids(
@@ -284,6 +349,7 @@ async def update_workspace(
     type_id: uuid.UUID | None = None,
     type_key: str | None = None,
     custom_fields: dict[str, Any] | None = None,
+    task_types: list[str] | Any | None = UNSET,
 ) -> Workspace:
     await authorize(ctx, Permission.WORKSPACES_MANAGE)
     structural = slug is not None or type_id is not None or type_key is not None
@@ -351,6 +417,12 @@ async def update_workspace(
             code="custom_fields_invalid",
             field_name="customFields",
         )
+    if task_types is not UNSET:
+        if task_types is not None:
+            await _check_task_type_keys(session, ctx, task_types)
+        if task_types != workspace.task_types:
+            changes["taskTypes"] = True
+            workspace.task_types = None if task_types is None else list(task_types)
     if not changes:
         raise ValidationError("empty_update", "No fields to update")
 
@@ -360,6 +432,10 @@ async def update_workspace(
     workspace.version += 1
     workspace.updated_at = utcnow()
 
+    payload: dict[str, Any] = {"changes": changes, "version": workspace.version}
+    if "taskTypes" in changes:
+        # The new own setting itself: keys are not secret (event v2).
+        payload["taskTypes"] = workspace.task_types
     await record_event(
         session,
         tenant_id=ctx.tenant_id,
@@ -370,7 +446,7 @@ async def update_workspace(
         request_id=ctx.request_id,
         correlation_id=ctx.correlation_id,
         trace_run_id=ctx.trace_run_id,
-        payload={"changes": changes, "version": workspace.version},
+        payload=payload,
     )
     return workspace
 

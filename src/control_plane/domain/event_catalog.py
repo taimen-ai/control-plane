@@ -294,37 +294,35 @@ _register(
         }
     ),
 )
+_IAM_BINDING_V1 = {
+    "principalId": UUID,
+    "issuer": STR,
+    "iamTenantId": ANY,
+    "iamPrincipalId": ANY,
+    "permissions": ARR,
+}
+_IAM_BINDING_VISIBILITY = described(
+    {"type": "string", "enum": ["tenant", "members"]},
+    "Visibility of the binding: the whole tenant or the workspaces of membership (CP-ADR-0082)",
+)
+_IAM_BINDING_MOVED = {
+    "previousPrincipalId": described(UUID, "Only when the identity moved from another principal"),
+}
 _register(
     "iam_binding.created",
     "iam_binding",
     "An IAM identity was bound to a local principal (CP-ADR-0053).",
-    data(
-        {
-            "principalId": UUID,
-            "issuer": STR,
-            "iamTenantId": ANY,
-            "iamPrincipalId": ANY,
-            "permissions": ARR,
-        }
-    ),
+    data(_IAM_BINDING_V1),
+    (data({**_IAM_BINDING_V1, "visibility": _IAM_BINDING_VISIBILITY}), "visibility"),
 )
 _register(
     "iam_binding.updated",
     "iam_binding",
-    "The permissions of an IAM binding changed.",
-    data(
-        {
-            "principalId": UUID,
-            "issuer": STR,
-            "iamTenantId": ANY,
-            "iamPrincipalId": ANY,
-            "permissions": ARR,
-        },
-        {
-            "previousPrincipalId": described(
-                UUID, "Only when the identity moved from another principal"
-            ),
-        },
+    "The permissions or the visibility of an IAM binding changed.",
+    data(_IAM_BINDING_V1, _IAM_BINDING_MOVED),
+    (
+        data({**_IAM_BINDING_V1, "visibility": _IAM_BINDING_VISIBILITY}, _IAM_BINDING_MOVED),
+        "visibility",
     ),
 )
 _register(
@@ -360,6 +358,22 @@ _register(
     "principal",
     "A principal (human, agent or service) was created.",
     data({"kind": STR, "displayName": STR}),
+)
+_register(
+    "principal.updated",
+    "principal",
+    "The display name or the profile of a principal changed (CP-ADR-0082). Names of"
+    " the changed fields only, never their values: read them via GET /principals/{id}.",
+    data(
+        {
+            "principalId": UUID,
+            "version": described(INT, "Version of the principal after the change"),
+            "changes": described(
+                {"type": "array", "items": STR, "minItems": 1},
+                "Changed fields: displayName, profile.<field>",
+            ),
+        }
+    ),
 )
 _register(
     "principal.disabled",
@@ -489,6 +503,16 @@ _register("skill.assigned", "principal", "A skill was assigned.", data({"skillId
 _register("skill.revoked", "principal", "A skill was revoked.", data({"skillId": UUID}))
 
 _INVOCATION_BASE = {"skillId": UUID}
+_INVOCATION_SUCCEEDED_V1 = {
+    **_INVOCATION_BASE,
+    "skill": STR,
+    "version": ANY,
+    "attempt": INT,
+    "taskId": UUID_N,
+    "runId": UUID_N,
+    "artifactId": UUID_N,
+    "cost": ANY,
+}
 _register(
     "skill.invocation_requested",
     "skill_invocation",
@@ -517,17 +541,20 @@ _register(
     "skill.invocation_succeeded",
     "skill_invocation",
     "The invocation finished; its result is an artifact.",
-    data(
-        {
-            **_INVOCATION_BASE,
-            "skill": STR,
-            "version": ANY,
-            "attempt": INT,
-            "taskId": UUID_N,
-            "runId": UUID_N,
-            "artifactId": UUID_N,
-            "cost": ANY,
-        }
+    data(_INVOCATION_SUCCEEDED_V1),
+    (
+        data(
+            {
+                **_INVOCATION_SUCCEEDED_V1,
+                "outputs": described(
+                    ARR,
+                    "Typed outputs of the executed task: {key, type, status"
+                    " (created | absent | missing | rejected), artifactId?, reason?};"
+                    " empty unless this is the task's execution call",
+                ),
+            }
+        ),
+        "outputs (CP-ADR-0072 amendment 2026-10-01)",
     ),
 )
 _register(
@@ -595,6 +622,19 @@ _register(
     "workspace",
     "Workspace attributes changed.",
     data({"changes": ANY, "version": INT}),
+    (
+        data(
+            {"changes": ANY, "version": INT},
+            {
+                "taskTypes": described(
+                    nullable({"type": "array", "items": STR}),
+                    "New own setting of the allowed task types, when it changed; "
+                    "null inherits from the ancestors",
+                )
+            },
+        ),
+        "taskTypes (CP-ADR-0008, amendment 2026-10-03 A2)",
+    ),
 )
 _register("workspace.archived", "workspace", "A workspace was archived.", data({"slug": STR}))
 _register(
@@ -1002,21 +1042,29 @@ _TASK_TYPE_CREATED_V1: dict[str, JsonSchema] = {
     "declaresInstructions": BOOL,
     "declaresCompletionWork": BOOL,
 }
+_TASK_TYPE_CREATED_V2 = {
+    **_TASK_TYPE_CREATED_V1,
+    "declaresArtifactSchema": BOOL,
+    "inputs": described(INT, "Number of declared artifact inputs"),
+    "outputs": described(INT, "Number of declared artifact outputs"),
+}
 _register(
     "task_type.created",
     "task_type",
     "A task type version was created (ADR-0048).",
     data(_TASK_TYPE_CREATED_V1),
+    (data(_TASK_TYPE_CREATED_V2), "declaresArtifactSchema, inputs, outputs (CP-ADR-0072)"),
     (
         data(
             {
-                **_TASK_TYPE_CREATED_V1,
-                "declaresArtifactSchema": BOOL,
-                "inputs": described(INT, "Number of declared artifact inputs"),
-                "outputs": described(INT, "Number of declared artifact outputs"),
+                **_TASK_TYPE_CREATED_V2,
+                "executorRoles": described(
+                    {"type": "array", "items": STR},
+                    "Slugs of the roles a person needs to take work of the version",
+                ),
             }
         ),
-        "declaresArtifactSchema, inputs, outputs (CP-ADR-0072)",
+        "executorRoles (CP-ADR-0048, amendment 2026-10-03 A1)",
     ),
 )
 _register(
@@ -1335,6 +1383,108 @@ _register(
         }
     ),
 )
+# --- connections (CP-ADR-0079) --------------------------------------------------
+_register(
+    "connection_type.published",
+    "connection_type",
+    "A version of a connection type was published (CP-ADR-0079 §2); a repeat"
+    " of the same spec records nothing.",
+    data({"key": STR, "version": INT, "auth": ARR}),
+)
+_CONNECTION_STATUS: JsonSchema = {
+    "type": "string",
+    "enum": ["pending", "active", "expired", "revoked"],
+}
+_register(
+    "connection.created",
+    "connection",
+    "A connection was created (CP-ADR-0079 §3); it waits for authorization.",
+    data({"key": STR, "type": STR, "typeVersion": INT, "status": _CONNECTION_STATUS}),
+)
+_register(
+    "connection.updated",
+    "connection",
+    "The display name, settings or type version of a connection changed; only the"
+    " names of the changed fields, never their values.",
+    data(
+        {
+            "key": STR,
+            "version": INT,
+            "changes": described(
+                ARR, "Names of the changed fields: displayName, settings, typeVersion"
+            ),
+        }
+    ),
+)
+_register(
+    "connection.status_changed",
+    "connection",
+    "The status of a connection moved without a new authorization — the connector"
+    " reported that access is lost. Codes only, no text of the provider.",
+    data(
+        {
+            "key": STR,
+            "type": STR,
+            "from": _CONNECTION_STATUS,
+            "to": _CONNECTION_STATUS,
+            "reason": described(STR_N, "A code, e.g. refresh_rejected"),
+            "connectedBy": described(UUID_N, "Who connected it last; null if nobody has"),
+        }
+    ),
+)
+_CONNECTION_AUTH: JsonSchema = {"type": "string", "enum": ["oauth2", "token"]}
+_register(
+    "connection.authorized",
+    "connection",
+    "A connection became active: the OAuth code was exchanged in the secret store or"
+    " a key of the connection was entered. No value, no account, no provider text.",
+    data(
+        {
+            "key": STR,
+            "type": STR,
+            "auth": _CONNECTION_AUTH,
+            "previousStatus": _CONNECTION_STATUS,
+            "connectedBy": described(UUID, "The principal that connected it"),
+        }
+    ),
+)
+_register(
+    "connection.authorization_failed",
+    "connection",
+    "An OAuth callback of a live state did not connect: consent denied, a provider"
+    " error, an invalid account, the initiator no longer authorized or a failed"
+    " exchange. The status of the connection did not change.",
+    data(
+        {
+            "key": STR,
+            "type": STR,
+            "reason": described(STR, "A code, e.g. consent_denied, oauth_exchange_failed"),
+            "initiatedBy": described(UUID, "The principal that started :authorize"),
+        }
+    ),
+)
+_register(
+    "connection.revoked",
+    "connection",
+    "A connection was revoked (CP-ADR-0079 §10): its material is deleted from the secret"
+    " store and no agent's policy names it any more. A repeated revocation records nothing.",
+    data(
+        {
+            "key": STR,
+            "type": STR,
+            "previousStatus": described(
+                _CONNECTION_STATUS, "pending, active or expired: the status before the revocation"
+            ),
+        }
+    ),
+)
+_register(
+    "connection_type.oauth_app_set",
+    "connection_type",
+    "The OAuth application of a connection type was written to the secret store;"
+    " neither the client id nor the secret is in the event.",
+    data({"type": STR, "created": described(BOOL, "The first write, not a replacement")}),
+)
 # --- agent registry (CP-ADR-0073) ---------------------------------------------
 
 _AGENT_HASH: JsonSchema = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
@@ -1444,6 +1594,25 @@ _register(
     ),
 )
 _register(
+    "agent.secret_set",
+    "agent",
+    "A secret of an agent was set by name (CP-ADR-0079 §11): the value went to the secret"
+    " store in transit; the event carries the name only.",
+    data(
+        {
+            "agentKey": STR,
+            "name": STR,
+            "created": described(BOOL, "The first value under the name, not a replacement"),
+        }
+    ),
+)
+_register(
+    "agent.secret_deleted",
+    "agent",
+    "A secret of an agent was deleted with every version from the secret store (CP-ADR-0079 §11).",
+    data({"agentKey": STR, "name": STR}),
+)
+_register(
     "observation.recorded",
     "observation",
     "An observation was recorded (ADR-0057).",
@@ -1550,8 +1719,18 @@ _register(
 _register(
     "work.reconciled",
     "task",
-    "A rule updated, cancelled or completed the work it derived earlier.",
-    data({**_WORK, "changes": ARR}, {"verificationId": UUID, "check": ANY}),
+    "A rule updated, cancelled or completed work: the work it derived earlier, "
+    "or the task an observation is bound to.",
+    data(
+        {**_WORK, "changes": ARR},
+        {
+            "verificationId": UUID,
+            "check": ANY,
+            # "task": the work is the task an observation is bound to, and
+            # dedupKey its pseudo-key task:<id> (CP-ADR-0063, amendment Zh4).
+            "target": STR,
+        },
+    ),
 )
 
 # --- processes (CP-ADR-0074, CP-ADR-0076) -----------------------------------
@@ -2044,6 +2223,63 @@ _register(
     data({"key": STR, "latestVersion": INT, "packageKey": STR_N, "packageVersion": STR_N}),
 )
 
+# --- views of packages (CP-ADR-0080) ------------------------------------------
+
+_register(
+    "view.published",
+    "view",
+    "A view of a package is in use at a revision: published by a package apply, or brought"
+    " back as it was; a console drops what it cached of the key (CP-ADR-0080).",
+    data(
+        {
+            "key": STR,
+            "revision": INT,
+            "hash": described(STR, "sha256 of the revision, as GET /views/{key} returns it"),
+            "previousRevision": described(INT_N, "The revision before; null for a new view"),
+            "packageKey": STR_N,
+            "packageVersion": STR_N,
+        }
+    ),
+)
+_register(
+    "view.retired",
+    "view",
+    "A view of a package is out of use: the package that installed it no longer brings it"
+    " (CP-ADR-0080).",
+    data(
+        {
+            "key": STR,
+            "revision": described(INT, "The last revision of the view"),
+            "reason": STR,
+            "packageKey": STR_N,
+            "packageVersion": STR_N,
+        }
+    ),
+)
+
+# --- settings of packages (CP-ADR-0081) ---------------------------------------
+
+_register(
+    "package.settings_changed",
+    "package",
+    "The settings of a package have a new version: a PUT /packages/{key}/settings saved"
+    " other values. No value is in the event — neither the old, the new nor the defaults;"
+    " who may read them reads GET /packages/{key}/settings/versions (CP-ADR-0081 §5).",
+    data(
+        {
+            "package": described(STR, "The key of the package"),
+            "version": described(INT, "The new version of the values"),
+            "previousVersion": described(INT, "The version before; 0 for the first saving"),
+            "schemaRevision": described(INT, "The schema revision the values were checked by"),
+            "changedPaths": described(
+                {"type": "array", "items": STR},
+                "JSON Pointers of the members whose saved value changed",
+            ),
+            "actorId": UUID,
+        }
+    ),
+)
+
 # --- attention ---------------------------------------------------------------
 
 _register(
@@ -2082,6 +2318,28 @@ _register(
     "event_journal",
     "Archived journal events were deleted.",
     data({"pruned": INT, "throughCursor": STR, "minAgeSeconds": INT}),
+)
+_register(
+    "event_journal.exported",
+    "event_journal",
+    "The journal was exported for a period (CP-ADR-0068, export amendment): the filters of the"
+    " export and the number of events, never the events themselves. Written before the"
+    " body is streamed.",
+    data(
+        {
+            "format": described(STR, "jsonl or csv"),
+            "types": described(ARR, "Event type prefixes of the filter; empty - every type"),
+            "entityType": STR_N,
+            "entityId": UUID_N,
+            "actorId": described(UUID_N, "Author filter of the export, not its author"),
+            "occurredFrom": TIME,
+            "occurredTo": TIME,
+            "workspaceId": UUID_N,
+            "includeDescendants": nullable(BOOL),
+            "events": described(INT, "Events the export holds"),
+            "throughCursor": described(STR, "Journal position the export reads up to"),
+        }
+    ),
 )
 _register(
     "context_adapter.redriven",

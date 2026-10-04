@@ -93,6 +93,7 @@ run — один `skill_invocation` с входами из `customFields` и evi
 ### 5. Реализации и исполнитель
 
 - **`http`** — `POST endpoint` с телом `{invocationId, idempotencyKey, inputs}`
+  (и `settings` пакета скилла — CP-ADR-0081, амендмент В3)
   и токеном IAM audience сервиса-скилла. Ответ 2xx — `outputs`; 4xx —
   неретраимая ошибка, 5xx и таймаут — ретраимая.
 - **`local`** — Python entrypoint `module:function` из пакета, установленного у
@@ -611,6 +612,60 @@ audience из своего allow-list, никогда — `control-plane`, `iam`
 
 Проверка — `tests/integration/test_process_skill_basis.py`.
 
+## Амендмент 2026-10-03: фильтр по типу в `/work/available`, демон берёт свои типы (§3, A.4; TASK-001359)
+
+Найдено ревью TASK-001354. Демон вида `skills` (без адаптера, например
+`selfdev-skills` без `work.workspace`) читал одну страницу `GET
+/work/available` (`WORK_SCAN` = 50) по всему арендатору, а тип отсекал на
+клиенте (A.4). Порядок очереди — приоритет, затем от старых к новым: больше
+50 доступных задач чужих типов старше и важнее — и задачи его типов не
+брались, без ошибки и без следа в журнале.
+
+### Ж1. `typeKey` у `GET /work/available`
+
+Параметр **`typeKey`** — ключ типа задачи, повторяемый (`?typeKey=a&typeKey=b`
+— задачи любого из типов), совпадает с любой версией типа. Он только сужает
+выборку: применяется в запросе кандидатов до страницы, поэтому курсор и
+`nextCursor` идут по отфильтрованной очереди; права (`tasks.read`), видимость,
+eligibility и прочие условия доступности те же. Сочетается с `workspaceId`
+/`includeDescendants`, `projectId`/`includeSubprojects`, `assigneeId`,
+`assignedToMe` и курсором. Ключ, которого нет ни у одного типа, даёт пустую
+выборку, а не всю очередь. Пустой или пробельный ключ и больше 50 значений —
+`422 invalid_type_key` (не молчаливое «без фильтра»). Клиент —
+`list_available_work(type_keys=...)`; пустой список он отвергает
+(`ValueError`): без параметра запрос вернул бы всю очередь.
+
+### Ж2. Демон
+
+- **Вид `skills`** (нет адаптера, есть исполнитель скиллов) передаёт `typeKey`
+  — ключи типов, у которых хотя бы одна версия объявляет `execution` со
+  скиллом, который он исполняет (то же решение, что `_takes`/`can_execute`
+  по задаче; `work.taskTypes`, если задан, сужает дальше). Список читается из
+  `GET /task-types` (до 20 страниц по 100) и держится 60 с: тип,
+  опубликованный позже, берётся после этого. Нет ни одного такого типа —
+  очередь не читается вовсе. Нет `task_types.read`, типов больше 50 или
+  больше 20 страниц — список без фильтра, как раньше, с предупреждением в
+  журнале. Проверка по каждой задаче (A.4) остаётся: фильтр совпадает с
+  любой версией ключа, а `execution` у версий может различаться.
+- **Остальные виды** фильтр не передают — их выборка прежняя.
+- **Страницы — у всех видов.** Если из страницы не взята ни одна задача
+  (клиентский фильтр отсеял всё, claim проиграл гонку или отказан по самой
+  задаче) и есть `nextCursor`, демон читает следующую страницу — не больше
+  `WORK_PAGES` = 5 за цикл (250 задач), дальше — следующий цикл. Отказ claim
+  уровня tenant, как и прежде, останавливает цикл (CP-ADR-0073 Е8).
+
+### Ж3. Проверки
+
+`tests/integration/test_discovery_v03.py` (`typeKey` с курсором и по
+версиям, повтор, сочетание с workspace и `assignedToMe`, eligibility не
+расширяется, неверные значения — `422`),
+`tests/client/test_skill_executor.py` (60 доступных задач чужого типа старше
+и важнее и одна задача типа исполнителя — демон её берёт одним запросом с
+`typeKey`; без исполнимых типов очередь не читается; обычный демон с
+`work.taskTypes` переходит на вторую страницу),
+`tests/unit/test_agent_work_listing.py` (выбор ключей, кэш, откаты к
+выборке без фильтра, потолок страниц, пустой фильтр в клиенте).
+
 ## Conformance
 
 ```conformance
@@ -637,5 +692,9 @@ audience из своего allow-list, никогда — `control-plane`, `iam`
 - grep: {path: "src/control_plane/api/v1/schemas.py", pattern: "http_origins"}
   repo: control-plane
 - grep: {path: "src/control_plane/domain/skill_contract.py", pattern: "def replace_endpoint"}
+  repo: control-plane
+- grep: {path: "src/control_plane/api/v1/harness.py", pattern: 'alias="typeKey"'}
+  repo: control-plane
+- grep: {path: "src/control_plane_agent/main.py", pattern: "async def _listing_type_keys"}
   repo: control-plane
 ```

@@ -1,0 +1,10 @@
+apiVersion: catalog.example/v1
+kind: Component
+key: procurement-summary
+spec:
+  params: {procurement: {schema: {$ref: ../schemas/tender.yaml#/properties/procurement}}}
+  layout:
+    - block: fields
+      items:
+        - {label: tenders.fields.procurement.customer, value: param.procurement.customer.shortName}
+        - {label: tenders.fields.procurement.maxPrice, value: "decimal(param.procurement.maxPrice.amount)", format: money}

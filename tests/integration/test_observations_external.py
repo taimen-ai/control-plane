@@ -1,5 +1,5 @@
 """External observations (CP-ADR-0057): source, dedupKey, observedAt,
-supersedes, externalRef — and dedup of repeats per tenant."""
+supersedes, externalRef — and dedup of repeats per tenant and author."""
 
 import uuid
 from datetime import datetime
@@ -82,6 +82,56 @@ async def test_dedup_identity_is_source_key_and_tenant(
     foreign = await _post(client, foreign_key, _external())
     assert foreign.status_code == 201
     assert foreign.json()["id"] != first.json()["id"]
+
+
+async def _two_agent_keys(client: httpx.AsyncClient) -> tuple[str, str]:
+    boot = await do_bootstrap(client)
+    admin_key = boot["apiKey"]["key"]
+    _, first = await create_agent_with_key(client, admin_key, name="observer")
+    _, second = await create_agent_with_key(client, admin_key, name="squatter")
+    return first, second
+
+
+async def test_a_key_taken_by_another_author_does_not_silence_the_observer(
+    client: httpx.AsyncClient, sync_engine: Engine
+) -> None:
+    """CP-ADR-0057, amendment 2026-10-01: the author is part of the key.
+
+    A predictable key taken in advance is the taker's own observation; the
+    real observer still records its fact, and each author dedups its own
+    repeats only.
+    """
+    observer, squatter = await _two_agent_keys(client)
+    taken = await _post(client, squatter, _external(content="squatted"))
+    assert taken.status_code == 201, taken.text
+
+    real = await _post(client, observer, _external())
+    assert real.status_code == 201, real.text
+    assert real.json()["deduplicated"] is False
+    assert real.json()["id"] != taken.json()["id"]
+
+    for key, first in ((observer, real), (squatter, taken)):
+        repeat = await _post(client, key, _external(content="re-polled"))
+        assert (repeat.status_code, repeat.json()["deduplicated"]) == (200, True)
+        assert repeat.json()["id"] == first.json()["id"]
+
+    recorded = await _recorded(client, observer)
+    assert sorted(e["entityId"] for e in recorded) == sorted(
+        [real.json()["id"], taken.json()["id"]]
+    )
+    with sync_engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM observation_dedup_keys")).scalar() == 2
+
+
+async def test_no_answer_names_the_key_of_another_author(client: httpx.AsyncClient) -> None:
+    """The key of another author is neither a conflict nor a repeat: nothing
+    about that author's observation reaches the caller."""
+    observer, squatter = await _two_agent_keys(client)
+    taken = await _post(client, squatter, _external())
+    real = await _post(client, observer, _external())
+    assert (taken.status_code, real.status_code) == (201, 201)
+    assert taken.json()["id"] not in real.text
+    assert taken.json()["eventId"] not in real.text
 
 
 async def test_event_carries_external_fields(client: httpx.AsyncClient) -> None:

@@ -35,6 +35,7 @@ from control_plane.infrastructure.db.models import WorkspaceType
 router = APIRouter(tags=["workspace-types"])
 
 
+# visibility: tenant — workspace types are objects of the tenant
 @router.post(
     "/workspace-types",
     response_model=WorkspaceTypeOut,
@@ -72,6 +73,7 @@ async def create_workspace_type(
     )
 
 
+# visibility: tenant — workspace types are objects of the tenant
 @router.get("/workspace-types", response_model=PageOut, responses=ERROR_RESPONSES)
 async def list_workspace_types(
     ctx: AuthDep,
@@ -109,6 +111,7 @@ async def list_workspace_types(
     return JSONResponse(page_body(items, next_cursor))
 
 
+# visibility: tenant — workspace types are objects of the tenant
 @router.get(
     "/workspace-types/{type_id}", response_model=WorkspaceTypeOut, responses=ERROR_RESPONSES
 )
@@ -123,6 +126,7 @@ async def get_workspace_type(type_id: uuid.UUID, ctx: AuthDep, db: DbDep) -> JSO
     )
 
 
+# visibility: tenant — workspace types are objects of the tenant
 @router.patch(
     "/workspace-types/{type_id}", response_model=WorkspaceTypeOut, responses=ERROR_RESPONSES
 )
@@ -163,6 +167,7 @@ async def update_workspace_type(
     )
 
 
+# visibility: tenant — workspace types are objects of the tenant
 @router.post(
     "/workspace-types/{type_id}:archive",
     response_model=WorkspaceTypeOut,

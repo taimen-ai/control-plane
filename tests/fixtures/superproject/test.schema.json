@@ -1,23 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://taimen.ai/schema/packages/v1/test.schema.json",
-  "title": "Тест пакета: процесс, правило или тип задачи", "$comment": "TAI-ADR-0054 Р8, TAI-ADR-0062 п.11",
-  "description": "Файл <имя>.test.yaml в каталоге tests/ пакета. Прогоняет ядро (POST /packages:test) тем же движком, что живой прогон, в песочнице: задачи, approvals и таймеры — в памяти, скиллы, агенты и память — заглушки, проверенные по схемам каталога, время виртуальное. Побочных эффектов нет.",
+  "title": "Package test: a process, rule or task type", "$comment": "TAI-ADR-0054 Р8, TAI-ADR-0062 item 11",
+  "description": "File <name>.test.yaml in the package's tests/ directory. Run by the core (POST /packages:test) with the same engine as a live run, in a sandbox: tasks, approvals and timers are in memory, skills, agents and memory are stubs checked against the catalog schemas, time is virtual. No side effects.",
   "type": "object",
   "required": ["name", "steps"],
   "additionalProperties": false,
   "properties": {
     "$schema": {"type": "string"},
-    "process": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ процесса пакета"},
-    "version": {"type": "integer", "minimum": 1, "description": "По умолчанию — версия в пакете"},
+    "process": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Package process key"},
+    "version": {"type": "integer", "minimum": 1, "description": "Defaults to the version in the package"},
     "name": {"type": "string", "minLength": 1, "maxLength": 200},
     "description": {"type": "string", "maxLength": 2000},
     "subject": {
       "enum": ["process", "rule", "taskType"], "default": "process",
-      "description": "Что проверяет тест: процесс (по умолчанию), правило вывода работы или тип задачи (исходы гейтов, критерии приёмки, действия завершения)"
+      "description": "What the test checks: a process (default), a work rule or a task type (gate outcomes, acceptance criteria, completion actions)"
     },
-    "rule": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ WorkRule пакета (subject: rule)"},
-    "taskType": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ TaskType пакета (subject: taskType)"},
+    "rule": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Package WorkRule key (subject: rule)"},
+    "taskType": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Package TaskType key (subject: taskType)"},
     "given": {"type": "object"},
     "mocks": {
       "type": "object", "additionalProperties": false,
@@ -26,7 +26,7 @@
           "type": "object",
           "propertyNames": {"pattern": "^[^@\\s]+@[^@\\s]+$"},
           "additionalProperties": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/mockAnswer"}},
-          "description": "name@version → ответы по порядку вызовов (или по when); выход проверяется по схеме скилла из каталога"
+          "description": "name@version → responses in call order (or by when); the output is checked against the skill schema from the catalog"
         },
         "agents": {
           "type": "object",
@@ -34,14 +34,14 @@
         },
         "recall": {
           "type": "array", "items": {"$ref": "#/$defs/mockAnswer"},
-          "description": "Ответы памяти шагам recall; step — id шага, when — CEL над запросом"
+          "description": "Memory responses to recall steps; step is the step id, when is CEL over the query"
         }
       }
     },
     "steps": {"type": "array", "minItems": 1, "maxItems": 500, "items": {"type": "object"}},
     "coverage": {
       "type": "object", "additionalProperties": false,
-      "properties": {"minimum": {"type": "number", "minimum": 0, "maximum": 100, "description": "Порог покрытия элементов процесса этим тестом, %"}}
+      "properties": {"minimum": {"type": "number", "minimum": 0, "maximum": 100, "description": "Coverage threshold of process elements by this test, %"}}
     }
   },
   "allOf": [
@@ -71,30 +71,37 @@
     "processGiven": {
       "type": "object", "additionalProperties": false,
       "properties": {
-        "clock": {"type": "string", "format": "date-time", "description": "Начальное виртуальное время"},
-        "data": {"type": "object", "description": "Начальные данные экземпляра (без события старта)"},
-        "stage": {"type": "string", "description": "Начать с открытой стадии"},
-        "fromInstance": {"type": "string", "description": "Только пробный прогон на стенде: состояние копируется из живого экземпляра"},
-        "calendar": {"type": "string", "description": "Ключ календаря вместо календаря процесса"},
+        "clock": {"type": "string", "format": "date-time", "description": "Initial virtual time"},
+        "data": {"type": "object", "description": "Initial instance data (without a start event)"},
+        "stage": {"type": "string", "description": "Start with an open stage"},
+        "fromInstance": {"type": "string", "description": "Dry run on an environment only: state is copied from a live instance"},
+        "calendar": {"type": "string", "description": "Calendar key instead of the process calendar"},
+        "settings": {"$ref": "#/$defs/settings"},
         "principals": {
           "type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
-          "description": "Роль → вымышленные principal теста (для назначений и разделения обязанностей)"
+          "description": "Role → fictitious test principals (for assignments and separation of duties)"
         }
       }
     },
 
     "variables": {
       "type": "object", "propertyNames": {"pattern": "^[A-Z][A-Z0-9_]*$"}, "additionalProperties": {"type": "string"},
-      "description": "Значения переменных установки для теста; остальные — default из манифеста"
+      "description": "Installation variable values for the test; the rest are defaults from the manifest"
+    },
+
+    "settings": {
+      "type": "object", "propertyNames": {"pattern": "^[a-z][A-Za-z0-9_]{0,62}$"},
+      "description": "Saved package settings values, as an administrator saves them: they replace the previously saved values, fields not given take their default from spec.settings of the manifest. The core checks them against the settings schema of the package",
+      "$comment": "TAI-ADR-0067"
     },
 
     "workExpectation": {
       "type": "object", "additionalProperties": false,
-      "description": "Ожидаемая работа: заданные поля сравниваются, незаданные не проверяются",
+      "description": "Expected work: the given fields are compared, the rest are not checked",
       "properties": {
         "type": {"type": "string"},
         "title": {"type": "string"},
-        "assignee": {"type": "string", "description": "agent:<key>, роль теста или вымышленный principal"},
+        "assignee": {"type": "string", "description": "agent:<key>, a test role or a fictitious principal"},
         "customFields": {"type": "object"},
         "relation": {"type": "object"}
       }
@@ -102,7 +109,7 @@
 
     "skillExpectation": {
       "type": "object", "required": ["skill"], "additionalProperties": false,
-      "properties": {"skill": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"}, "inputs": {"type": "object", "description": "Подмножество входа вызова"}}
+      "properties": {"skill": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$"}, "inputs": {"type": "object", "description": "Subset of the call input"}}
     },
 
     "ruleGiven": {
@@ -111,21 +118,22 @@
       "properties": {
         "clock": {"type": "string", "format": "date-time"},
         "variables": {"$ref": "#/$defs/variables"},
+        "settings": {"$ref": "#/$defs/settings"},
         "task": {
           "type": "object", "required": ["type"], "additionalProperties": false,
-          "description": "Задача, заведённая до входа: событие без taskId в payload — о ней", "$comment": "CP-ADR-0074, амендмент 2026-09-30",
+          "description": "Task created before the input: an event without taskId in the payload is about it", "$comment": "CP-ADR-0074, amendment 2026-09-30",
           "properties": {
-            "type": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Ключ типа задачи пакета или tenant'а"},
+            "type": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$", "description": "Task type key of the package or tenant"},
             "title": {"type": "string"},
             "status": {"type": "string"},
-            "assignee": {"type": "string", "description": "agent:<key> или вымышленный principal"},
+            "assignee": {"type": "string", "description": "agent:<key> or a fictitious principal"},
             "customFields": {"type": "object"}
           }
         },
         "schedule": {
           "type": "object", "additionalProperties": false,
-          "description": "Вход — срабатывание расписания правила (trigger.kind: schedule)",
-          "properties": {"at": {"type": "string", "format": "date-time", "description": "Время слота; по умолчанию clock"}}
+          "description": "Input: a firing of the rule's schedule (trigger.kind: schedule)",
+          "properties": {"at": {"type": "string", "format": "date-time", "description": "Slot time; defaults to clock"}}
         },
         "observation": {
           "type": "object", "required": ["kind"], "additionalProperties": false,
@@ -150,7 +158,7 @@
         "expect": {
           "type": "object", "additionalProperties": false,
           "properties": {
-            "result": {"type": "string", "description": "Итог оценки правила ядра (как result события rule.evaluated)"},
+            "result": {"type": "string", "description": "Outcome of the core's rule evaluation (like result of the rule.evaluated event)"},
             "ensureWork": {"type": "array", "items": {"$ref": "#/$defs/workExpectation"}},
             "invokeSkill": {"type": "array", "items": {"$ref": "#/$defs/skillExpectation"}},
             "noSideEffects": {"const": true}
@@ -182,14 +190,14 @@
               "key": {"type": "string"},
               "type": {"type": "string"},
               "metadata": {"type": "object"},
-              "content": {"type": "string", "maxLength": 1048576, "description": "Содержимое (текст): артефакт с сохранённым содержимым, как после загрузки"},
-              "mediaType": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(\\s*;.*)?$", "description": "Тип содержимого (text/markdown, application/json, …)"}
+              "content": {"type": "string", "maxLength": 1048576, "description": "Content (text): an artifact with stored content, as after an upload"},
+              "mediaType": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(\\s*;.*)?$", "description": "Content type (text/markdown, application/json, …)"}
             }
           }
         },
         "principals": {
           "type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
-          "description": "Роль → вымышленные principal теста"
+          "description": "Role → fictitious test principals"
         }
       }
     },
@@ -204,17 +212,18 @@
             "gate": {"type": "string", "default": "default"},
             "decision": {"enum": ["approved", "rejected"]},
             "by": {"type": "string"},
-            "comment": {"type": "string"}
+            "comment": {"type": "string"},
+            "expectRefused": {"type": "string", "description": "Core rejection code for the decider, e.g. not_eligible: the decider is not a holder of the gate role"}
           }
         },
         "verify": {
           "type": "object", "required": ["check", "result"], "additionalProperties": false,
-          "description": "Итог критерия приёмки типа",
+          "description": "Outcome of the type's acceptance criterion",
           "properties": {"check": {"type": "string"}, "result": {"enum": ["passed", "failed"]}, "output": {"type": "object"}}
         },
         "complete": {
           "type": "object", "additionalProperties": false,
-          "properties": {"output": {"type": "object", "description": "Выход завершения (completionSchema)"}}
+          "properties": {"output": {"type": "object", "description": "Completion output (completionSchema)"}}
         },
         "expect": {
           "type": "object", "additionalProperties": false,
@@ -225,7 +234,7 @@
               "type": "object", "additionalProperties": false,
               "properties": {"key": {"type": "string"}, "category": {"enum": ["backlog", "active", "blocked", "terminal_success", "terminal_cancelled"]}}
             },
-            "comments": {"type": "array", "items": {"type": "string"}, "description": "Подстроки комментариев, оставленных исходами"},
+            "comments": {"type": "array", "items": {"type": "string"}, "description": "Substrings of comments left by outcomes"},
             "noSideEffects": {"const": true}
           }
         }
@@ -237,7 +246,7 @@
       "oneOf": [{"required": ["output"]}, {"required": ["error"]}, {"required": ["timeout"]}],
       "properties": {
         "step": {"type": "string"},
-        "when": {"type": "string", "description": "CEL над input вызова"},
+        "when": {"type": "string", "description": "CEL over the call input"},
         "output": {},
         "error": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}},
         "timeout": {"const": true}
@@ -247,9 +256,13 @@
       "type": "object", "additionalProperties": false,
       "oneOf": [
         {"required": ["emit"]}, {"required": ["advance"]}, {"required": ["complete"]},
-        {"required": ["approve"]}, {"required": ["expect"]}
+        {"required": ["approve"]}, {"required": ["expect"]}, {"required": ["settings"]}
       ],
       "properties": {
+        "settings": {
+          "$ref": "#/$defs/settings",
+          "description": "Save new settings values in the middle of the scenario: computations after this step read them, decisions already taken keep the values they read"
+        },
         "emit": {
           "type": "object", "additionalProperties": false,
           "oneOf": [{"required": ["event"]}, {"required": ["observation"]}],
@@ -257,16 +270,18 @@
             "event": {"type": "string"},
             "observation": {"type": "string"},
             "source": {"type": "string"},
+            "task": {"type": "string", "description": "Only with observation: id of the process step whose latest task the observation is bound to (the task field of the core's observation)", "$comment": "CP-ADR-0063 Ж5"},
+            "by": {"type": "string", "minLength": 1, "description": "Event author (actorId): a test principal or agent:<key>"},
             "payload": {"type": "object"}
           }
         },
-        "advance": {"type": "string", "description": "Сдвиг виртуального времени (ISO 8601, P3D) или до момента: until:<id таймера>"},
+        "advance": {"type": "string", "description": "Virtual time shift (ISO 8601, P3D) or up to a moment: until:<timer id>"},
         "complete": {
           "type": "object", "required": ["step"], "additionalProperties": false,
           "properties": {
             "step": {"type": "string"},
-            "by": {"type": "string", "description": "principal теста или agent:<key>"},
-            "output": {"type": "object", "description": "Данные формы или результат агента; проверяются по схеме формы"},
+            "by": {"type": "string", "description": "test principal or agent:<key>"},
+            "output": {"type": "object", "description": "Form data or the agent's result; checked against the form schema"},
             "cancel": {"const": true}
           }
         },
@@ -276,7 +291,7 @@
             "step": {"type": "string"},
             "by": {"type": "string"},
             "decision": {"enum": ["approve", "reject"]},
-            "expectRefused": {"type": "string", "description": "Код отказа ядра, например separation_of_duties_violation"}
+            "expectRefused": {"type": "string", "description": "Core rejection code, e.g. separation_of_duties_violation"}
           }
         },
         "expect": {
@@ -285,17 +300,22 @@
             "stages": {"type": "object", "additionalProperties": {"enum": ["open", "completed", "skipped", "not_started"]}},
             "milestones": {"type": "array", "items": {"type": "string"}},
             "tasks": {"type": "array", "items": {"type": "object", "properties": {
-              "step": {"type": "string"}, "status": {"type": "string"}, "assignee": {"type": "string"}, "due": {"type": "string"}}}},
+              "step": {"type": "string"}, "status": {"type": "string"}, "assignee": {"type": "string"}, "due": {"type": "string"},
+              "customFields": {"type": "object", "description": "Subset of task fields: the given ones are compared (human step prefill)"}}}},
             "timers": {"type": "array", "items": {"type": "object", "properties": {
               "id": {"type": "string"}, "at": {"type": "string"}, "provisional": {"type": "boolean"}}}},
-            "data": {"type": "object", "description": "Путь в данных → ожидаемое значение"},
+            "data": {"type": "object", "description": "Path in data → expected value"},
             "sla": {
               "type": "object", "minProperties": 1,
               "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,62}$"},
               "additionalProperties": {"enum": ["ok", "warning", "breached", "paused"]},
-              "description": "Состояние срока: id шага → состояние его открытой попытки; ключ process — срок процесса (spec.due)", "$comment": "CP-ADR-0078 §7"
+              "description": "Due state: step id → state of its open attempt; the process key is the process due (spec.due)", "$comment": "CP-ADR-0078 §7"
             },
-            "events": {"type": "array", "items": {"type": "string"}, "description": "Типы событий process.* с последнего expect"},
+            "events": {"type": "array", "items": {"type": "string"}, "description": "process.* event types since the last expect"},
+            "rules": {"type": "array", "items": {"type": "object", "properties": {
+              "rule": {"type": "string"}, "action": {"type": "string"}, "step": {"type": "string"},
+              "result": {"enum": ["matched", "not_matched", "skipped", "failed"]}, "reason": {"type": "string"}}},
+              "description": "Decisions of the package's rules with target: task since the last expect", "$comment": "CP-ADR-0063 Ж5"},
             "memory": {"type": "object", "additionalProperties": false, "properties": {
               "recalled": {"type": "array", "items": {"type": "string"}},
               "remembered": {"type": "array", "items": {"type": "object"}}}},

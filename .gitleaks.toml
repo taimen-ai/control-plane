@@ -13,8 +13,10 @@ paths = [
   '''^tests/contract/conftest\.py$''',                  # пример CP_TEST_MEMORY_API_KEY в докстринге контрактных тестов
   '''^tests/integration/test_active_turn_control\.py$''',   # фикстуры integration-тестов
   '''^tests/integration/test_external_references_v08\.py$''',
+  '''^tests/integration/test_connection_types\.py$''',    # AKIA- и api-key-образцы как вход проверки secret_material_rejected (типы подключений)
   '''^tests/integration/test_task_type_instructions\.py$''',  # AKIA-образец как вход проверки secret_material_rejected (инструкции типа задачи)
   '''^tests/unit/test_agent_instructions\.py$''',       # AKIA-образец как вход проверки secret_material_rejected (validate_instructions)
+  '''^tests/unit/test_connection_type_domain\.py$''',   # AKIA- и api-key-образцы как вход проверки secret_material_rejected (домен типов подключений)
   '''^tests/unit/test_trace\.py$''',                    # RSA-ключ и заголовки Authorization как вход теста редактирования транскрипта
   '''^tests/unit/test_work_item_domain\.py$''',         # JWT, подписанный тестовым ключом внутри теста
   '''^tests/unit/test_work_graph_domain\.py$''',        # AKIA-образец как вход проверки reject_secret_material (evidence)

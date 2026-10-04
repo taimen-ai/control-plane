@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from control_plane.application.authorization import (
     AuthContext,
     ResourceRef,
+    WorkspaceNotVisible,
     authorize,
     visible_objects,
 )
@@ -46,6 +47,7 @@ from control_plane.application.commands.work_rules import check_identity, ensure
 from control_plane.application.common import new_uuid, utcnow
 from control_plane.application.events import event_reason, record_event
 from control_plane.application.queries.package_links import in_package
+from control_plane.application.queries.package_settings import object_scope
 from control_plane.domain.enums import Permission
 from control_plane.domain.errors import ConflictError, NotFoundError, ValidationError
 from control_plane.domain.process_definition import (
@@ -60,6 +62,7 @@ from control_plane.domain.process_definition import (
     references,
 )
 from control_plane.domain.process_engine import ENGINE_REVISION
+from control_plane.domain.settings_refs import SettingsScope
 from control_plane.infrastructure.db.models import (
     Agent,
     ArtifactType,
@@ -185,6 +188,7 @@ async def load_catalog(
     *,
     history_key: str | None = None,
     retired: bool = True,
+    settings: SettingsScope | None = None,
 ) -> Catalog:
     """What the tenant's catalog holds of the keys ``spec`` names.
 
@@ -192,6 +196,8 @@ async def load_catalog(
     migration maps names: the old key of a process a package renames.
     ``retired=False`` — a version already published is compiled to run: the
     keys it names that were retired since do not stop its open instances.
+    ``settings`` — the type of ``settings`` (CP-ADR-0081 §6); ``None``: the
+    active revision of the package that installed ``key`` (``package_objects``).
     """
     refs = references(spec)
     skills: dict[str, SkillEntry] = {}
@@ -275,6 +281,11 @@ async def load_catalog(
         versions=versions,
         retired_calendars=retired_calendars,
         retired_processes=retired_processes - {key},
+        settings=(
+            settings
+            if settings is not None
+            else await object_scope(session, tenant_id, PROCESS, key)
+        ),
     )
 
 
@@ -326,12 +337,15 @@ async def publish_process_definition(
     key: str,
     spec: dict[str, Any],
     renamed_from: str | None = None,
+    settings: SettingsScope | None = None,
 ) -> ProcessDefinitionView:
     """Publish ``spec.version`` of ``key``: immutable, checked, with its hash.
 
     ``renamed_from`` — a package renames that key to this one (CP-ADR-0074
     §11): its latest version keeps the element ids of the first version of
     ``key`` and its versions are the ``from`` side of the migrations.
+    ``settings`` — the settings the apply of a package types ``settings`` by
+    (the revision it records); ``None``: those of the package of ``key``.
     """
     from control_plane.application.commands.workspaces import require_active_workspace
 
@@ -347,9 +361,7 @@ async def publish_process_definition(
     latest = await _latest(session, ctx.tenant_id, key)
     if latest is not None and isinstance(version, int):
         if latest.workspace_id is not None and latest.workspace_id != workspace_id:
-            await authorize(
-                ctx, Permission.PROCESSES_WRITE, resource=process_scope(latest.workspace_id)
-            )
+            await _writable(ctx, latest)
         same = latest if latest.version == version else None
         if same is None and version <= latest.version:
             same = await _version(session, ctx.tenant_id, key, version)
@@ -383,6 +395,7 @@ async def publish_process_definition(
         body,
         previous,
         history_key=renamed_from if latest is None else None,
+        settings=settings,
     )
     checked = check_process(key, body, catalog)
     if checked.errors:
@@ -440,9 +453,23 @@ async def publish_process_definition(
     return ProcessDefinitionView(row, row.version, created=True)
 
 
-async def _readable(ctx: AuthContext, row: ProcessDefinition) -> None:
+async def _readable(ctx: AuthContext, row: ProcessDefinition, not_found: NotFoundError) -> None:
+    """A definition of an invisible workspace answers as a missing one (CP-ADR-0082 §3.7)."""
     if row.workspace_id is not None:
-        await authorize(ctx, Permission.PROCESSES_READ, resource=process_scope(row.workspace_id))
+        try:
+            await authorize(
+                ctx, Permission.PROCESSES_READ, resource=process_scope(row.workspace_id)
+            )
+        except WorkspaceNotVisible:
+            raise not_found from None
+
+
+async def _writable(ctx: AuthContext, row: ProcessDefinition) -> None:
+    """``processes.write`` on the definition's workspace; an invisible one is its 404."""
+    try:
+        await authorize(ctx, Permission.PROCESSES_WRITE, resource=process_scope(row.workspace_id))
+    except WorkspaceNotVisible:
+        raise NotFoundError("Process definition not found", details={"process": row.key}) from None
 
 
 def _parse_ref(ref: str) -> tuple[str, int | None]:
@@ -467,7 +494,7 @@ async def resolve_process_definition(
     row = latest if version is None else await _version(session, ctx.tenant_id, key, version)
     if row is None:
         raise not_found
-    await _readable(ctx, row)
+    await _readable(ctx, row, not_found)
     retired = await retirements(session, ctx.tenant_id, PROCESS, [key])
     return ProcessDefinitionView(row, latest.version, retirement=retired.get(key))
 
@@ -555,10 +582,11 @@ async def list_process_versions(
 ) -> tuple[list[ProcessDefinitionView], int | None]:
     """Versions of a key, newest first; the last version of a full page continues it."""
     await authorize(ctx, Permission.PROCESSES_READ)
+    not_found = NotFoundError("Process definition not found", details={"process": key})
     latest = await _latest(session, ctx.tenant_id, key)
     if latest is None:
-        raise NotFoundError("Process definition not found", details={"process": key})
-    await _readable(ctx, latest)
+        raise not_found
+    await _readable(ctx, latest, not_found)
     stmt = select(ProcessDefinition).where(
         ProcessDefinition.tenant_id == ctx.tenant_id, ProcessDefinition.key == key
     )
@@ -622,7 +650,7 @@ async def retire_process_definition(
     latest = await _latest(session, ctx.tenant_id, key)
     if latest is None:
         raise NotFoundError("Process definition not found", details={"process": key})
-    await authorize(ctx, Permission.PROCESSES_WRITE, resource=process_scope(latest.workspace_id))
+    await _writable(ctx, latest)
     by_version = await open_instances_by_version(session, ctx.tenant_id, key)
     existing = await retirement(session, ctx.tenant_id, PROCESS, key)
     if existing is not None:

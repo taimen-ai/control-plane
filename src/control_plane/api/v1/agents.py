@@ -21,6 +21,7 @@ from control_plane.api.v1.schemas import (
     PACKAGE_FILTER_DESCRIPTION,
     AgentIdentityLinkRequest,
     AgentIdentityReplaceRequest,
+    AgentMeOut,
     AgentOut,
     AgentPageOut,
     AgentPublishRequest,
@@ -43,6 +44,7 @@ from control_plane.application.queries.package_links import (
     attach_packages,
     in_package,
 )
+from control_plane.application.queries.package_settings import object_settings
 from control_plane.domain.enums import AgentStatus, Permission
 from control_plane.domain.errors import ValidationError
 from control_plane.infrastructure.db.models import Agent, AgentObservedStatus, AgentRevision
@@ -122,6 +124,7 @@ def _forget(request: Request, identities: list[tuple[str, uuid.UUID]]) -> None:
         forget_binding_cache(request, issuer, iam_principal_id)
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.post(
     "/agents",
     response_model=AgentOut,
@@ -164,6 +167,7 @@ async def publish_agent(
     return response
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.post(
     "/agents:validate",
     response_model=AgentValidationOut,
@@ -183,6 +187,7 @@ async def validate_agent(payload: AgentPublishRequest, ctx: AuthDep, db: DbDep) 
     )
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.get(
     "/agents",
     response_model=AgentPageOut,
@@ -253,20 +258,23 @@ async def list_agents(
 
 
 # Declared before /agents/{ref}: "me" is not an agent key.
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.get(
     "/agents/me",
-    response_model=AgentOut,
+    response_model=AgentMeOut,
     responses=ERROR_RESPONSES,
-    summary="The agent the caller is, with its current revision",
+    summary="The agent the caller is, with its current revision and its package's settings",
 )
 async def get_my_agent(ctx: AuthDep, db: DbDep) -> JSONResponse:
-    # Authentication is the whole check: an executor reads its own spec.
+    # Authentication is the whole check: an executor reads its own spec and
+    # the settings of the package that describes it (CP-ADR-0081 §8).
     view = await commands.my_agent(db, ctx)
-    return JSONResponse(
-        await attach_package(db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision))
-    )
+    body = await attach_package(db, ctx.tenant_id, "Agent", agent_body(view.agent, view.revision))
+    body["packageSettings"] = await object_settings(db, ctx.tenant_id, "Agent", view.agent.key)
+    return JSONResponse(body)
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.get(
     "/agents/{ref}",
     response_model=AgentOut,
@@ -306,6 +314,7 @@ def revision_summary_body(
     ).model_dump(mode="json", by_alias=True)
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.get(
     "/agents/{key}/revisions",
     response_model=AgentRevisionPageOut,
@@ -324,6 +333,7 @@ async def list_agent_revisions(
     return JSONResponse(page_body(items, page.next_cursor))
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.patch(
     "/agents/{key}/state",
     response_model=AgentOut,
@@ -358,6 +368,7 @@ async def update_agent_state(
     )
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.post(
     "/agents/{key}:retire",
     response_model=AgentOut,
@@ -396,6 +407,7 @@ async def retire_agent(
     return response
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.put(
     "/agents/{key}/identity",
     response_model=AgentOut,
@@ -442,6 +454,7 @@ async def link_agent_identity(
     return response
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.post(
     "/agents/{key}/identity:replace",
     response_model=AgentOut,
@@ -491,6 +504,7 @@ async def replace_agent_identity(
     return response
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.get(
     "/agents/{key}/status",
     response_model=AgentStatusOut,
@@ -502,6 +516,7 @@ async def get_agent_status(key: str, ctx: AuthDep, db: DbDep) -> JSONResponse:
     return JSONResponse(status_body(agent, row))
 
 
+# visibility: tenant — an agent of the registry is an object of the tenant (CP-ADR-0082 3.8)
 @router.put(
     "/agents/{key}/status",
     response_model=AgentStatusOut,

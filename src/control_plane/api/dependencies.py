@@ -12,6 +12,7 @@ from control_plane.infrastructure.auth.iam import IamEnforcement
 from control_plane.infrastructure.auth.service import resolve_auth_context
 from control_plane.infrastructure.content_store import ContentStore
 from control_plane.infrastructure.db.engine import transaction
+from control_plane.infrastructure.secret_store import SecretStore
 
 
 def get_settings_dep(request: Request) -> Settings:
@@ -43,6 +44,14 @@ def get_content_store(request: Request) -> ContentStore | None:
 
 
 ContentStoreDep = Annotated[ContentStore | None, Depends(get_content_store)]
+
+
+def get_secret_store(request: Request) -> SecretStore | None:
+    """``None`` when no store is configured (CP-ADR-0079 §1)."""
+    return cast(SecretStore | None, getattr(request.app.state, "secret_store", None))
+
+
+SecretStoreDep = Annotated[SecretStore | None, Depends(get_secret_store)]
 
 
 def get_iam_enforcement(request: Request) -> IamEnforcement | None:

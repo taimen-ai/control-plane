@@ -1,0 +1,12 @@
+# A vertical package of TAI-ADR-0066 §1 and §7.1 as the decision writes it: its
+# views and component are copied from the decision (spec verbatim; the catalog
+# of apiVersion is neutral, white-label ADR-0022); the dictionaries and the data
+# schema are the fixture.
+apiVersion: catalog.example/v1
+kind: Package
+key: tenders
+spec:
+  version: 1.0.0
+  displayName: Tenders
+  locales: [en, ru]
+  defaultLocale: en
